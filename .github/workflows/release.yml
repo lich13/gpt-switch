@@ -55,6 +55,8 @@ jobs:
           if ($install.ExitCode -ne 0) { throw 'Installer failed' }
           $exe = Get-ChildItem $installDir -Filter 'gpt-switch.exe' -Recurse | Select-Object -First 1
           if (!$exe) { throw 'Installed executable missing' }
+          $notice = Get-Content (Join-Path $installDir 'THIRD_PARTY_NOTICES.md') -Raw
+          if (!$notice.Contains('Copyright (c) 2025 Jason Young')) { throw 'Third-party notice missing' }
           $report = Join-Path $env:RUNNER_TEMP 'gpt-switch-smoke.json'
           $process = Start-Process -FilePath $exe.FullName -ArgumentList @('--smoke-test', $report) -PassThru
           if (!$process.WaitForExit(60000)) { $process.Kill(); throw 'Smoke timed out' }
@@ -74,6 +76,7 @@ jobs:
           hdiutil detach "$mount"
           executable="$RUNNER_TEMP/gpt-Switch.app/Contents/MacOS/gpt-switch"
           test -x "$executable"
+          python3 -c 'import pathlib,sys; assert "Copyright (c) 2025 Jason Young" in pathlib.Path(sys.argv[1]).read_text()' "$RUNNER_TEMP/gpt-Switch.app/Contents/Resources/THIRD_PARTY_NOTICES.md"
           "$executable" --smoke-test "$report" &
           pid=$!
           for attempt in {1..60}; do
