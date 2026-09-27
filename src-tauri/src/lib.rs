@@ -1049,7 +1049,9 @@ pub fn run() {
         .run(|app, event| {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = &event {
-                let _ = show(app, None);
+                if !startup::macos_login_event() {
+                    let _ = show(app, None);
+                }
             }
             if let tauri::RunEvent::ExitRequested { api, .. } = &event {
                 let r = app.state::<Arc<Runtime>>();

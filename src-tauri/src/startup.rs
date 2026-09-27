@@ -212,10 +212,35 @@ pub fn login_source(args: &[String]) -> bool {
     {
         use objc2::MainThreadMarker;
         use objc2_app_kit::NSApplication;
-        MainThreadMarker::new().is_some_and(|m| NSApplication::sharedApplication(m).isHidden())
+        macos_login_event()
+            || MainThreadMarker::new()
+                .is_some_and(|m| NSApplication::sharedApplication(m).isHidden())
     }
     #[cfg(not(target_os = "macos"))]
     false
+}
+#[cfg(target_os = "macos")]
+pub fn macos_login_event() -> bool {
+    use objc2_foundation::NSAppleEventManager;
+    // Read during Tauri setup / applicationDidFinishLaunching, while the
+    // launch Apple event is still current. macOS 13+ can ignore the legacy
+    // login item's `hidden` flag; the official login-origin marker remains.
+    // https://developer.apple.com/documentation/coreservices/keyaelaunchedasloginitem
+    NSAppleEventManager::sharedAppleEventManager()
+        .currentAppleEvent()
+        .is_some_and(|event| {
+            is_login_event(
+                event.eventID(),
+                event
+                    .paramDescriptorForKeyword(u32::from_be_bytes(*b"prdt"))
+                    .map(|value| value.enumCodeValue()),
+            )
+        })
+}
+#[cfg(any(target_os = "macos", test))]
+fn is_login_event(event: u32, origin: Option<u32>) -> bool {
+    [u32::from_be_bytes(*b"oapp"), u32::from_be_bytes(*b"rapp")].contains(&event)
+        && origin == Some(u32::from_be_bytes(*b"lgit"))
 }
 pub fn silent(args: &[String], prefs: &Preferences) -> bool {
     prefs.launch_to_tray && login_source(args)
@@ -235,6 +260,15 @@ mod tests {
         let prefs: Preferences = serde_json::from_str("{}").unwrap();
         assert!(prefs.launch_to_tray);
         assert!(!prefs.restore_gateway);
+        assert!(is_login_event(
+            u32::from_be_bytes(*b"oapp"),
+            Some(u32::from_be_bytes(*b"lgit"))
+        ));
+        assert!(is_login_event(
+            u32::from_be_bytes(*b"rapp"),
+            Some(u32::from_be_bytes(*b"lgit"))
+        ));
+        assert!(!is_login_event(u32::from_be_bytes(*b"oapp"), None));
         assert_eq!(
             registration_path(r"C:\Program Files\gpt-Switch\gpt-switch.exe", true),
             r#""C:\Program Files\gpt-Switch\gpt-switch.exe""#
