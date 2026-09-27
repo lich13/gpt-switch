@@ -25,7 +25,44 @@ struct Runtime {
     quitting: AtomicBool,
     quit_pending: AtomicBool,
     smoke: Option<PathBuf>,
+    smoke_result: Mutex<Option<Result<SmokeSnapshot>>>,
     fixture: Mutex<Option<tempfile::TempDir>>,
+}
+struct SmokeSnapshot {
+    home: PathBuf,
+    auth: Option<Vec<u8>>,
+    config: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "macos")]
+fn application_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    // The native predefined Quit calls NSApplication.terminate directly.
+    // Use our command so configuration restoration can finish (or report a conflict).
+    let menu = Menu::default(app)?;
+    menu.remove_at(0)?;
+    let application = tauri::menu::Submenu::with_items(
+        app,
+        "gpt-Switch",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, Some("关于 gpt-Switch"), None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::services(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, None)?,
+            &PredefinedMenuItem::hide_others(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(
+                app,
+                "app-quit",
+                "退出 gpt-Switch",
+                true,
+                Some("CmdOrCtrl+Q"),
+            )?,
+        ],
+    )?;
+    menu.insert(&application, 0)?;
+    Ok(menu)
 }
 fn login_active(s: &login::LoginState) -> bool {
     ["starting", "waiting", "cancelling"].contains(&s.phase.as_str())
@@ -391,6 +428,14 @@ fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = runtime.gateway.stop().await {
+            if runtime.smoke.is_some() {
+                if let Ok(mut result) = runtime.smoke_result.lock() {
+                    *result = Some(Err(e));
+                }
+                runtime.quitting.store(true, Ordering::Relaxed);
+                app.exit(1);
+                return;
+            }
             runtime.quit_pending.store(false, Ordering::Relaxed);
             let _ = app.emit("switch-error", e);
             let _ = show(&app, "gateway");
@@ -450,7 +495,7 @@ async fn test_provider(r: tauri::State<'_, Arc<Runtime>>, id: String) -> Result<
 }
 #[tauri::command]
 async fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
-    if let Some(output) = &r.smoke {
+    if r.smoke.is_some() {
         let result = (|| -> Result<()> {
             let mut c = lock(&r.core)?;
             let a = c.add_api_key("Smoke A", "fixture-only-a")?;
@@ -471,19 +516,54 @@ async fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>
             Ok(()) => gateway_smoke(&r).await,
             Err(e) => Err(e),
         };
-        let data = serde_json::json!({"gateway":result.is_ok(),"ok":result.is_ok(),"version":env!("CARGO_PKG_VERSION"),"revision":env!("GPT_SWITCH_REVISION"),"webview":true,"tray":app.tray_by_id("switch").is_some(),"platform":std::env::consts::OS,"error":result.err()});
-        storage::atomic_write(
-            output,
-            serde_json::to_string_pretty(&data).unwrap().as_bytes(),
-            None,
-        )?;
-        if let Some(fixture) = lock(&r.fixture)?.take() {
-            fixture.close().map_err(storage::io_error)?;
-        }
-        r.quitting.store(true, Ordering::Relaxed);
-        app.exit(if data["ok"] == true { 0 } else { 1 });
+        let result = match result {
+            Ok(()) => prepare_exit_smoke(&r).await,
+            Err(e) => Err(e),
+        };
+        *lock(&r.smoke_result)? = Some(result);
+        // Exercise a coded exit request while the gateway is still active.
+        // The report is written only after the exit handler verifies restoration.
+        app.exit(0);
     } else {
         show(&app, "accounts")?;
+    }
+    Ok(())
+}
+async fn prepare_exit_smoke(r: &Runtime) -> Result<SmokeSnapshot> {
+    let home = lock(&r.core)?.home();
+    let snapshot = SmokeSnapshot {
+        auth: storage::read_optional(&home.join("auth.json"))?,
+        config: storage::read_optional(&home.join("config.toml"))?,
+        home,
+    };
+    r.gateway
+        .start(&r.gateway.view().revision, &snapshot.home)
+        .await?;
+    Ok(snapshot)
+}
+fn report_exit_smoke(app: &tauri::AppHandle, r: &Runtime, restored: Result<()>) -> Result<()> {
+    let result = (|| -> Result<()> {
+        let snapshot = lock(&r.smoke_result)?
+            .take()
+            .ok_or_else(|| AppError::new("SMOKE", "退出验收未初始化"))??;
+        restored?;
+        if !r.quit_pending.load(Ordering::Relaxed)
+            || r.gateway.guarded_home()
+            || snapshot.auth != storage::read_optional(&snapshot.home.join("auth.json"))?
+            || snapshot.config != storage::read_optional(&snapshot.home.join("config.toml"))?
+        {
+            return Err(AppError::new("SMOKE", "正常退出未恢复配置"));
+        }
+        Ok(())
+    })();
+    let data = serde_json::json!({"safeExit":result.is_ok(),"gateway":result.is_ok(),"ok":result.is_ok(),"version":env!("CARGO_PKG_VERSION"),"revision":env!("GPT_SWITCH_REVISION"),"webview":true,"tray":app.tray_by_id("switch").is_some(),"platform":std::env::consts::OS,"error":result.err()});
+    storage::atomic_write(
+        r.smoke.as_ref().unwrap(),
+        serde_json::to_string_pretty(&data).unwrap().as_bytes(),
+        None,
+    )?;
+    if let Some(fixture) = lock(&r.fixture)?.take() {
+        fixture.close().map_err(storage::io_error)?;
     }
     Ok(())
 }
@@ -591,10 +671,13 @@ pub fn run() {
                 quitting: AtomicBool::new(false),
                 quit_pending: AtomicBool::new(false),
                 smoke,
+                smoke_result: Mutex::new(None),
                 fixture: Mutex::new(fixture),
             });
             let state = lock(&runtime.core)?.state()?;
             app.manage(runtime.clone());
+            #[cfg(target_os = "macos")]
+            app.set_menu(application_menu(app.handle())?)?;
             let mut gateway_events = runtime.gateway.subscribe();
             let gateway_runtime = runtime.clone();
             let gateway_app = app.handle().clone();
@@ -741,6 +824,12 @@ pub fn run() {
             });
             Ok(())
         })
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "app-quit" {
+                let r = app.state::<Arc<Runtime>>();
+                quit(app, &r);
+            }
+        })
         .on_window_event(|w, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let r = w.state::<Arc<Runtime>>();
@@ -785,11 +874,20 @@ pub fn run() {
             if let tauri::RunEvent::Reopen { .. } = &event {
                 let _ = show(app, "accounts");
             }
-            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-                if code.is_none() {
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+                let r = app.state::<Arc<Runtime>>();
+                if !r.quitting.load(Ordering::Relaxed) {
                     api.prevent_exit();
-                    let r = app.state::<Arc<Runtime>>();
                     quit(app, &r);
+                }
+            }
+            if let tauri::RunEvent::Exit = event {
+                let r = app.state::<Arc<Runtime>>();
+                // macOS Dock/system termination can bypass ExitRequested.
+                // Serialize restoration with any in-flight takeover before returning to the OS.
+                let restored = tauri::async_runtime::block_on(r.gateway.stop()).map(|_| ());
+                if r.smoke.is_some() {
+                    let _ = report_exit_smoke(app, &r, restored);
                 }
             }
         });

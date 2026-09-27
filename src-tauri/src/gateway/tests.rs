@@ -125,6 +125,23 @@ async fn fixture(urls: Vec<String>) -> (tempfile::TempDir, Gateway) {
     std::fs::write(t.path().join("auth.json"), "unchanged-auth").unwrap();
     (t, g)
 }
+
+#[tokio::test]
+async fn stopping_releases_listener_before_restart_returns_to_caller() {
+    let (t, g) = fixture(vec!["https://example.test/v1".into()]).await;
+    let config = std::fs::read(t.path().join("config.toml")).ok();
+    let auth = std::fs::read(t.path().join("auth.json")).ok();
+    for _ in 0..4 {
+        start(&g, &t).await;
+        g.stop().await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", g.view().settings.port))
+            .await
+            .expect("stop must release the listening port before returning");
+        drop(listener);
+        assert_eq!(std::fs::read(t.path().join("config.toml")).ok(), config);
+        assert_eq!(std::fs::read(t.path().join("auth.json")).ok(), auth);
+    }
+}
 fn update(g: &Gateway, t: &tempfile::TempDir, edit: Edit) {
     g.edit(edit, &g.view().revision, t.path()).unwrap();
 }

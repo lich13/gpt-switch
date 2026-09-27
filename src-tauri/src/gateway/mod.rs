@@ -78,6 +78,7 @@ struct Inner {
     revision: String,
     running: bool,
     shutdown: Option<watch::Sender<bool>>,
+    listener_task: Option<tokio::task::JoinHandle<()>>,
     error: Option<String>,
     circuits: HashMap<String, Circuit>,
     recent: VecDeque<Recent>,
@@ -125,6 +126,7 @@ impl Gateway {
                 revision,
                 running: false,
                 shutdown: None,
+                listener_task: None,
                 error,
                 circuits: HashMap::new(),
                 recent: VecDeque::new(),
@@ -266,9 +268,10 @@ impl Gateway {
             s.error = None;
         }
         let gateway = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             forward::serve(gateway, listener, rx).await;
         });
+        self.0.inner.lock().unwrap().listener_task = Some(task);
         self.changed();
         Ok(self.view())
     }
@@ -279,13 +282,17 @@ impl Gateway {
             self.changed();
             return Err(e);
         }
-        {
+        let listener_task = {
             let mut s = self.0.inner.lock().unwrap();
             if let Some(tx) = s.shutdown.take() {
                 let _ = tx.send(true);
             }
             s.running = false;
             s.error = None;
+            s.listener_task.take()
+        };
+        if let Some(task) = listener_task {
+            let _ = task.await;
         }
         self.0.clients.lock().unwrap().clear();
         self.changed();

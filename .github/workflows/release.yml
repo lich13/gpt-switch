@@ -61,7 +61,7 @@ jobs:
           $process = Start-Process -FilePath $exe.FullName -ArgumentList @('--smoke-test', $report) -PassThru
           if (!$process.WaitForExit(60000)) { $process.Kill(); throw 'Smoke timed out' }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (!$result.ok -or !$result.webview -or !$result.tray -or !$result.gateway -or $result.revision -ne $env:GITHUB_SHA) { throw 'Smoke failed' }
+          if (!$result.ok -or !$result.webview -or !$result.tray -or !$result.gateway -or !$result.safeExit -or $result.revision -ne $env:GITHUB_SHA) { throw 'Smoke failed' }
           Get-Content $report
       - name: Installed macOS DMG smoke test
         if: runner.os == 'macOS'
@@ -86,7 +86,7 @@ jobs:
           done
           if [ ! -f "$report" ]; then kill "$pid" 2>/dev/null || true; exit 1; fi
           wait "$pid"
-          python3 -c 'import json,sys,os; d=json.load(open(sys.argv[1])); assert d["ok"] and d["webview"] and d["tray"] and d["gateway"] and d["revision"] == os.environ["GITHUB_SHA"]; print(d)' "$report"
+          python3 -c 'import json,sys,os; d=json.load(open(sys.argv[1])); assert d["ok"] and d["webview"] and d["tray"] and d["gateway"] and d["safeExit"] and d["revision"] == os.environ["GITHUB_SHA"]; print(d)' "$report"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
