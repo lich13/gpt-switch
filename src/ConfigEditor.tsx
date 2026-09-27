@@ -42,6 +42,7 @@ export default function ConfigEditor({
     }
   }, []);
   useEffect(() => {
+    setDoc(null);
     void load();
   }, [load, home]);
   useEffect(() => {
@@ -190,25 +191,29 @@ export default function ConfigEditor({
         </div>
       )}
       <div className="editor-body">
-        <CodeMirror
-          value={text}
-          onChange={(value) =>
-            setText(
-              docRef.current?.text.includes("\r\n")
-                ? value.replace(/\r?\n/g, "\r\n")
-                : value,
-            )
-          }
-          theme={theme}
-          height="100%"
-          extensions={extensions}
-          aria-label="TOML 编辑器"
-          basicSetup={{
-            foldGutter: true,
-            autocompletion: false,
-            highlightActiveLine: true,
-          }}
-        />
+        {doc ? (
+          <CodeMirror
+            value={text}
+            onChange={(value) =>
+              setText(
+                docRef.current?.text.includes("\r\n")
+                  ? value.replace(/\r?\n/g, "\r\n")
+                  : value,
+              )
+            }
+            theme={theme}
+            height="100%"
+            extensions={extensions}
+            aria-label="TOML 编辑器"
+            basicSetup={{
+              foldGutter: true,
+              autocompletion: false,
+              highlightActiveLine: true,
+            }}
+          />
+        ) : (
+          <div className="empty">正在读取配置…</div>
+        )}
       </div>
       <div className="editor-footer">
         <span>
