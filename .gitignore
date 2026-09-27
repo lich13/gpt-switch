@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+artifacts/
+.DS_Store
+*.log
+auth.json
+config.toml
+.env*
+!*.example

@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Local gpt-Switch window",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

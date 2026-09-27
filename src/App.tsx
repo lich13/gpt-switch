@@ -1,0 +1,933 @@
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import {
+  ArrowLeftRight,
+  Users,
+  FileCode2,
+  Settings,
+  Search,
+  Plus,
+  Check,
+  ArrowUpRight,
+  KeyRound,
+  UserRound,
+  MoreHorizontal,
+  X,
+  Upload,
+  Terminal,
+  ExternalLink,
+  ChevronRight,
+  AlertTriangle,
+  LoaderCircle,
+  FolderOpen,
+  Sun,
+  Moon,
+  Monitor,
+  LogIn,
+  Trash2,
+  Pencil,
+} from "lucide-react";
+import { command, subscribe, preview } from "./bridge";
+import {
+  errorOf,
+  type Account,
+  type ViewState,
+  type Preferences,
+  type LoginState,
+} from "./types";
+const ConfigEditor = lazy(() => import("./ConfigEditor"));
+type Dialog =
+  | "add"
+  | "settings"
+  | { action: "rename" | "delete"; account: Account }
+  | null;
+const emptyLogin: LoginState = {
+  phase: "idle",
+  mode: "",
+  url: null,
+  code: null,
+  message: "",
+};
+export default function App() {
+  const [state, setState] = useState<ViewState | null>(null),
+    [page, setPage] = useState<"accounts" | "config">("accounts"),
+    [search, setSearch] = useState(""),
+    [dialog, setDialog] = useState<Dialog>(null),
+    [error, setError] = useState(""),
+    [message, setMessage] = useState(""),
+    [busy, setBusy] = useState(false),
+    [dirty, setDirty] = useState(false),
+    [systemDark, setSystemDark] = useState(
+      window.matchMedia("(prefers-color-scheme: dark)").matches,
+    ),
+    [login, setLogin] = useState(emptyLogin);
+  const dirtyRef = useRef(false),
+    pageRef = useRef(page);
+  dirtyRef.current = dirty;
+  pageRef.current = page;
+  const notify = useCallback((s: string) => setMessage(s), []);
+  const navigate = useCallback((next: "accounts" | "config") => {
+    if (
+      pageRef.current === "config" &&
+      next !== "config" &&
+      dirtyRef.current &&
+      !window.confirm("离开配置页会丢弃未保存的草稿，是否继续？")
+    )
+      return;
+    setPage(next);
+    if (next !== "config") setDirty(false);
+  }, []);
+  useEffect(() => {
+    let disposed = false;
+    const cleaners: (() => void)[] = [];
+    void Promise.all([
+      command<ViewState>("get_state"),
+      command<LoginState>("get_login"),
+    ])
+      .then(([s, l]) => {
+        if (!disposed) {
+          setState(s);
+          setLogin(l);
+          void command("frontend_ready").catch((e) =>
+            setError(errorOf(e).message),
+          );
+        }
+      })
+      .catch((e) => setError(errorOf(e).message));
+    const events: [string, (p: unknown) => void][] = [
+      ["switch-state", (p) => setState(p as ViewState)],
+      ["switch-notice", (p) => setMessage(String(p))],
+      ["switch-error", (p) => setError(errorOf(p).message)],
+      ["navigate", (p) => navigate(p === "config" ? "config" : "accounts")],
+      ["login-state", (p) => setLogin(p as LoginState)],
+    ];
+    for (const [event, fn] of events)
+      void subscribe(event, fn).then((clean) => {
+        if (disposed) clean();
+        else cleaners.push(clean);
+      });
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const change = () => setSystemDark(media.matches);
+    media.addEventListener("change", change);
+    return () => {
+      disposed = true;
+      cleaners.forEach((c) => c());
+      media.removeEventListener("change", change);
+    };
+  }, [navigate]);
+  useEffect(() => {
+    if (!message) return;
+    const t = setTimeout(() => setMessage(""), 6500);
+    return () => clearTimeout(t);
+  }, [message]);
+  const theme =
+    state?.preferences.theme === "system" || !state
+      ? systemDark
+        ? "dark"
+        : "light"
+      : state.preferences.theme;
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+  const action = async (fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setError("");
+    try {
+      await fn();
+    } catch (e) {
+      setError(errorOf(e).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const switchAccount = (a: Account) =>
+    void action(async () => {
+      if (!state) return;
+      const s = await command<ViewState>("switch_account", {
+        id: a.id,
+        expectedRevision: state.authRevision,
+      });
+      setState(s);
+      notify("文件已切换，请重新打开 Codex");
+    });
+  const current = state?.accounts.find((a) => a.current),
+    accounts =
+      state?.accounts.filter((a) =>
+        (a.name + " " + (a.email ?? ""))
+          .toLowerCase()
+          .includes(search.toLowerCase()),
+      ) ?? [];
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <img src="/icon.svg" alt="" />
+          <div>
+            <strong>gpt-Switch</strong>
+            <span>随手切换，即刻就绪</span>
+          </div>
+        </div>
+        <nav aria-label="主导航">
+          <button
+            className={page === "accounts" ? "nav-item active" : "nav-item"}
+            onClick={() => navigate("accounts")}
+          >
+            <Users size={17} />
+            账号<span className="nav-count">{state?.accounts.length ?? 0}</span>
+          </button>
+          <button
+            className={page === "config" ? "nav-item active" : "nav-item"}
+            onClick={() => navigate("config")}
+          >
+            <FileCode2 size={17} />
+            配置
+          </button>
+        </nav>
+        <div className="sidebar-bottom">
+          <div className="local-label">
+            <span className="dot" />
+            本地存储
+          </div>
+          <button className="nav-item" onClick={() => setDialog("settings")}>
+            <Settings size={17} />
+            设置<span className="version">v0.1.0</span>
+          </button>
+        </div>
+      </aside>
+      <main>
+        <div className="topbar">
+          <span>
+            <span className="dot" />
+            {current?.name ??
+              {
+                unsaved: "未保存账号",
+                missing: "尚无登录文件",
+                invalid: "凭据格式无效",
+              }[state?.currentState as "unsaved"] ??
+              "正在读取"}
+          </span>
+          <span className="topbar-right">
+            <Terminal size={13} />
+            Codex{preview && <span className="preview-badge">预览</span>}
+          </span>
+        </div>
+        {(error || state?.error) && (
+          <div className="banner error global-error" role="alert">
+            <AlertTriangle size={16} />
+            <span>{error || state?.error}</span>
+            <button
+              className="icon-button"
+              aria-label="关闭提示"
+              onClick={() => setError("")}
+            >
+              <X size={15} />
+            </button>
+          </div>
+        )}
+        {page === "accounts" ? (
+          <section className="accounts-page">
+            <div className="page-heading">
+              <div>
+                <div className="eyebrow">
+                  <ArrowLeftRight size={14} />
+                  账号切换
+                </div>
+                <h1>你的账号，一个入口。</h1>
+                <p>选择账号，接着完成手上的工作。</p>
+              </div>
+              <button
+                className="primary"
+                onClick={() => setDialog("add")}
+                disabled={!state}
+              >
+                <Plus size={16} />
+                添加账号
+              </button>
+            </div>
+            <div className="source-strip">
+              <div className="source-symbol">
+                <Terminal size={18} />
+              </div>
+              <div className="source-detail">
+                <strong>当前认证来源</strong>
+                <div className="source-values">
+                  <span>{state?.authSource.provider ?? "—"}</span>
+                  <span>
+                    {state?.authSource.credentialStore === "file"
+                      ? "auth.json"
+                      : (state?.authSource.credentialStore ?? "—")}
+                  </span>
+                  {state?.authSource.inlineToken && (
+                    <span>独立 bearer token</span>
+                  )}
+                  {state?.authSource.envKey && <span>环境变量凭据</span>}
+                  {state?.authSource.commandAuth && <span>命令获取凭据</span>}
+                </div>
+              </div>
+              <button
+                className="text-button"
+                onClick={() => navigate("config")}
+              >
+                查看配置
+                <ArrowUpRight size={14} />
+              </button>
+            </div>
+            {state?.authSource.warning && (
+              <div className="banner warning">
+                <AlertTriangle size={16} />
+                <span>{state.authSource.warning}</span>
+              </div>
+            )}
+            {(state?.currentState === "unsaved" ||
+              state?.currentState === "missing" ||
+              state?.currentState === "invalid") && (
+              <div className="banner">
+                <span>
+                  {state.currentState === "unsaved"
+                    ? "当前文件中的账号尚未保存"
+                    : state.currentState === "missing"
+                      ? "尚无 auth.json，可添加账号或登录 ChatGPT"
+                      : "auth.json 无法识别，请重新导入或登录"}
+                </span>
+                {state.currentState === "unsaved" && (
+                  <button
+                    className="text-button"
+                    onClick={() =>
+                      void action(async () =>
+                        setState(await command("import_current")),
+                      )
+                    }
+                  >
+                    保存当前账号
+                  </button>
+                )}
+              </div>
+            )}
+            <div className="list-tools">
+              <h2>
+                已保存账号 <span>{state?.accounts.length ?? 0}</span>
+              </h2>
+              <label className="search">
+                <Search size={15} />
+                <input
+                  aria-label="搜索账号"
+                  placeholder="搜索账号"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+                <kbd>⌕</kbd>
+              </label>
+            </div>
+            <div className="account-list" aria-label="已保存账号">
+              {!state ? (
+                <div className="empty">
+                  <LoaderCircle className="spin" />
+                  正在读取账号…
+                </div>
+              ) : accounts.length === 0 ? (
+                <div className="empty">
+                  <Users size={30} />
+                  <h3>
+                    {search ? "没有找到匹配账号" : "从你的第一个账号开始"}
+                  </h3>
+                  <p>
+                    {search
+                      ? "尝试其他名称或邮箱"
+                      : "登录 ChatGPT，或导入已有 auth.json。"}
+                  </p>
+                  {!search && (
+                    <button
+                      className="secondary"
+                      onClick={() => setDialog("add")}
+                    >
+                      <Plus size={15} />
+                      添加账号
+                    </button>
+                  )}
+                </div>
+              ) : (
+                accounts.map((a) => (
+                  <div
+                    key={a.id}
+                    className={"account-row" + (a.current ? " selected" : "")}
+                  >
+                    <div className={"avatar " + a.kind}>
+                      {a.kind === "chatgpt" ? (
+                        <UserRound size={20} />
+                      ) : (
+                        <KeyRound size={20} />
+                      )}
+                    </div>
+                    <div className="account-copy">
+                      <strong title={a.name}>{a.name}</strong>
+                      <div>
+                        <span>
+                          {a.kind === "chatgpt" ? "ChatGPT" : "API Key"}
+                        </span>
+                        {a.email && <span title={a.email}>{a.email}</span>}
+                      </div>
+                    </div>
+                    <div className="account-actions">
+                      {a.current ? (
+                        <span className="current-badge">
+                          <Check size={13} />
+                          当前文件
+                        </span>
+                      ) : (
+                        <button
+                          className="switch-button"
+                          disabled={busy}
+                          aria-label={"切换到 " + a.name}
+                          onClick={() => switchAccount(a)}
+                        >
+                          切换
+                          <ArrowLeftRight size={13} />
+                        </button>
+                      )}
+                      <details className="account-menu">
+                        <summary aria-label={"管理 " + a.name}>
+                          <MoreHorizontal size={18} />
+                        </summary>
+                        <div className="menu-popover">
+                          <button
+                            onClick={(e) => {
+                              e.currentTarget
+                                .closest("details")
+                                ?.removeAttribute("open");
+                              setDialog({ action: "rename", account: a });
+                            }}
+                          >
+                            <Pencil size={14} />
+                            重命名
+                          </button>
+                          <button
+                            className="danger"
+                            onClick={(e) => {
+                              e.currentTarget
+                                .closest("details")
+                                ?.removeAttribute("open");
+                              setDialog({ action: "delete", account: a });
+                            }}
+                          >
+                            <Trash2 size={14} />
+                            删除
+                          </button>
+                        </div>
+                      </details>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="account-footer">
+              <span>
+                <ArrowLeftRight size={14} />
+                也可以左键点击菜单栏或托盘图标切换
+              </span>
+              <span>{state?.accounts.length ?? 0} 个账号</span>
+            </div>
+          </section>
+        ) : (
+          state && (
+            <Suspense fallback={<div className="empty">正在打开编辑器…</div>}>
+              <ConfigEditor
+                revision={state.configRevision}
+                home={state.preferences.codexHome}
+                theme={theme}
+                onDirty={setDirty}
+                onMessage={notify}
+              />
+            </Suspense>
+          )
+        )}
+      </main>
+      {message && (
+        <div className="toast" role="status">
+          <Check size={17} />
+          {message}
+          <button
+            aria-label="关闭成功提示"
+            className="icon-button"
+            onClick={() => setMessage("")}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+      {dialog && state && (
+        <Modal
+          title={
+            dialog === "add"
+              ? "添加账号"
+              : dialog === "settings"
+                ? "设置"
+                : dialog.action === "rename"
+                  ? "重命名账号"
+                  : "删除账号"
+          }
+          onClose={() => setDialog(null)}
+        >
+          {dialog === "add" ? (
+            <AddAccount
+              login={login}
+              setLogin={setLogin}
+              onDone={(s) => {
+                setState(s);
+                setDialog(null);
+              }}
+            />
+          ) : dialog === "settings" ? (
+            <SettingsForm
+              preferences={state.preferences}
+              dirty={dirty}
+              onDone={(s) => {
+                setState(s);
+                setDialog(null);
+              }}
+            />
+          ) : (
+            <AccountEdit
+              dialog={dialog}
+              onDone={(s) => {
+                setState(s);
+                setDialog(null);
+              }}
+            />
+          )}
+        </Modal>
+      )}
+    </div>
+  );
+}
+function Modal({
+  title,
+  onClose,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    ref.current?.showModal();
+  }, []);
+  return (
+    <dialog
+      ref={ref}
+      className="modal"
+      onCancel={(e) => {
+        e.preventDefault();
+        onClose();
+      }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="modal-heading">
+        <h2>{title}</h2>
+        <button
+          className="icon-button"
+          aria-label="关闭对话框"
+          onClick={onClose}
+        >
+          <X size={18} />
+        </button>
+      </div>
+      {children}
+    </dialog>
+  );
+}
+function AddAccount({
+  login,
+  setLogin,
+  onDone,
+}: {
+  login: LoginState;
+  setLogin: (s: LoginState) => void;
+  onDone: (s: ViewState) => void;
+}) {
+  const [tab, setTab] = useState<"login" | "import" | "api">("login"),
+    [name, setName] = useState(""),
+    [key, setKey] = useState(""),
+    [error, setError] = useState(""),
+    [busy, setBusy] = useState(false);
+  const running = ["starting", "waiting", "cancelling"].includes(login.phase);
+  const perform = async (fn: () => Promise<void>) => {
+    setBusy(true);
+    setError("");
+    try {
+      await fn();
+    } catch (e) {
+      setError(errorOf(e).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-content">
+      <div className="segments">
+        {(["login", "import", "api"] as const).map((t) => (
+          <button
+            key={t}
+            className={tab === t ? "active" : ""}
+            onClick={() => setTab(t)}
+          >
+            {t === "login"
+              ? "ChatGPT 登录"
+              : t === "import"
+                ? "导入凭据"
+                : "API Key"}
+          </button>
+        ))}
+      </div>
+      {tab === "login" ? (
+        <>
+          <div className="login-illustration">
+            <img src="/icon.svg" alt="" />
+            <ArrowLeftRight size={20} />
+            <div>
+              <UserRound size={24} />
+            </div>
+          </div>
+          <h3 className="center">连接你的 ChatGPT 账号</h3>
+          <p className="dialog-help center">
+            通过官方 Codex 登录，成功后加入账号列表。
+          </p>
+          {login.message && login.phase !== "idle" && (
+            <div
+              className={"banner " + (login.phase === "error" ? "error" : "")}
+            >
+              {running ? (
+                <LoaderCircle size={16} className="spin" />
+              ) : (
+                <Check size={16} />
+              )}
+              <span>{login.message}</span>
+            </div>
+          )}
+          {login.code && running && (
+            <div className="device-code">
+              <span>在浏览器输入设备码</span>
+              <strong>{login.code}</strong>
+            </div>
+          )}
+          <div className="login-actions">
+            {running ? (
+              <>
+                <button
+                  className="primary"
+                  disabled={!login.url}
+                  onClick={() =>
+                    void perform(async () => {
+                      await command("open_login_url");
+                    })
+                  }
+                >
+                  打开登录页面
+                  <ExternalLink size={15} />
+                </button>
+                <button
+                  className="secondary"
+                  disabled={login.phase === "cancelling"}
+                  onClick={() =>
+                    void perform(async () => {
+                      await command("cancel_login");
+                      setLogin({
+                        ...login,
+                        phase: "cancelling",
+                        message: "正在取消登录…",
+                      });
+                    })
+                  }
+                >
+                  取消登录
+                </button>
+              </>
+            ) : (
+              <>
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() =>
+                    void perform(async () =>
+                      setLogin(
+                        await command("start_login", { mode: "browser" }),
+                      ),
+                    )
+                  }
+                >
+                  <LogIn size={16} />
+                  使用浏览器登录
+                </button>
+                <button
+                  className="text-button"
+                  disabled={busy}
+                  onClick={() =>
+                    void perform(async () =>
+                      setLogin(
+                        await command("start_login", { mode: "device" }),
+                      ),
+                    )
+                  }
+                >
+                  使用设备码
+                  <ChevronRight size={15} />
+                </button>
+              </>
+            )}
+          </div>
+        </>
+      ) : tab === "import" ? (
+        <>
+          <div className="import-area">
+            <Upload size={26} />
+            <h3>导入已有 auth.json</h3>
+            <p>完整保留账号凭据和附加字段。</p>
+            <button
+              className="primary"
+              disabled={busy}
+              onClick={() =>
+                void perform(async () => {
+                  const s = await command<ViewState | null>("import_auth_file");
+                  if (s) onDone(s);
+                })
+              }
+            >
+              <FolderOpen size={16} />
+              选择凭据文件
+            </button>
+          </div>
+          <button
+            className="secondary full"
+            disabled={busy}
+            onClick={() =>
+              void perform(async () => onDone(await command("import_current")))
+            }
+          >
+            从当前 Codex 目录导入
+          </button>
+        </>
+      ) : (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void perform(async () => {
+              const s = await command<ViewState>("add_api_key", { name, key });
+              setKey("");
+              onDone(s);
+            });
+          }}
+        >
+          <label className="field">
+            账号名称
+            <input
+              required
+              autoComplete="off"
+              maxLength={100}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="例如：开发 API"
+            />
+          </label>
+          <label className="field">
+            API Key
+            <input
+              required
+              type="password"
+              autoComplete="off"
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+              placeholder="输入 API Key"
+            />
+          </label>
+          <p className="dialog-help">API 地址与模型在配置页单独编辑。</p>
+          <button
+            className="primary full"
+            disabled={busy || !key.trim() || !name.trim()}
+          >
+            <Plus size={15} />
+            添加账号
+          </button>
+        </form>
+      )}
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <p className="privacy-note">凭据仅保存在这台设备。</p>
+    </div>
+  );
+}
+function SettingsForm({
+  preferences,
+  dirty,
+  onDone,
+}: {
+  preferences: Preferences;
+  dirty: boolean;
+  onDone: (s: ViewState) => void;
+}) {
+  const [prefs, setPrefs] = useState(preferences),
+    [error, setError] = useState(""),
+    [busy, setBusy] = useState(false);
+  const pick = async (kind: string) => {
+    try {
+      const path = await command<string | null>("pick_path", { kind });
+      if (path)
+        setPrefs((p) => ({
+          ...p,
+          [kind === "directory" ? "codexHome" : "cliPath"]: path,
+        }));
+    } catch (e) {
+      setError(errorOf(e).message);
+    }
+  };
+  return (
+    <form
+      className="modal-content"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (dirty && prefs.codexHome !== preferences.codexHome) {
+          setError("请先保存配置草稿，再切换 Codex 目录");
+          return;
+        }
+        setBusy(true);
+        void command<ViewState>("set_preferences", { preferences: prefs })
+          .then(onDone)
+          .catch((e) => setError(errorOf(e).message))
+          .finally(() => setBusy(false));
+      }}
+    >
+      <label className="field">
+        Codex 配置目录
+        <div className="path-input">
+          <input
+            required
+            value={prefs.codexHome}
+            onChange={(e) => setPrefs({ ...prefs, codexHome: e.target.value })}
+          />
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="选择 Codex 目录"
+            onClick={() => void pick("directory")}
+          >
+            <FolderOpen size={17} />
+          </button>
+        </div>
+      </label>
+      <label className="field">
+        Codex CLI 路径
+        <div className="path-input">
+          <input
+            value={prefs.cliPath}
+            placeholder="自动查找"
+            onChange={(e) => setPrefs({ ...prefs, cliPath: e.target.value })}
+          />
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="选择 Codex CLI"
+            onClick={() => void pick("file")}
+          >
+            <FolderOpen size={17} />
+          </button>
+        </div>
+      </label>
+      <p className="dialog-help">仅添加 ChatGPT 账号时需要官方 Codex CLI。</p>
+      <label className="field">外观</label>
+      <div className="segments theme-options">
+        {(["system", "dark", "light"] as const).map((t) => (
+          <button
+            key={t}
+            type="button"
+            className={prefs.theme === t ? "active" : ""}
+            onClick={() => setPrefs({ ...prefs, theme: t })}
+          >
+            {t === "system" ? (
+              <Monitor size={16} />
+            ) : t === "dark" ? (
+              <Moon size={16} />
+            ) : (
+              <Sun size={16} />
+            )}
+            {{ system: "跟随系统", dark: "深色", light: "浅色" }[t]}
+          </button>
+        ))}
+      </div>
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <button className="primary full" disabled={busy}>
+        保存设置
+      </button>
+    </form>
+  );
+}
+function AccountEdit({
+  dialog,
+  onDone,
+}: {
+  dialog: { action: "rename" | "delete"; account: Account };
+  onDone: (s: ViewState) => void;
+}) {
+  const [name, setName] = useState(dialog.account.name),
+    [error, setError] = useState(""),
+    [busy, setBusy] = useState(false);
+  return (
+    <form
+      className="modal-content"
+      onSubmit={(e) => {
+        e.preventDefault();
+        setBusy(true);
+        void command<ViewState>(
+          dialog.action === "rename" ? "rename_account" : "delete_account",
+          { id: dialog.account.id, name },
+        )
+          .then(onDone)
+          .catch((e) => setError(errorOf(e).message))
+          .finally(() => setBusy(false));
+      }}
+    >
+      {dialog.action === "rename" ? (
+        <label className="field">
+          账号名称
+          <input
+            autoFocus
+            required
+            maxLength={100}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </label>
+      ) : (
+        <p className="delete-copy">
+          从列表删除「{dialog.account.name}」？当前 Codex 登录文件会保留。
+        </p>
+      )}
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <button
+        className={
+          dialog.action === "delete" ? "danger-button full" : "primary full"
+        }
+        disabled={busy}
+      >
+        {dialog.action === "rename" ? "保存名称" : "删除账号"}
+      </button>
+    </form>
+  );
+}
