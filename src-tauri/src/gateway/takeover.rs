@@ -1,331 +1,600 @@
+//! Only the two credential values in the existing `custom` provider belong to us.
+//! Edits use parser byte spans: unrelated TOML is never serialized again.
 use crate::storage::{self, AppError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
-use toml_edit::{value, DocumentMut, Item, Table};
-pub const PROVIDER: &str = "gpt_switch_gateway";
+use toml_edit::{Document, Item};
+const FILE: &str = "gateway-recovery.json";
+const KEYS: [&str; 2] = ["base_url", "experimental_bearer_token"];
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Pair {
+    pub base_url: Option<String>,
+    pub token: Option<String>,
+}
+impl Pair {
+    pub fn new(base: &str, token: &str) -> Self {
+        Self {
+            base_url: Some(base.into()),
+            token: Some(token.into()),
+        }
+    }
+}
 #[derive(Serialize, Deserialize)]
 struct Journal {
+    version: u32,
     path: PathBuf,
-    original: Option<String>,
-    applied: String,
-    profile: Option<String>,
+    before: Pair,
+    applied: Pair,
+    exit: Pair,
+    live: bool,
+    #[serde(default)]
+    config_applied: bool,
+    #[serde(default)]
+    store_before: Option<String>,
+    #[serde(default)]
+    store_after: Option<String>,
 }
-fn parse(text: &str) -> Result<DocumentMut> {
-    text.parse()
-        .map_err(|_| AppError::new("TOML", "配置不是有效的 TOML，请先修复配置"))
+fn parse(text: &str) -> Result<Document<&str>> {
+    Document::parse(text).map_err(|_| AppError::new("TOML", "配置不是有效的 TOML，请先修复配置"))
 }
-fn selector(doc: &DocumentMut, profile: Option<&str>) -> Option<Item> {
-    match profile {
-        Some(p) => doc.get("profiles")?.get(p)?.get("model_provider"),
-        None => doc.get("model_provider"),
-    }
-    .cloned()
-}
-fn put_selector(doc: &mut DocumentMut, profile: Option<&str>, item: Option<Item>) {
-    let table: &mut dyn toml_edit::TableLike = match profile {
-        Some(p) => doc["profiles"][p]
-            .as_table_like_mut()
-            .expect("existing profile"),
-        None => doc.as_table_mut(),
-    };
-    if let Some(item) = item {
-        table.insert("model_provider", item);
-    } else {
-        table.remove("model_provider");
-    }
-}
-fn owned(doc: &DocumentMut, profile: Option<&str>) -> String {
-    format!(
-        "{:?}|{:?}",
-        selector(doc, profile).map(|x| x.to_string()),
-        doc.get("model_providers")
-            .and_then(|t| t.get(PROVIDER))
-            .map(ToString::to_string)
-    )
-}
-fn render(doc: &DocumentMut, reference: &str) -> String {
-    let raw = doc.to_string();
-    if reference.contains("\r\n") {
-        raw.replace("\r\n", "\n").replace('\n', "\r\n")
-    } else {
-        raw
-    }
-}
-pub fn import(home: &Path) -> Result<(String, String)> {
-    let bytes = storage::read_optional(&home.join("config.toml"))?.unwrap_or_default();
-    let text = String::from_utf8(bytes).map_err(|_| AppError::new("TOML", "配置不是 UTF-8"))?;
-    let doc = parse(&text)?;
+fn custom<'a>(doc: &'a Document<&str>) -> Result<&'a Item> {
     let profile = doc.get("profile").and_then(Item::as_str);
-    let id = selector(&doc, profile)
-        .or_else(|| selector(&doc, None))
-        .and_then(|i| i.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "openai".into());
-    if id == PROVIDER {
+    let selector = profile
+        .and_then(|p| doc.get("profiles")?.get(p)?.get("model_provider"))
+        .or_else(|| doc.get("model_provider"))
+        .and_then(Item::as_str);
+    if selector != Some("custom") {
         return Err(AppError::new(
-            "MANAGED",
-            "当前配置由本网关接管，请先停用网关再导入原供应商",
+            "CUSTOM",
+            "当前生效的 provider 不是 custom，请在配置编辑器中处理",
         ));
     }
-    let p = doc.get("model_providers").and_then(|t| t.get(&id));
-    let read = |k| {
-        p.and_then(|p| p.get(k))
-            .and_then(Item::as_str)
-            .map(str::to_owned)
+    doc.get("model_providers")
+        .and_then(|p| p.get("custom"))
+        .filter(|p| p.as_table_like().is_some())
+        .ok_or_else(|| {
+            AppError::new(
+                "CUSTOM",
+                "缺少现有 model_providers.custom，请在配置编辑器中处理",
+            )
+        })
+}
+fn pair(doc: &Document<&str>) -> Result<Pair> {
+    let p = custom(doc)?;
+    let read = |key| -> Result<Option<String>> {
+        p.get(key)
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| AppError::new("CUSTOM", "custom 的地址和 Token 必须是字符串"))
+            })
+            .transpose()
     };
-    let base =
-        read("base_url").ok_or_else(|| AppError::new("IMPORT", "当前 provider 没有 base_url"))?;
-    let token = read("experimental_bearer_token")
+    Ok(Pair {
+        base_url: read(KEYS[0])?,
+        token: read(KEYS[1])?,
+    })
+}
+pub fn read(home: &Path) -> Result<(String, Pair)> {
+    let raw = storage::read_optional(&home.join("config.toml"))?.ok_or_else(|| {
+        AppError::new("CUSTOM", "缺少 config.toml，请先在配置编辑器中设置 custom")
+    })?;
+    let text = std::str::from_utf8(&raw).map_err(|_| AppError::new("TOML", "配置不是 UTF-8"))?;
+    Ok((storage::digest(&raw), pair(&parse(text)?)?))
+}
+pub fn patch(text: &str, target: &Pair) -> Result<String> {
+    let doc = parse(text)?;
+    let p = custom(&doc)?;
+    pair(&doc)?;
+    let mut edits = vec![];
+    let mut missing = vec![];
+    for (key, next) in KEYS.into_iter().zip([&target.base_url, &target.token]) {
+        let next = next
+            .as_ref()
+            .ok_or_else(|| AppError::new("CUSTOM", "供应商地址和 Token 不完整"))?;
+        let encoded = toml_edit::Value::from(next.clone()).to_string();
+        if let Some(item) = p.get(key) {
+            if item.as_str() != Some(next) {
+                let span = item
+                    .as_value()
+                    .and_then(|v| v.span())
+                    .ok_or_else(|| AppError::new("TOML", "无法定位配置字段"))?;
+                edits.push((span, encoded));
+            }
+        } else {
+            missing.push((key, encoded));
+        }
+    }
+    if !missing.is_empty() {
+        let parent = doc.get("model_providers").unwrap();
+        let (container, prefix) = if p.as_table().is_some_and(|t| t.is_implicit())
+            || p.as_inline_table().is_some_and(|t| t.is_dotted())
+        {
+            if parent.as_table().is_some_and(|t| t.is_implicit()) {
+                (doc.as_item(), "model_providers.custom.")
+            } else {
+                (parent, "custom.")
+            }
+        } else {
+            (p, "")
+        };
+        let items: Vec<_> = missing
+            .iter()
+            .map(|(k, v)| format!("{prefix}{k} = {v}"))
+            .collect();
+        if let Some(t) = container.as_inline_table() {
+            let span = t
+                .span()
+                .ok_or_else(|| AppError::new("TOML", "无法定位内联表"))?;
+            let at = span.end - 1;
+            let join = if t.is_empty() { "" } else { ", " };
+            edits.push((at..at, format!("{join}{}", items.join(", "))));
+        } else {
+            let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+            let end = if prefix == "model_providers.custom." {
+                0
+            } else {
+                let span = container
+                    .as_table()
+                    .and_then(|t| t.span())
+                    .ok_or_else(|| AppError::new("TOML", "无法定位 custom 表"))?;
+                text[span.end..]
+                    .find('\n')
+                    .map(|i| span.end + i + 1)
+                    .unwrap_or(text.len())
+            };
+            let lead = if end > 0 && !text[..end].ends_with('\n') {
+                newline
+            } else {
+                ""
+            };
+            edits.push((end..end, format!("{lead}{}{newline}", items.join(newline))));
+        }
+    }
+    edits.sort_by_key(|(s, _)| std::cmp::Reverse(s.start));
+    let mut output = text.to_owned();
+    for (span, value) in edits {
+        output.replace_range(span, &value);
+    }
+    if pair(&parse(&output)?)? != *target {
+        return Err(AppError::new("VERIFY", "两字段配置验证失败"));
+    }
+    Ok(output)
+}
+fn write_pair(
+    path: &Path,
+    target: &Pair,
+    expected: Option<&str>,
+    allowed: Option<&[&Pair]>,
+) -> Result<()> {
+    let raw =
+        storage::read_optional(path)?.ok_or_else(|| AppError::new("CONFLICT", "配置已被移除"))?;
+    let revision = storage::digest(&raw);
+    if expected.is_some_and(|e| e != revision) {
+        return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
+    }
+    let text = std::str::from_utf8(&raw).map_err(|_| AppError::new("TOML", "配置不是 UTF-8"))?;
+    let current = pair(&parse(text)?)?;
+    if allowed.is_some_and(|pairs| !pairs.contains(&&current)) {
+        return Err(AppError::new(
+            "CONFLICT",
+            "custom 的地址或 Token 已被外部修改，已保留现场与事务记录",
+        ));
+    }
+    let output = patch(text, target)?;
+    if output != text {
+        storage::atomic_write(path, output.as_bytes(), Some(&revision))?;
+    }
+    Ok(())
+}
+fn save(data: &Path, record: &Journal) -> Result<()> {
+    let path = data.join(FILE);
+    let prior = storage::read_optional(&path)?;
+    storage::atomic_write(
+        &path,
+        &serde_json::to_vec(record).map_err(|_| AppError::new("RECOVERY", "无法生成事务记录"))?,
+        Some(&storage::revision(prior.as_deref())),
+    )
+}
+fn load(data: &Path) -> Result<Option<Journal>> {
+    let Some(raw) = storage::read_optional(&data.join(FILE))? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|_| AppError::new("RECOVERY", "恢复记录损坏，请保留并检查"))?;
+    if value.get("version").and_then(|v| v.as_u64()) != Some(2) {
+        return Err(AppError::new(
+            "RECOVERY",
+            "旧版接管记录尚未解除；已保留配置，请在配置编辑器中处理",
+        ));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|_| AppError::new("RECOVERY", "恢复记录格式无效"))
+}
+fn complete_store(data: &Path, record: &mut Journal) -> Result<()> {
+    if let Some(after) = &record.store_after {
+        let path = data.join("gateway.json");
+        let current = storage::read_optional(&path)?;
+        if current.as_deref() != Some(after.as_bytes()) {
+            storage::atomic_write(
+                &path,
+                after.as_bytes(),
+                Some(&storage::revision(
+                    record.store_before.as_deref().map(str::as_bytes),
+                )),
+            )?;
+        }
+        record.store_before = None;
+        record.store_after = None;
+        save(data, record)?;
+    }
+    Ok(())
+}
+pub fn import(home: &Path) -> Result<(String, String)> {
+    let (_, p) = read(home)?;
+    let base = p
+        .base_url
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::new("IMPORT", "当前 provider 没有 experimental_bearer_token"))?;
+        .ok_or_else(|| AppError::new("IMPORT", "custom 没有 base_url"))?;
+    let token = p
+        .token
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::new("IMPORT", "custom 没有 experimental_bearer_token"))?;
     if token.starts_with("gs_") && base.contains("127.0.0.1") {
         return Err(AppError::new("MANAGED", "不能导入网关的本地凭据"));
     }
     Ok((base, token))
 }
-pub fn attach(data: &Path, home: &Path, port: u16, token: &str) -> Result<()> {
-    let journal = data.join("gateway-recovery.json");
-    if journal.exists() {
+pub fn attach(
+    data: &Path,
+    home: &Path,
+    port: u16,
+    token: &str,
+    exit: Pair,
+    expected: &str,
+) -> Result<()> {
+    if data.join(FILE).exists() {
+        return Err(AppError::new("RECOVERY", "请先处理现有配置事务"));
+    }
+    let (revision, before) = read(home)?;
+    if revision != expected {
+        return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
+    }
+    let mut record = Journal {
+        version: 2,
+        path: home.join("config.toml"),
+        before,
+        applied: Pair::new(&format!("http://127.0.0.1:{port}/v1"), token),
+        exit,
+        live: true,
+        config_applied: false,
+        store_before: None,
+        store_after: None,
+    };
+    save(data, &record)?;
+    if let Err(e) = write_pair(&record.path, &record.applied, Some(expected), None) {
+        if read(home).is_ok_and(|(_, p)| p != record.applied) {
+            fs::remove_file(data.join(FILE)).map_err(storage::io_error)?;
+        }
+        return Err(e);
+    }
+    record.config_applied = true;
+    save(data, &record)
+}
+pub fn commit_store(
+    data: &Path,
+    home: &Path,
+    before_store: Option<String>,
+    after_store: String,
+    target: Pair,
+    running: bool,
+    expected_config: Option<&str>,
+) -> Result<()> {
+    let mut record = if running {
+        let record = load(data)?.ok_or_else(|| AppError::new("RECOVERY", "缺少网关事务记录"))?;
+        if record.store_after.is_some() {
+            return Err(AppError::new("RECOVERY", "请先停止网关并完成待处理事务"));
+        }
+        let (_, current) = read(home)?;
+        if current != record.applied {
+            return Err(AppError::new(
+                "CONFLICT",
+                "custom 的地址或 Token 已被外部修改",
+            ));
+        }
+        record
+    } else {
+        if data.join(FILE).exists() {
+            return Err(AppError::new("RECOVERY", "请先处理待恢复的配置事务"));
+        }
+        let (revision, before) = read(home)?;
+        if expected_config.is_some_and(|e| e != revision) {
+            return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
+        }
+        Journal {
+            version: 2,
+            path: home.join("config.toml"),
+            before,
+            applied: target.clone(),
+            exit: target.clone(),
+            live: false,
+            config_applied: false,
+            store_before: None,
+            store_after: None,
+        }
+    };
+    record.exit = target;
+    record.store_before = before_store;
+    record.store_after = Some(after_store);
+    save(data, &record)?;
+    if !running {
+        write_pair(
+            &record.path,
+            &record.applied,
+            expected_config,
+            Some(&[&record.before, &record.applied]),
+        )?;
+    }
+    record.config_applied = true;
+    save(data, &record)?;
+    complete_store(data, &mut record)?;
+    if !running {
+        fs::remove_file(data.join(FILE)).map_err(storage::io_error)?;
+    }
+    Ok(())
+}
+pub fn update_exit(data: &Path, target: Pair) -> Result<()> {
+    let mut record = load(data)?.ok_or_else(|| AppError::new("RECOVERY", "缺少网关事务记录"))?;
+    if record.store_after.is_some() {
+        return Err(AppError::new("RECOVERY", "供应商事务尚未完成"));
+    }
+    if record.exit != target {
+        record.exit = target;
+        save(data, &record)?;
+    }
+    Ok(())
+}
+/// Startup, normal stop and exit all finish the same transaction, preserving unrelated edits.
+pub fn detach(data: &Path) -> Result<()> {
+    let Some(mut record) = load(data)? else {
+        return Ok(());
+    };
+    let allowed = if record.config_applied {
+        vec![&record.applied, &record.exit]
+    } else {
+        vec![&record.before, &record.applied, &record.exit]
+    };
+    write_pair(&record.path, &record.exit, None, Some(&allowed))?;
+    complete_store(data, &mut record)?;
+    fs::remove_file(data.join(FILE)).map_err(storage::io_error)
+}
+pub fn recover(data: &Path) -> Result<()> {
+    let Some(raw) = storage::read_optional(&data.join(FILE))? else {
+        return Ok(());
+    };
+    let v: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|_| AppError::new("RECOVERY", "恢复记录损坏"))?;
+    if v.get("version").and_then(|v| v.as_u64()) == Some(2) {
+        return detach(data);
+    }
+    // v0.2 could leave a journal after the user already restored custom. Do not replay it.
+    let path = v
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(Path::new)
+        .ok_or_else(|| AppError::new("RECOVERY", "旧恢复记录无效"))?;
+    let text = fs::read_to_string(path).map_err(storage::io_error)?;
+    let doc = parse(&text)?;
+    let current = pair(&doc)?;
+    let applied = v
+        .get("applied")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::new("RECOVERY", "旧恢复记录无效"))?;
+    let old = parse(applied)?;
+    let managed = old
+        .get("model_providers")
+        .and_then(|p| p.get("gpt_switch_gateway"))
+        .ok_or_else(|| AppError::new("RECOVERY", "无法确认旧恢复记录的来源，已保留现场"))?;
+    let still_managed = doc
+        .get("model_providers")
+        .and_then(|p| p.get("gpt_switch_gateway"))
+        .is_some()
+        || managed.get("base_url").and_then(Item::as_str) == current.base_url.as_deref()
+        || managed
+            .get("experimental_bearer_token")
+            .and_then(Item::as_str)
+            == current.token.as_deref();
+    if still_managed {
         return Err(AppError::new(
             "RECOVERY",
-            "有尚未恢复的配置接管记录，请先停止接管并处理冲突",
+            "旧版接管尚未解除，已保留配置，请通过配置编辑器处理",
         ));
     }
-    let path = home.join("config.toml");
-    let raw = storage::read_optional(&path)?;
-    let original = raw
-        .as_ref()
-        .map(|b| String::from_utf8(b.clone()))
-        .transpose()
-        .map_err(|_| AppError::new("TOML", "配置不是 UTF-8"))?;
-    let text = original.as_deref().unwrap_or("");
-    let mut doc = parse(text)?;
-    if doc
-        .get("model_providers")
-        .and_then(|p| p.get(PROVIDER))
-        .is_some()
-    {
-        return Err(AppError::new(
-            "MANAGED",
-            "配置中已存在同名受管 provider，请先处理原记录",
-        ));
-    }
-    let profile = doc
-        .get("profile")
-        .and_then(Item::as_str)
-        .filter(|p| {
-            doc.get("profiles")
-                .and_then(|t| t.get(*p))
-                .and_then(|t| t.get("model_provider"))
-                .is_some()
-        })
-        .map(str::to_owned);
-    let old_id = selector(&doc, profile.as_deref())
-        .or_else(|| selector(&doc, None))
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "openai".into());
-    let mut provider = doc
-        .get("model_providers")
-        .and_then(|t| t.get(&old_id))
-        .and_then(|item| item.clone().into_table().ok())
-        .unwrap_or_default();
-    for key in [
-        "env_key",
-        "env_key_instructions",
-        "auth",
-        "experimental_bearer_token",
-    ] {
-        provider.remove(key);
-    }
-    for key in ["http_headers", "env_http_headers"] {
-        if let Some(headers) = provider.get_mut(key).and_then(Item::as_table_like_mut) {
-            let keys: Vec<_> = headers
-                .iter()
-                .filter(|(k, _)| {
-                    [
-                        "authorization",
-                        "proxy-authorization",
-                        "api-key",
-                        "x-api-key",
-                    ]
-                    .contains(&k.to_ascii_lowercase().as_str())
-                })
-                .map(|(k, _)| k.to_owned())
-                .collect();
-            for key in keys {
-                headers.remove(&key);
-            }
-        }
-    }
-    provider.insert("name", value("gpt-Switch"));
-    provider.insert("base_url", value(format!("http://127.0.0.1:{port}/v1")));
-    provider.insert("experimental_bearer_token", value(token));
-    provider.insert("requires_openai_auth", value(false));
-    if !provider.contains_key("wire_api") {
-        provider.insert("wire_api", value("responses"));
-    }
-    if doc.get("model_providers").is_none() {
-        let mut parent = Table::new();
-        parent.set_implicit(true);
-        doc.insert("model_providers", Item::Table(parent));
-    }
-    doc["model_providers"][PROVIDER] = if doc["model_providers"].is_inline_table() {
-        value(provider.into_inline_table())
-    } else {
-        Item::Table(provider)
-    };
-    put_selector(&mut doc, profile.as_deref(), Some(value(PROVIDER)));
-    let applied = render(&doc, text);
-    let record = Journal {
-        path: path.clone(),
-        original,
-        applied: applied.clone(),
-        profile,
-    };
-    storage::atomic_write(
-        &journal,
-        &serde_json::to_vec(&record).map_err(|_| AppError::new("RECOVERY", "无法生成恢复记录"))?,
-        Some("missing"),
-    )?;
-    // The journal is durable before the config write. A crash at either step is recoverable.
-    storage::atomic_write(
-        &path,
-        applied.as_bytes(),
-        Some(&storage::revision(raw.as_deref())),
-    )
+    fs::remove_file(data.join(FILE)).map_err(storage::io_error)
 }
-pub fn detach(data: &Path) -> Result<()> {
-    let journal = data.join("gateway-recovery.json");
-    let Some(raw) = storage::read_optional(&journal)? else {
-        return Ok(());
-    };
-    let record: Journal = serde_json::from_slice(&raw)
-        .map_err(|_| AppError::new("RECOVERY", "恢复记录损坏，请保留该记录并手动检查配置"))?;
-    let current = storage::read_optional(&record.path)?;
-    let text = current
-        .as_deref()
-        .map(std::str::from_utf8)
-        .transpose()
-        .map_err(|_| AppError::new("CONFLICT", "配置编码已变化，请手动检查接管记录"))?;
-    if text == record.original.as_deref() {
-        fs::remove_file(journal).map_err(storage::io_error)?;
-        return Ok(());
-    }
-    let output = if text == Some(&record.applied) {
-        record.original.clone()
-    } else {
-        let mut doc = parse(text.unwrap_or_default())?;
-        let applied = parse(&record.applied)?;
-        if owned(&doc, record.profile.as_deref()) != owned(&applied, record.profile.as_deref()) {
-            return Err(AppError::new("CONFLICT", "受管 provider 或选择器已被外部修改，已保留配置与恢复记录；恢复受管字段后可再次停止接管"));
-        }
-        let original = parse(record.original.as_deref().unwrap_or_default())?;
-        put_selector(
-            &mut doc,
-            record.profile.as_deref(),
-            selector(&original, record.profile.as_deref()),
-        );
-        if let Some(providers) = doc
-            .get_mut("model_providers")
-            .and_then(Item::as_table_like_mut)
-        {
-            providers.remove(PROVIDER);
-        }
-        if original.get("model_providers").is_none()
-            && doc
-                .get("model_providers")
-                .and_then(Item::as_table)
-                .is_some_and(Table::is_empty)
-        {
-            doc.remove("model_providers");
-        }
-        Some(render(&doc, text.unwrap_or_default()))
-    };
-    if let Some(output) = output {
-        storage::atomic_write(
-            &record.path,
-            output.as_bytes(),
-            Some(&storage::revision(current.as_deref())),
-        )?;
-    } else {
-        if storage::revision(storage::read_optional(&record.path)?.as_deref())
-            != storage::revision(current.as_deref())
-        {
-            return Err(AppError::new("CONFLICT", "配置在恢复时发生变化"));
-        }
-        fs::remove_file(&record.path).map_err(storage::io_error)?;
-    }
-    fs::remove_file(journal).map_err(storage::io_error)
-}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    const ORIGINAL: &str = "# settings\r\nmodel_provider='custom'\r\nmodel='unchanged'\r\n[model_providers.custom] # comment\r\nbase_url = 'https://original.test/v1' # address\r\nexperimental_bearer_token = 'old' # key\r\nsupports_websockets = false\r\nwire_api = 'responses'\r\n[other]\r\na=42\r\n";
+    pub fn masked(text: &str) -> String {
+        let doc = parse(text).unwrap();
+        let p = custom(&doc).unwrap();
+        let mut spans: Vec<_> = KEYS
+            .iter()
+            .filter_map(|k| p.get(k)?.as_value()?.span())
+            .collect();
+        spans.sort_by_key(|s| std::cmp::Reverse(s.start));
+        let mut s = text.to_owned();
+        for span in spans {
+            s.replace_range(span, "<value>");
+        }
+        s
+    }
     #[test]
-    fn takeover_roundtrip_and_external_edits() {
+    fn replacements_are_byte_exact_outside_two_values() {
+        for text in [ORIGINAL,"profile='work'\nprofiles={work={model_provider='custom',model='keep'}}\nmodel_providers = { custom = { base_url='https://x.test', experimental_bearer_token='a', other=true }, spare={x=1} }\n"] {
+            let out=patch(text,&Pair::new("https://next.test/prefix/v1","a\\b\"c\n" )).unwrap();
+            assert_eq!(masked(text),masked(&out));
+            assert_eq!(pair(&parse(&out).unwrap()).unwrap().token.as_deref(),Some("a\\b\"c\n"));
+        }
+    }
+    #[test]
+    fn missing_fields_insert_into_existing_normal_inline_and_dotted_tables() {
+        for text in ["model_provider='custom'\r\n[model_providers.custom] # keep\r\nname='stay'\r\n[next]\r\nx=1", "model_provider='custom'\nmodel_providers={custom={name='stay'},spare={x=1}}", "model_provider='custom'\n[model_providers]\ncustom.name='stay'\n", "model_provider='custom'\nmodel_providers.custom.name='stay'\n", "model_provider='custom'\nmodel_providers={custom.name='stay'}\n"] {
+            let out=patch(text,&Pair::new("https://x.test","k")).unwrap();
+            assert_eq!(pair(&parse(&out).unwrap()).unwrap().token.as_deref(),Some("k"));
+            assert!(out.contains("name='stay'"));
+        }
+        for text in [
+            "",
+            "model_provider='other'\n[model_providers.custom]\nx=1",
+            "model_provider='custom'\n",
+            "model_provider='custom'\n[model_providers.custom]\nbase_url=42",
+        ] {
+            assert!(patch(text, &Pair::new("https://x.test", "k")).is_err());
+        }
+    }
+    #[test]
+    fn stop_writes_current_provider_preserving_unrelated_edits_and_auth() {
         let t = tempfile::tempdir().unwrap();
-        let data = t.path().join("data");
-        let home = t.path().join("home");
-        storage::private_dir(&data).unwrap();
-        storage::private_dir(&home).unwrap();
-        let original = "# keep\r\nmodel = 'custom-model'\r\nmodel_provider = 'custom'\r\n[model_providers.custom]\r\nbase_url = 'https://example.test/sub/v1'\r\nexperimental_bearer_token = 'fixture'\r\nsupports_websockets = true\r\n";
-        let path = home.join("config.toml");
-        fs::write(&path, original).unwrap();
-        fs::write(home.join("auth.json"), "auth-unchanged").unwrap();
-        attach(&data, &home, 15722, "local-test").unwrap();
-        let doc = parse(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            doc["model_providers"][PROVIDER]["supports_websockets"].as_bool(),
-            Some(true)
-        );
-        assert!(import(&home).is_err());
-        detach(&data).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        attach(&data, &home, 15722, "local-test").unwrap();
+        let path = t.path().join("config.toml");
+        fs::write(&path, ORIGINAL).unwrap();
+        fs::write(t.path().join("auth.json"), "untouched").unwrap();
+        attach(
+            t.path(),
+            t.path(),
+            15722,
+            "local",
+            Pair::new("https://a.test", "a"),
+            &read(t.path()).unwrap().0,
+        )
+        .unwrap();
         let live = fs::read_to_string(&path)
             .unwrap()
-            .replace("custom-model", "external-model");
-        fs::write(&path, live).unwrap();
-        detach(&data).unwrap();
-        let result = fs::read_to_string(&path).unwrap();
-        assert!(result.contains("external-model"));
-        assert!(!result.contains(PROVIDER));
-        assert!(result.contains("# keep\r\n"));
-        assert_eq!(
-            fs::read_to_string(home.join("auth.json")).unwrap(),
-            "auth-unchanged"
-        );
-    }
-    #[test]
-    fn inline_tables_and_profile_selector_roundtrip() {
-        let t = tempfile::tempdir().unwrap();
-        let path = t.path().join("config.toml");
-        let original = "# inline example\nprofile='work'\nprofiles={work={model_provider='original',model='keep'}}\nmodel_providers={original={base_url='https://example.test/v1',experimental_bearer_token='fixture',supports_websockets=true}}\n";
-        fs::write(&path, original).unwrap();
-        attach(t.path(), t.path(), 15722, "local-test").unwrap();
-        let doc = parse(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(
-            doc["profiles"]["work"]["model_provider"].as_str(),
-            Some(PROVIDER)
-        );
-        assert_eq!(
-            doc["model_providers"][PROVIDER]["supports_websockets"].as_bool(),
-            Some(true)
-        );
+            .replace("model='unchanged'", "model='external'");
+        fs::write(&path, &live).unwrap();
+        update_exit(t.path(), Pair::new("https://b.test", "b")).unwrap();
         detach(t.path()).unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), original);
+        let output = fs::read_to_string(&path).unwrap();
+        assert_eq!(masked(&output), masked(&live));
+        assert_eq!(
+            read(t.path()).unwrap().1.base_url.as_deref(),
+            Some("https://b.test")
+        );
+        assert_eq!(
+            fs::read_to_string(t.path().join("auth.json")).unwrap(),
+            "untouched"
+        );
+        assert!(!t.path().join(FILE).exists());
     }
     #[test]
-    fn conflict_and_crash_before_write() {
+    fn owned_field_conflict_and_revision_failure_preserve_scene() {
         let t = tempfile::tempdir().unwrap();
-        attach(t.path(), t.path(), 15722, "local-test").unwrap();
         let path = t.path().join("config.toml");
-        let applied = fs::read_to_string(&path).unwrap();
-        fs::write(&path, applied.replace("local-test", "edited")).unwrap();
+        fs::write(&path, ORIGINAL).unwrap();
+        assert!(attach(
+            t.path(),
+            t.path(),
+            15722,
+            "local",
+            Pair::new("https://a.test", "a"),
+            "stale"
+        )
+        .is_err());
+        assert!(!t.path().join(FILE).exists());
+        attach(
+            t.path(),
+            t.path(),
+            15722,
+            "local",
+            Pair::new("https://a.test", "a"),
+            &read(t.path()).unwrap().0,
+        )
+        .unwrap();
+        let changed = fs::read_to_string(&path)
+            .unwrap()
+            .replace("local", "externally-edited");
+        fs::write(&path, &changed).unwrap();
         assert!(detach(t.path()).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), changed);
+        assert!(t.path().join(FILE).exists());
+    }
+    #[test]
+    fn crash_between_config_and_store_finishes_transaction_and_protects_permissions() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("config.toml");
+        fs::write(&path, ORIGINAL).unwrap();
+        let old = Pair::new("https://original.test/v1", "old");
+        let new = Pair::new("https://next.test", "new");
+        let mut record = Journal {
+            version: 2,
+            path: path.clone(),
+            before: old,
+            applied: new.clone(),
+            exit: new.clone(),
+            live: false,
+            config_applied: false,
+            store_before: None,
+            store_after: Some("{\"selected\":\"new\"}".into()),
+        };
+        save(t.path(), &record).unwrap();
+        write_pair(&path, &new, None, None).unwrap();
+        record.config_applied = true;
+        save(t.path(), &record).unwrap();
+        recover(t.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(t.path().join("gateway.json")).unwrap(),
+            "{\"selected\":\"new\"}"
+        );
+        assert_eq!(
+            masked(&fs::read_to_string(&path).unwrap()),
+            masked(ORIGINAL)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+    #[test]
+    fn legacy_already_restored_keeps_current_credentials_and_active_legacy_is_blocked() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("config.toml");
+        fs::write(&path, ORIGINAL).unwrap();
+        let applied="model_provider='gpt_switch_gateway'\n[model_providers.gpt_switch_gateway]\nbase_url='http://127.0.0.1:15722/v1'\nexperimental_bearer_token='gs_local'\n";
+        let old =
+            serde_json::json!({"path":path,"original":ORIGINAL,"applied":applied,"profile":null});
+        fs::write(t.path().join(FILE), old.to_string()).unwrap();
+        recover(t.path()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), ORIGINAL);
+        fs::write(t.path().join(FILE), old.to_string()).unwrap();
         fs::write(&path, applied).unwrap();
-        detach(t.path()).unwrap();
-        assert!(!path.exists());
+        assert!(recover(t.path()).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), applied);
+    }
+    #[test]
+    fn journal_write_failure_never_changes_config() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("config.toml");
+        fs::write(&path, ORIGINAL).unwrap();
+        fs::create_dir(t.path().join(FILE)).unwrap();
+        assert!(attach(
+            t.path(),
+            t.path(),
+            15722,
+            "local",
+            Pair::new("https://a.test", "a"),
+            &read(t.path()).unwrap().0
+        )
+        .is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), ORIGINAL);
     }
 }

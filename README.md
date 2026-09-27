@@ -25,13 +25,23 @@ ChatGPT 登录需要本机已安装 [官方 Codex CLI](https://developers.openai
 
 ## 本地网关
 
-在“网关”添加 `base_url` 和 `experimental_bearer_token`，或从当前 Codex 配置导入。应用不会导入自身的受管 provider。启用会先绑定 `127.0.0.1:15722`，再添加独立 provider 并切换选择器；首次启用或停用后重新打开 Codex。供应商切换即时作用于新请求，进行中的流保持原连接。停止或正常退出会恢复受管字段；外部修改冲突时保留现场，修复后再次停止。异常退出后，下次启动先恢复。更换 Codex 目录前须先停用网关。
+在“网关”添加 `base_url` 和 `experimental_bearer_token`，或从现有 `custom` 配置导入。当前生效的 provider 必须为 `custom`，且已有 `[model_providers.custom]`。应用只替换该表中的两个字段，不新增 provider，不改选择器、模型、协议或其他设置；其余配置字节、注释和换行保持原样。
+
+启用先绑定 `127.0.0.1:15722`，再将两字段替换为本地地址和访问令牌。运行时切换供应商只更新内部路由，新请求生效，进行中的连接保持原供应商。关闭网关时选择供应商会直接写入其地址和 Key。**停用或正常退出写入当前供应商，不恢复启用前供应商**；自动模式使用最近成功响应的供应商，没有成功记录时使用队首。写入文件后需要重新打开 Codex，不自动重启客户端。
+
+两字段受到外部修改时停止覆盖并保留事务记录；其他字段的外部编辑会保留。异常退出后，下次启动按同一事务完成写入。旧版已经解除接管的失效记录只清理元数据；仍由旧 provider 接管时提示处理，不执行旧版整份配置回滚。更换 Codex 目录前须先停用网关。
 
 网关只转发发往供应商 `base_url` 的 API：未知路径、Responses、compact、models、搜索、图片和上传均使用同一原始载荷通道，包括 SSE 和 WebSocket。登录、插件和 MCP 的其他地址不经过网关。`base_url` 子路径按输入保留，不猜测 `/v1`；本地 `/v1` 前缀替换为上游 base 路径。重定向原样返回。Bearer 认证替换为上游 Token，连接头按 HTTP 规范处理，模型和业务参数不重写。
 
 自动模式每次从 P1 开始，跳过熔断项，每家最多一次，默认最多四家。默认连续失败 4 次、错误率 60% / 最小 10 次、恢复等待 60 秒、半开 2 次成功；半开只放行一个探测。首字节 60 秒、流静默 120 秒、非流式总超时 600 秒。`400/405/406/413/414/415/422/501` 直接返回且不计故障；客户端取消为中性。有效 Retry-After 延长冷却。已向客户端提交输出后不重试，WebSocket 升级后不换商；已知 previous_response_id 固定原供应商，未知归属仅尝试一次。gzip / deflate / zstd 和磁盘暂存的 JSON 只流式读取路由归属，原始载荷不变；无法解析的 JSON 或未知压缩编码保守地只尝试一次。
 
 请求最多 1 GiB，超过 2 MiB 使用权限受限的临时文件重放，完成或取消后清理。供应商和代理健康独立：代理连接或认证失败会跳过共享代理的其他候选；目标连接和 HTTP 错误归供应商。仅保留内存中的最近 40 条元数据，不记录请求/响应正文与凭据。故障转移来源和改动见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## Key 额度
+
+网关页使用供应商现有 Key，优先查询 Sub2API `/v1/usage`；未识别时回退到同一部署路径的 New API `/api/usage/token/`。支持余额、Key 配额、无限额度、订阅日／周／月窗口、5 小时／日／周限制、到期、重置及已返回的使用统计。New API 使用公开 `/api/status` 的比例和货币设置换算；信息不足时显示原始“额度单位”。不支持的站点显示“不可查询”，认证、限流、网络和代理错误分别显示原因。
+
+进入网关页时查询，可见期间每 60 秒刷新；隐藏窗口或离开页面暂停，并提供单项及全部手动刷新。失败保留上次结果并标记过期。额度查询沿用供应商的代理与严格 TLS，失败不会静默直连；不调用模型、不触发业务熔断，也不更改故障转移选择。关闭本地网关时仍可查询额度；Codex 本身的供应商代理仅在网关运行时生效。
 
 ## 供应商代理
 
@@ -41,7 +51,7 @@ SOCKS5 本身不加密；HTTPS 供应商内容仍经端到端 TLS 加密。腾�
 
 ## 本地数据
 
-数据目录为 Tauri 的 `com.lich13.gpt-switch` 应用数据目录（macOS：`~/Library/Application Support/com.lich13.gpt-switch`；Windows：`%APPDATA%/com.lich13.gpt-switch`）。`accounts.json` 保存完整账号，`previous-auth.json`、`previous-config.toml` 各保留一份最近写入前的文件。`gateway.json` 独立保存供应商、代理及本地访问令牌，`gateway-recovery.json` 在接管期间保存恢复信息。供应商 Token 仅用于其上游认证，代理密码仅用于 SOCKS5 握手；凭据不写日志、不返回到列表或事件。文件采用当前用户权限，**未加密**，应像原 `auth.json` 一样保护。
+数据目录为 Tauri 的 `com.lich13.gpt-switch` 应用数据目录（macOS：`~/Library/Application Support/com.lich13.gpt-switch`；Windows：`%APPDATA%/com.lich13.gpt-switch`）。`accounts.json` 保存完整账号，`previous-auth.json`、`previous-config.toml` 各保留一份最近写入前的文件。`gateway.json` 独立保存供应商、代理及本地访问令牌，`gateway-recovery.json` 保存版本化的两字段事务与停止目标，写入完成后清理。供应商 Token 仅用于其上游认证，代理密码仅用于 SOCKS5 握手；凭据不写日志、不返回到列表或事件。文件采用当前用户权限，**未加密**，应像原 `auth.json` 一样保护。
 
 ## 开发与验证
 
@@ -57,7 +67,7 @@ cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D w
 pnpm tauri dev
 ```
 
-`pnpm dev` 是标明“预览”的模拟界面，真实凭据只能在桌面应用中操作。`--smoke-test <绝对输出路径>` 使用独立临时账号和配置，验证 WebView、托盘、账号切换、网关监听与认证、接管恢复和 auth 不变后退出，不接触真实 Codex 目录。
+`pnpm dev` 是标明“预览”的模拟界面，真实凭据只能在桌面应用中操作。`--smoke-test <绝对输出路径>` 使用独立临时账号和配置，验证 WebView、托盘、账号切换、网关监听与认证、两字段切换、退出恢复和 auth 不变后退出，不接触真实 Codex 目录。
 
 `pnpm icons` 从原创 SVG 生成 9 档 PNG、黑白托盘图标、ICNS 和 ICO。发布通过 CI 构建三平台安装包及校验和；真实 OAuth 和操作系统托盘交互验收与自动冒烟测试分别记录。
 

@@ -80,6 +80,7 @@ fn show(app: &tauri::AppHandle, page: &str) -> Result<()> {
         w.show()
             .map_err(|_| AppError::new("WINDOW", "无法显示主窗口"))?;
         let _ = w.set_focus();
+        let _ = app.emit("app-visibility", true);
         let _ = app.emit("navigate", page);
     }
     Ok(())
@@ -182,6 +183,7 @@ fn publish(app: &tauri::AppHandle, state: ViewState) {
 }
 fn refresh(app: &tauri::AppHandle, r: &Runtime) -> Result<ViewState> {
     let state = lock(&r.core)?.state()?;
+    r.gateway.observe_home(&lock(&r.core)?.home());
     publish(app, state.clone());
     Ok(state)
 }
@@ -456,25 +458,56 @@ fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
 }
 #[tauri::command]
 fn get_gateway(r: tauri::State<'_, Arc<Runtime>>) -> gateway::View {
+    if let Ok(core) = lock(&r.core) {
+        r.gateway.observe_home(&core.home());
+    }
     r.gateway.view()
 }
 #[tauri::command]
 fn update_gateway(
+    app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
     edit: gateway::Edit,
     expected_revision: String,
+    expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
     let home = lock(&r.core)?.home();
-    r.gateway.edit(edit, &expected_revision, &home)
+    let selected = matches!(&edit, gateway::Edit::Select { .. });
+    let result = r.gateway.edit_checked(
+        edit,
+        &expected_revision,
+        &home,
+        expected_config_revision.as_deref(),
+    )?;
+    let _ = refresh(&app, &r);
+    if selected {
+        let _ = app.emit(
+            "switch-notice",
+            if result.running {
+                "已切换供应商，新请求立即生效"
+            } else {
+                "文件已切换，请重新打开 Codex"
+            },
+        );
+    }
+    Ok(result)
 }
 #[tauri::command]
 async fn start_gateway(
     app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
     expected_revision: String,
+    expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
     let home = lock(&r.core)?.home();
-    let result = r.gateway.start(&expected_revision, &home).await?;
+    let result = r
+        .gateway
+        .start_checked(
+            &expected_revision,
+            &home,
+            expected_config_revision.as_deref(),
+        )
+        .await?;
     let _ = refresh(&app, &r);
     let _ = app.emit("switch-notice", "网关已启用，请重新打开 Codex");
     Ok(result)
@@ -483,15 +516,27 @@ async fn start_gateway(
 async fn stop_gateway(
     app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
+    expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
-    let result = r.gateway.stop().await?;
+    let result = r
+        .gateway
+        .stop_checked(expected_config_revision.as_deref())
+        .await?;
     let _ = refresh(&app, &r);
-    let _ = app.emit("switch-notice", "原配置已恢复，请重新打开 Codex");
+    let _ = app.emit("switch-notice", "已写入当前供应商，请重新打开 Codex");
     Ok(result)
 }
 #[tauri::command]
 async fn test_provider(r: tauri::State<'_, Arc<Runtime>>, id: String) -> Result<u64> {
     r.gateway.test_connection(&id).await
+}
+#[tauri::command]
+async fn query_provider_quota(
+    r: tauri::State<'_, Arc<Runtime>>,
+    provider_id: String,
+    force: bool,
+) -> Result<gateway::QuotaView> {
+    r.gateway.query_quota(&provider_id, force).await
 }
 #[tauri::command]
 async fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
@@ -500,7 +545,7 @@ async fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>
             let mut c = lock(&r.core)?;
             let a = c.add_api_key("Smoke A", "fixture-only-a")?;
             let b = c.add_api_key("Smoke B", "fixture-only-b")?;
-            let text = "# smoke\nmodel = 'fixture'\n[future]\nkeep = true\n";
+            let text = "# smoke\nmodel = 'fixture'\nmodel_provider = 'custom'\n[model_providers.custom]\nbase_url = \"https://example.invalid/v1\"\nexperimental_bearer_token = \"fixture-only\"\nwire_api = 'responses'\n[future]\nkeep = true\n";
             c.save_config(text, "missing")?;
             let cfg = c.state()?.config_revision;
             for id in [&a, &b, &a] {
@@ -533,12 +578,25 @@ async fn prepare_exit_smoke(r: &Runtime) -> Result<SmokeSnapshot> {
     let home = lock(&r.core)?.home();
     let snapshot = SmokeSnapshot {
         auth: storage::read_optional(&home.join("auth.json"))?,
-        config: storage::read_optional(&home.join("config.toml"))?,
+        config: storage::read_optional(&home.join("config.toml"))?.map(|raw| {
+            String::from_utf8(raw)
+                .unwrap()
+                .replace("https://backup.invalid/v1", "https://example.invalid/v1")
+                .replace("fixture-backup", "fixture-only")
+                .into_bytes()
+        }),
         home,
     };
     r.gateway
         .start(&r.gateway.view().revision, &snapshot.home)
         .await?;
+    r.gateway.edit(
+        gateway::Edit::Select {
+            id: r.gateway.view().providers[0].id.clone(),
+        },
+        &r.gateway.view().revision,
+        &snapshot.home,
+    )?;
     Ok(snapshot)
 }
 fn report_exit_smoke(app: &tauri::AppHandle, r: &Runtime, restored: Result<()>) -> Result<()> {
@@ -594,7 +652,34 @@ async fn gateway_smoke(r: &Runtime) -> Result<()> {
         &r.gateway.view().revision,
         &home,
     )?;
+    r.gateway.edit(
+        gateway::Edit::SaveProvider {
+            id: None,
+            base_url: "https://backup.invalid/v1".into(),
+            token: "fixture-backup".into(),
+        },
+        &r.gateway.view().revision,
+        &home,
+    )?;
     r.gateway.start(&r.gateway.view().revision, &home).await?;
+    let live = storage::read_optional(&home.join("config.toml"))?;
+    r.gateway.edit(
+        gateway::Edit::Select {
+            id: r.gateway.view().providers[1].id.clone(),
+        },
+        &r.gateway.view().revision,
+        &home,
+    )?;
+    if live != storage::read_optional(&home.join("config.toml"))? {
+        return Err(AppError::new("SMOKE", "运行中换商修改了配置"));
+    }
+    let config = config.map(|raw| {
+        String::from_utf8(raw)
+            .unwrap()
+            .replace("https://example.invalid/v1", "https://backup.invalid/v1")
+            .replace("fixture-only", "fixture-backup")
+            .into_bytes()
+    });
     let mut connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .map_err(storage::io_error)?;
@@ -674,10 +759,24 @@ pub fn run() {
                 smoke_result: Mutex::new(None),
                 fixture: Mutex::new(fixture),
             });
+            runtime.gateway.observe_home(&lock(&runtime.core)?.home());
             let state = lock(&runtime.core)?.state()?;
             app.manage(runtime.clone());
             #[cfg(target_os = "macos")]
             app.set_menu(application_menu(app.handle())?)?;
+            let mut quota_events = runtime.gateway.quota_events();
+            let quota_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match quota_events.recv().await {
+                        Ok(view) => {
+                            let _ = quota_app.emit("provider-quota", view);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
             let mut gateway_events = runtime.gateway.subscribe();
             let gateway_runtime = runtime.clone();
             let gateway_app = app.handle().clone();
@@ -739,26 +838,40 @@ pub fn run() {
                     }
                     "gateway-auto" => {
                         if let Ok(c) = lock(&r.core) {
-                            let _ = r.gateway.edit(
+                            if let Err(e) = r.gateway.edit(
                                 gateway::Edit::Mode {
                                     mode: "auto".into(),
                                 },
                                 &r.gateway.view().revision,
                                 &c.home(),
-                            );
+                            ) {
+                                let _ = app.emit("switch-error", e);
+                            }
                         }
                     }
                     _ => {
                         if let Some(provider) = id.strip_prefix("provider:") {
                             if let Ok(c) = lock(&r.core) {
-                                if let Err(e) = r.gateway.edit(
+                                match r.gateway.edit(
                                     gateway::Edit::Select {
                                         id: provider.into(),
                                     },
                                     &r.gateway.view().revision,
                                     &c.home(),
                                 ) {
-                                    let _ = app.emit("switch-error", e);
+                                    Ok(state) => {
+                                        let _ = app.emit(
+                                            "switch-notice",
+                                            if state.running {
+                                                "供应商已切换，新请求已生效"
+                                            } else {
+                                                "配置已切换，请重新打开 Codex"
+                                            },
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let _ = app.emit("switch-error", e);
+                                    }
                                 }
                             }
                         }
@@ -795,6 +908,10 @@ pub fn run() {
                     match result {
                         Ok(s) => {
                             if last.as_ref() != Some(&s) {
+                                runtime.gateway.observe_home(
+                                    &lock(&runtime.core).map(|c| c.home()).unwrap_or_default(),
+                                );
+                                let _ = handle.emit("gateway-state", runtime.gateway.view());
                                 last = Some(s.clone());
                                 publish(&handle, s);
                             }
@@ -836,6 +953,7 @@ pub fn run() {
                 if !r.quitting.load(Ordering::Relaxed) {
                     api.prevent_close();
                     let _ = w.hide();
+                    let _ = w.emit("app-visibility", false);
                     #[cfg(target_os = "macos")]
                     let _ = w
                         .app_handle()
@@ -849,6 +967,7 @@ pub fn run() {
             start_gateway,
             stop_gateway,
             test_provider,
+            query_provider_quota,
             get_state,
             switch_account,
             import_current,

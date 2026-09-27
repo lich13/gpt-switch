@@ -128,4 +128,16 @@ describe("gateway controls", () => {
       expectedRevision: state.revision,
     });
   });
+  it("switches a stopped provider with the visible config revision and restart feedback", async () => {
+    const notify = vi.fn();
+    const user = userEvent.setup();
+    render(<Gateway section="gateway" notify={notify} />);
+    await user.click(await screen.findByRole("button", { name: "选择" }));
+    expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+      edit: { op: "select", id: "backup" },
+      expectedRevision: state.revision,
+      expectedConfigRevision: state.configRevision,
+    });
+    expect(notify).toHaveBeenCalledWith("文件已切换，请重新打开 Codex");
+  });
 });

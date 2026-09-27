@@ -97,6 +97,12 @@ where
 }
 async fn fixture(urls: Vec<String>) -> (tempfile::TempDir, Gateway) {
     let t = tempfile::tempdir().unwrap();
+    let first = urls
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "https://example.test/v1".into());
+    let config=format!("# fixture\nmodel_provider='custom'\n[model_providers.custom]\nbase_url = {}\nexperimental_bearer_token = \"upstream-fixture-token\"\nwire_api='responses'\nsupports_websockets=false\n",serde_json::to_string(&first).unwrap());
+    std::fs::write(t.path().join("config.toml"), config).unwrap();
     let g = Gateway::new(t.path().to_path_buf()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -377,7 +383,7 @@ async fn port_conflict_startup_recovery_and_single_candidate_breaker() {
         .await
         .unwrap();
     assert!(g.start(&g.view().revision, t.path()).await.is_err());
-    assert!(!t.path().join("config.toml").exists());
+    assert!(takeover::read(t.path()).is_ok());
     drop(occupied);
     update(
         &g,
@@ -391,10 +397,19 @@ async fn port_conflict_startup_recovery_and_single_candidate_breaker() {
     assert_eq!(request(&g, "/v1/a", vec![], vec![]).await.status(), 503);
     assert!(g.view().providers[0].health.retry_in >= 119);
     g.stop().await.unwrap();
-    takeover::attach(t.path(), t.path(), g.view().settings.port, "fixture-crash").unwrap();
+    let (_, pair) = takeover::read(t.path()).unwrap();
+    takeover::attach(
+        t.path(),
+        t.path(),
+        g.view().settings.port,
+        "fixture-crash",
+        pair,
+        &takeover::read(t.path()).unwrap().0,
+    )
+    .unwrap();
     let recovered = Gateway::new(t.path().to_path_buf()).unwrap();
     assert!(!recovered.guarded_home());
-    assert!(!t.path().join("config.toml").exists());
+    assert!(takeover::read(t.path()).is_ok());
 }
 
 async fn socks(auth: bool) -> (u16, Arc<Mutex<Vec<String>>>, Arc<AtomicUsize>) {
@@ -1025,7 +1040,7 @@ async fn real_codex_cli_with_isolated_home() {
     // A valid disposable auth file proves the CLI used the managed provider, never the real account.
     let auth = b"{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"fixture-only\"}";
     storage::atomic_write(&t.path().join("auth.json"), auth, None).unwrap();
-    let config=format!("model = {}\nmodel_provider = 'original'\n[model_providers.original]\nname = 'Original'\nwire_api = 'responses'\nsupports_websockets = false\n",serde_json::to_string(private["model"].as_str().unwrap()).unwrap());
+    let config=format!("model = {}\nmodel_provider = 'custom'\n[model_providers.custom]\nname = 'Original'\nwire_api = 'responses'\nsupports_websockets = false\nbase_url = {}\nexperimental_bearer_token = {}\n",serde_json::to_string(private["model"].as_str().unwrap()).unwrap(),serde_json::to_string(private["baseUrl"].as_str().unwrap()).unwrap(),serde_json::to_string(private["token"].as_str().unwrap()).unwrap());
     storage::atomic_write(&t.path().join("config.toml"), config.as_bytes(), None).unwrap();
     start(&g, &t).await;
     let result = tokio::time::timeout(
@@ -1136,4 +1151,468 @@ async fn compressed_and_spooled_json_replay_exactly_across_failover() {
     }
     assert_eq!(std::fs::read_dir(g.0.spool.path()).unwrap().count(), 0);
     g.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn custom_only_switch_while_stopped_running_and_auto_stop() {
+    let ok = server(|_| async { Response::new(full("ok")) }).await;
+    let (t, g) = fixture(vec![
+        "https://a.test/v1".into(),
+        format!("http://127.0.0.1:{ok}"),
+    ])
+    .await;
+    let b = g.view().providers[1].id.clone();
+    let path = t.path().join("config.toml");
+    let initial = std::fs::read_to_string(&path).unwrap();
+    let old_rev = takeover::read(t.path()).unwrap().0;
+    assert!(g
+        .edit_checked(
+            Edit::Select { id: b.clone() },
+            &g.view().revision,
+            t.path(),
+            Some("stale")
+        )
+        .is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
+    g.edit_checked(
+        Edit::Select { id: b.clone() },
+        &g.view().revision,
+        t.path(),
+        Some(&old_rev),
+    )
+    .unwrap();
+    assert_eq!(g.view().config_provider.as_deref(), Some(b.as_str()));
+    let direct = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        direct,
+        initial.replace("https://a.test/v1", &format!("http://127.0.0.1:{ok}"))
+    );
+    start(&g, &t).await;
+    let live = std::fs::read(&path).unwrap();
+    let a = g.view().providers[0].id.clone();
+    update(&g, &t, Edit::Select { id: a });
+    assert_eq!(std::fs::read(&path).unwrap(), live);
+    update(
+        &g,
+        &t,
+        Edit::Mode {
+            mode: "auto".into(),
+        },
+    );
+    update(
+        &g,
+        &t,
+        Edit::QueueProvider {
+            id: g.view().providers[0].id.clone(),
+            queued: false,
+        },
+    );
+    let response = request(&g, "/v1/new", vec![], vec![]).await;
+    assert_eq!(response.status(), 200);
+    response.into_body().collect().await.unwrap();
+    assert_eq!(g.view().last_successful.as_deref(), Some(b.as_str()));
+    assert_eq!(std::fs::read(&path).unwrap(), live);
+    g.stop().await.unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), direct);
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("auth.json")).unwrap(),
+        "unchanged-auth"
+    );
+}
+#[tokio::test]
+async fn running_cannot_delete_final_exit_provider_and_crash_uses_updated_target() {
+    let (t, g) = fixture(vec!["https://a.test/v1".into(), "https://b.test/v1".into()]).await;
+    start(&g, &t).await;
+    let a = g.view().providers[0].id.clone();
+    let b = g.view().providers[1].id.clone();
+    update(&g, &t, Edit::Select { id: b.clone() });
+    update(&g, &t, Edit::DeleteProvider { id: a });
+    assert!(g
+        .edit(Edit::DeleteProvider { id: b }, &g.view().revision, t.path())
+        .is_err());
+    takeover::recover(t.path()).unwrap();
+    assert_eq!(
+        takeover::read(t.path()).unwrap().1.base_url.as_deref(),
+        Some("https://b.test/v1")
+    );
+    g.stop().await.unwrap();
+}
+#[tokio::test]
+async fn quota_sub2_priority_singleflight_cache_and_health_isolation() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let port = server(move |req| {
+        let hits = counted.clone();
+        async move {
+            hits.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(req.uri().path(), "/prefix/v1/usage");
+            assert_eq!(
+                req.headers()["authorization"],
+                "Bearer upstream-fixture-token"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Response::new(full(
+                r#"{"isValid":true,"quota":{"limit":10,"used":2,"remaining":8}}"#,
+            ))
+        }
+    })
+    .await;
+    let (t, g) = fixture(vec![format!("http://127.0.0.1:{port}/prefix/v1")]).await;
+    let p = g.view().providers[0].id.clone();
+    let config = std::fs::read(t.path().join("config.toml")).unwrap();
+    let (a, b) = tokio::join!(g.query_quota(&p, true), g.query_quota(&p, true));
+    assert_eq!(a.unwrap().plans[0].remaining, Some(8.));
+    assert_eq!(b.unwrap().source.as_deref(), Some("sub2api"));
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    g.query_quota(&p, false).await.unwrap();
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    assert!(g.view().recent.is_empty());
+    assert_eq!(g.view().providers[0].health.requests, 0);
+    assert_eq!(std::fs::read(t.path().join("config.toml")).unwrap(), config);
+}
+#[tokio::test]
+async fn quota_newapi_fallback_and_public_unit_request_has_no_key() {
+    let paths = Arc::new(Mutex::new(vec![]));
+    let seen = paths.clone();
+    let port=server(move|r|{let seen=seen.clone();async move{
+        let path=r.uri().path().to_owned();seen.lock().unwrap().push(path.clone());
+        match path.as_str(){
+            "/site/v1/usage"=>Response::builder().status(404).body(full("missing")).unwrap(),
+            "/site/api/usage/token/"=>{assert!(r.headers().contains_key("authorization"));Response::new(full(r#"{"code":true,"data":{"object":"token_usage","total_available":400,"total_granted":1000,"total_used":600,"unlimited_quota":false,"expires_at":0}}"#))},
+            "/site/api/status"=>{assert!(!r.headers().contains_key("authorization"));Response::new(full(r#"{"success":true,"data":{"quota_per_unit":100,"quota_display_type":"CNY","usd_exchange_rate":7}}"#))},
+            _=>panic!("unexpected quota endpoint"),
+        }
+    }}).await;
+    let (_t, g) = fixture(vec![format!("http://127.0.0.1:{port}/site/v1")]).await;
+    let result = g
+        .query_quota(&g.view().providers[0].id, true)
+        .await
+        .unwrap();
+    assert_eq!(result.source.as_deref(), Some("newapi"));
+    assert_eq!(result.plans[0].remaining, Some(28.));
+    assert_eq!(result.plans[0].unit, "CNY");
+    assert_eq!(paths.lock().unwrap().len(), 3);
+}
+#[tokio::test]
+async fn quota_retry_after_keeps_last_success_and_does_not_fallback() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let port = server(move |_| {
+        let seen = seen.clone();
+        async move {
+            if seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                Response::new(full(r#"{"balance":4.25}"#))
+            } else {
+                Response::builder()
+                    .status(429)
+                    .header("retry-after", "120")
+                    .body(full("limited"))
+                    .unwrap()
+            }
+        }
+    })
+    .await;
+    let (_t, g) = fixture(vec![format!("http://127.0.0.1:{port}")]).await;
+    let id = g.view().providers[0].id.clone();
+    g.query_quota(&id, true).await.unwrap();
+    let result = g.query_quota(&id, true).await.unwrap();
+    assert!(result.stale);
+    assert_eq!(result.state, "error");
+    assert_eq!(result.plans[0].remaining, Some(4.25));
+    assert!(result.retry_at.unwrap() >= quota::now() + 119);
+    g.query_quota(&id, true).await.unwrap();
+    assert_eq!(hits.load(Ordering::Relaxed), 2);
+}
+#[tokio::test]
+async fn quota_redirect_oversize_auth_and_unsupported_are_distinct() {
+    for (status, body, expected) in [
+        (302, "redirect".to_owned(), "error"),
+        (200, "x".repeat(2_000_001), "error"),
+        (401, "invalid key".to_owned(), "error"),
+        (200, "<html>login</html>".to_owned(), "unsupported"),
+    ] {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let port = server(move |_| {
+            let seen = seen.clone();
+            let body = body.clone();
+            async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Response::builder()
+                    .status(status)
+                    .header("location", "https://elsewhere.invalid/steal")
+                    .body(full(body))
+                    .unwrap()
+            }
+        })
+        .await;
+        let (_t, g) = fixture(vec![format!("http://127.0.0.1:{port}")]).await;
+        let result = g
+            .query_quota(&g.view().providers[0].id, true)
+            .await
+            .unwrap();
+        assert_eq!(result.state, expected);
+        assert!(result.plans.is_empty());
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            if status == 302 || result.error.as_ref().is_some_and(|e| e.contains("2 MB")) {
+                1
+            } else {
+                2
+            }
+        );
+    }
+}
+#[tokio::test]
+async fn quota_proxy_dns_auth_and_no_direct_fallback() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let port = server(move |_| {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Response::new(full(r#"{"balance":9}"#))
+        }
+    })
+    .await;
+    let (socks_port, names, _) = socks(true).await;
+    let (t, g) = fixture(vec![format!("http://localhost:{port}/v1")]).await;
+    update(
+        &g,
+        &t,
+        Edit::SaveProxy {
+            id: None,
+            name: "quota-proxy".into(),
+            host: "127.0.0.1".into(),
+            port: socks_port,
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+        },
+    );
+    let proxy = g.view().proxies[0].id.clone();
+    let id = g.view().providers[0].id.clone();
+    update(
+        &g,
+        &t,
+        Edit::RouteProvider {
+            id: id.clone(),
+            proxy_id: Some(proxy.clone()),
+        },
+    );
+    let result = g.query_quota(&id, true).await.unwrap();
+    assert_eq!(result.state, "ok");
+    assert!(names.lock().unwrap().iter().any(|s| s == "localhost"));
+    update(
+        &g,
+        &t,
+        Edit::SaveProxy {
+            id: Some(proxy),
+            name: "quota-proxy".into(),
+            host: "127.0.0.1".into(),
+            port: socks_port,
+            username: "wrong".into(),
+            password: "wrong".into(),
+        },
+    );
+    let result = g.query_quota(&id, true).await.unwrap();
+    assert_eq!(result.state, "error");
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    assert!(g.view().recent.is_empty());
+    assert_eq!(g.view().proxies[0].health.failures, 0);
+}
+#[tokio::test]
+async fn quota_late_response_is_discarded_after_provider_edit() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let e = entered.clone();
+    let gate2 = gate.clone();
+    let port = server(move |_| {
+        let e = e.clone();
+        let gate = gate2.clone();
+        async move {
+            e.notify_one();
+            gate.notified().await;
+            Response::new(full(r#"{"balance":123}"#))
+        }
+    })
+    .await;
+    let (t, g) = fixture(vec![format!("http://127.0.0.1:{port}")]).await;
+    let id = g.view().providers[0].id.clone();
+    let g2 = g.clone();
+    let id2 = id.clone();
+    let task = tokio::spawn(async move { g2.query_quota(&id2, true).await });
+    entered.notified().await;
+    update(
+        &g,
+        &t,
+        Edit::SaveProvider {
+            id: Some(id),
+            base_url: format!("http://127.0.0.1:{port}"),
+            token: "changed-key".into(),
+        },
+    );
+    gate.notify_one();
+    assert_eq!(
+        task.await
+            .unwrap()
+            .err()
+            .expect("stale result must be rejected")
+            .code,
+        "STALE"
+    );
+    assert!(g.view().providers[0].quota.is_none());
+}
+
+#[tokio::test]
+async fn quota_concurrency_limit_and_echoed_secrets_are_filtered() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+    let a = active.clone();
+    let m = max.clone();
+    let port = server(move |_| {
+        let a = a.clone();
+        let m = m.clone();
+        async move {
+            let current = a.fetch_add(1, Ordering::SeqCst) + 1;
+            m.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            a.fetch_sub(1, Ordering::SeqCst);
+            Response::new(full(r#"{"balance":5,"unit":"upstream-fixture-token"}"#))
+        }
+    })
+    .await;
+    let (_t, g) = fixture(
+        (0..6)
+            .map(|i| format!("http://127.0.0.1:{port}/site{i}"))
+            .collect(),
+    )
+    .await;
+    let ids: Vec<_> = g.view().providers.iter().map(|p| p.id.clone()).collect();
+    let results =
+        futures_util::future::join_all(ids.iter().map(|id| g.query_quota(id, true))).await;
+    assert_eq!(max.load(Ordering::SeqCst), 3);
+    for result in results {
+        let view = result.unwrap();
+        assert_eq!(view.state, "ok");
+        assert!(!serde_json::to_string(&view)
+            .unwrap()
+            .contains("upstream-fixture-token"));
+    }
+}
+
+#[tokio::test]
+async fn quota_timeout_does_not_probe_another_protocol() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let port = server(move |_| {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            Response::new(full(r#"{"balance":5}"#))
+        }
+    })
+    .await;
+    let (_t, g) = fixture(vec![format!("http://127.0.0.1:{port}")]).await;
+    let start = Instant::now();
+    let result = g
+        .query_quota(&g.view().providers[0].id, true)
+        .await
+        .unwrap();
+    assert_eq!(result.error.as_deref(), Some("额度查询超时"));
+    assert!(start.elapsed() < Duration::from_secs(12));
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+    assert!(g.view().recent.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "Read-only quota acceptance using explicitly supplied private gateway store"]
+async fn real_provider_quota_direct_and_tencent_proxy() {
+    let path = std::env::var_os("GPT_SWITCH_QUOTA_FIXTURE").expect("private fixture required");
+    let store: Store = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(!store.providers.is_empty());
+    let proxy = store.proxies.first().expect("Tencent proxy required");
+    for (index, p) in store.providers.iter().enumerate() {
+        let (t, g) = fixture(vec![]).await;
+        update(
+            &g,
+            &t,
+            Edit::SaveProvider {
+                id: None,
+                base_url: p.base_url.clone(),
+                token: p.token.clone(),
+            },
+        );
+        let id = g.view().providers[0].id.clone();
+        let auth = std::fs::read(t.path().join("auth.json")).unwrap();
+        let config = std::fs::read(t.path().join("config.toml")).unwrap();
+        for route in ["direct", "proxy"] {
+            if route == "proxy" {
+                update(
+                    &g,
+                    &t,
+                    Edit::SaveProxy {
+                        id: None,
+                        name: "Tencent acceptance".into(),
+                        host: proxy.host.clone(),
+                        port: proxy.port,
+                        username: proxy.username.clone(),
+                        password: proxy.password.clone(),
+                    },
+                );
+                update(
+                    &g,
+                    &t,
+                    Edit::RouteProvider {
+                        id: id.clone(),
+                        proxy_id: Some(g.view().proxies[0].id.clone()),
+                    },
+                );
+            }
+            let result = g.query_quota(&id, true).await.unwrap();
+            println!(
+                "provider={} route={} state={} source={} plans={} error={}",
+                index + 1,
+                route,
+                result.state,
+                result.source.as_deref().unwrap_or("none"),
+                result.plans.len(),
+                result.error.as_deref().unwrap_or("none")
+            );
+            assert_eq!(
+                result.state, "ok",
+                "real quota query failed; payload omitted"
+            );
+            assert!(!result.plans.is_empty());
+            assert_eq!(g.view().providers[0].health.requests, 0);
+            assert!(g.view().recent.is_empty());
+        }
+        assert_eq!(std::fs::read(t.path().join("auth.json")).unwrap(), auth);
+        assert_eq!(std::fs::read(t.path().join("config.toml")).unwrap(), config);
+    }
+}
+
+#[tokio::test]
+async fn recognized_expired_sub2_stops_protocol_probing() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    let port = server(move |_| {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, Ordering::Relaxed);
+            Response::builder()
+                .status(403)
+                .body(full(r#"{"status":"expired","isValid":false}"#))
+                .unwrap()
+        }
+    })
+    .await;
+    let (_t, g) = fixture(vec![format!("http://127.0.0.1:{port}")]).await;
+    let result = g
+        .query_quota(&g.view().providers[0].id, true)
+        .await
+        .unwrap();
+    assert_eq!(result.source.as_deref(), Some("sub2api"));
+    assert_eq!(result.key_status.as_deref(), Some("已过期"));
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
 }

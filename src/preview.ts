@@ -76,10 +76,12 @@ export async function run(
       "stop_gateway",
       "update_gateway",
       "test_provider",
+      "query_provider_quota",
     ].includes(name)
   ) {
     const result = gatewayPreview(name, args);
-    if (name !== "test_provider") emit("gateway-state", result);
+    if (name === "query_provider_quota") emit("provider-quota", result);
+    else if (name !== "test_provider") emit("gateway-state", result);
     return result;
   }
   switch (name) {

@@ -76,6 +76,8 @@ export type Provider = {
   proxyId: string | null;
   queued: boolean;
   health: Health;
+  quotaVersion: string;
+  quota: ProviderQuota | null;
 };
 export type ProxyProfile = {
   id: string;
@@ -92,6 +94,11 @@ export type GatewayState = {
   address: string;
   mode: "manual" | "auto";
   selected: string | null;
+  lastSuccessful: string | null;
+  configRevision: string | null;
+  configProvider: string | null;
+  configState: string;
+  configError: string | null;
   providers: Provider[];
   proxies: ProxyProfile[];
   settings: GatewaySettings;
@@ -107,4 +114,36 @@ export type GatewayState = {
   }[];
   error: string | null;
   recoveryPending: boolean;
+};
+
+export type QuotaPlan = {
+  name: string;
+  remaining: number | null;
+  used: number | null;
+  total: number | null;
+  unit: string;
+  unlimited: boolean;
+  resetAt: string | null;
+};
+export type QuotaUsage = {
+  requests: number | null;
+  tokens: number | null;
+  cost: number | null;
+};
+export type ProviderQuota = {
+  providerId: string;
+  version: string;
+  state: "idle" | "loading" | "ok" | "unsupported" | "error";
+  source: "sub2api" | "newapi" | null;
+  checkedAt: number | null;
+  successAt: number | null;
+  retryAt: number | null;
+  stale: boolean;
+  error: string | null;
+  keyStatus: string | null;
+  plans: QuotaPlan[];
+  expiresAt: string | null;
+  expiresAtUnix: number | null;
+  today: QuotaUsage | null;
+  totalUsage: QuotaUsage | null;
 };

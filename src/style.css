@@ -1301,3 +1301,82 @@ select:focus-visible {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+.config-binding {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: -4px 0 14px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.quota-area {
+  margin: 8px 0 10px 34px;
+  font-size: 12px;
+}
+.quota-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.quota-summary > span,
+.quota-summary time {
+  color: var(--muted);
+}
+.quota-summary strong {
+  font-weight: 550;
+}
+.quota-summary .icon-button {
+  width: 26px;
+  height: 26px;
+}
+.quota-summary .quota-warning,
+.quota-error {
+  color: var(--warning);
+}
+.quota-error {
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+.quota-details {
+  margin-top: 3px;
+  color: var(--muted);
+}
+.quota-details summary {
+  cursor: pointer;
+  width: max-content;
+}
+.quota-details > div {
+  margin-top: 7px;
+}
+.quota-plan {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+.quota-plan strong {
+  color: var(--ink);
+  font-weight: 500;
+}
+.quota-spin {
+  animation: quota-spin 1.2s linear infinite;
+}
+@keyframes quota-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .quota-spin {
+    animation: none;
+  }
+}
+@media (max-width: 820px) {
+  .quota-area {
+    margin-left: 0;
+  }
+  .gateway-toolbar {
+    flex-wrap: wrap;
+  }
+}

@@ -1,4 +1,4 @@
-import type { GatewayState, GatewaySettings } from "./types";
+import type { GatewayState, GatewaySettings, ProviderQuota } from "./types";
 const healthy = {
   state: "closed" as const,
   failures: 0,
@@ -11,6 +11,11 @@ export const gatewayDemo: GatewayState = {
   address: "http://127.0.0.1:15722/v1",
   mode: "manual",
   selected: "primary",
+  lastSuccessful: null,
+  configRevision: "preview-config",
+  configProvider: "primary",
+  configState: "provider",
+  configError: null,
   settings: {
     port: 15722,
     maxRetries: 3,
@@ -32,6 +37,8 @@ export const gatewayDemo: GatewayState = {
       proxyId: null,
       queued: true,
       health: { ...healthy },
+      quotaVersion: "preview-quota",
+      quota: null,
     },
     {
       id: "backup",
@@ -40,6 +47,8 @@ export const gatewayDemo: GatewayState = {
       proxyId: "cloud",
       queued: true,
       health: { ...healthy },
+      quotaVersion: "preview-quota",
+      quota: null,
     },
   ],
   proxies: [
@@ -60,9 +69,49 @@ export const gatewayDemo: GatewayState = {
 };
 export function gatewayPreview(name: string, args: Record<string, unknown>) {
   const s = gatewayDemo;
-  if (name === "start_gateway") s.running = true;
-  if (name === "stop_gateway") s.running = false;
+  if (name === "start_gateway") {
+    s.running = true;
+    s.configState = "gateway";
+    s.configProvider = null;
+  }
+  if (name === "stop_gateway") {
+    s.running = false;
+    s.configState = "provider";
+    s.configProvider = s.selected;
+  }
   if (name === "test_provider") return 84;
+  if (name === "query_provider_quota") {
+    const provider = s.providers.find((p) => p.id === args.providerId)!;
+    const result: ProviderQuota = {
+      providerId: provider.id,
+      version: provider.quotaVersion,
+      state: "ok",
+      source: provider.id === "primary" ? "sub2api" : "newapi",
+      checkedAt: Math.floor(Date.now() / 1000),
+      successAt: Math.floor(Date.now() / 1000),
+      retryAt: null,
+      stale: false,
+      error: null,
+      keyStatus: null,
+      plans: [
+        {
+          name: "API Key 配额",
+          remaining: 42.35,
+          used: 7.65,
+          total: 50,
+          unit: "USD",
+          unlimited: false,
+          resetAt: null,
+        },
+      ],
+      expiresAt: null,
+      expiresAtUnix: null,
+      today: { requests: 18, tokens: 56200, cost: 1.25 },
+      totalUsage: null,
+    };
+    provider.quota = result;
+    return result;
+  }
   if (name === "update_gateway") {
     const e = args.edit as Record<string, unknown>,
       id = String(e.id),
@@ -71,6 +120,10 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
     if (e.op === "select") {
       s.selected = id;
       s.mode = "manual";
+      if (!s.running) {
+        s.configState = "provider";
+        s.configProvider = id;
+      }
     }
     if (e.op === "queueProvider" && p) p.queued = Boolean(e.queued);
     if (e.op === "routeProvider" && p) p.proxyId = e.proxyId as string | null;
@@ -92,6 +145,8 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
           proxyId: null,
           queued: true,
           health: { ...healthy },
+          quotaVersion: crypto.randomUUID(),
+          quota: null,
         });
     }
     if (e.op === "saveProxy") {

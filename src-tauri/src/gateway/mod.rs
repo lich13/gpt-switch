@@ -2,7 +2,9 @@ mod circuit;
 mod connector;
 mod forward;
 mod model;
+mod quota;
 mod replay;
+pub use quota::QuotaView;
 mod takeover;
 #[cfg(test)]
 mod tests;
@@ -34,6 +36,8 @@ pub struct ProviderView {
     proxy_id: Option<String>,
     queued: bool,
     health: Health,
+    quota_version: String,
+    quota: Option<QuotaView>,
 }
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +69,11 @@ pub struct View {
     pub address: String,
     pub mode: String,
     pub selected: Option<String>,
+    pub last_successful: Option<String>,
+    pub config_revision: Option<String>,
+    pub config_provider: Option<String>,
+    pub config_state: String,
+    pub config_error: Option<String>,
     pub providers: Vec<ProviderView>,
     pub proxies: Vec<ProxyView>,
     pub settings: Settings,
@@ -83,6 +92,8 @@ struct Inner {
     circuits: HashMap<String, Circuit>,
     recent: VecDeque<Recent>,
     affinity: HashMap<String, (String, Instant)>,
+    last_successful: Option<String>,
+    home: Option<PathBuf>,
 }
 struct Shared {
     inner: Mutex<Inner>,
@@ -92,6 +103,7 @@ struct Shared {
     spool: tempfile::TempDir,
     active: AtomicUsize,
     events: broadcast::Sender<()>,
+    quota: quota::Service,
 }
 #[derive(Clone)]
 pub struct Gateway(Arc<Shared>);
@@ -112,7 +124,7 @@ fn xkey(p: &Proxy) -> String {
 impl Gateway {
     pub fn new(data: PathBuf) -> Result<Self> {
         storage::private_dir(&data)?;
-        let error = takeover::detach(&data).err().map(|e| e.message);
+        let error = takeover::recover(&data).err().map(|e| e.message);
         let (store, revision) = Store::load(&data.join("gateway.json"))?;
         let spool = tempfile::Builder::new()
             .prefix("gateway-spool-")
@@ -131,6 +143,8 @@ impl Gateway {
                 circuits: HashMap::new(),
                 recent: VecDeque::new(),
                 affinity: HashMap::new(),
+                last_successful: None,
+                home: None,
             }),
             lifecycle: tokio::sync::Mutex::new(()),
             clients: Mutex::new(HashMap::new()),
@@ -138,6 +152,7 @@ impl Gateway {
             spool,
             active: AtomicUsize::new(0),
             events,
+            quota: quota::Service::new(),
         })))
     }
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
@@ -149,7 +164,38 @@ impl Gateway {
     pub fn view(&self) -> View {
         let s = self.0.inner.lock().unwrap();
         let health = |key: String| s.circuits.get(&key).cloned().unwrap_or_default().health();
+        let config = s.home.as_ref().map(|h| takeover::read(h));
+        let config_revision = config
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .map(|(r, _)| r.clone());
+        let mut config_state = "unknown";
+        let mut config_provider = None;
+        if let Some(Ok((_, pair))) = &config {
+            config_state = "unsaved";
+            if pair
+                == &takeover::Pair::new(
+                    &format!("http://127.0.0.1:{}/v1", s.store.settings.port),
+                    &s.store.local_token,
+                )
+            {
+                config_state = "gateway";
+            } else if let Some(p) = s
+                .store
+                .providers
+                .iter()
+                .find(|p| pair == &takeover::Pair::new(&p.base_url, &p.token))
+            {
+                config_state = "provider";
+                config_provider = Some(p.id.clone());
+            }
+        }
         View {
+            config_revision,
+            config_provider,
+            config_state: config_state.into(),
+            config_error: config.and_then(|r| r.err()).map(|e| e.message),
+            last_successful: s.last_successful.clone(),
             revision: s.revision.clone(),
             running: s.running,
             address: format!("http://127.0.0.1:{}/v1", s.store.settings.port),
@@ -167,6 +213,11 @@ impl Gateway {
                     proxy_id: p.proxy_id.clone(),
                     queued: p.queued,
                     health: health(pkey(p)),
+                    quota_version: Self::quota_version(&s.store, p),
+                    quota: self
+                        .0
+                        .quota
+                        .cached(&p.id, &Self::quota_version(&s.store, p)),
                 })
                 .collect(),
             proxies: s
@@ -189,17 +240,51 @@ impl Gateway {
             recovery_pending: self.0.data.join("gateway-recovery.json").exists(),
         }
     }
+    pub fn observe_home(&self, home: &Path) {
+        self.0.inner.lock().unwrap().home = Some(home.to_owned());
+    }
+    fn exit_provider<'a>(store: &'a Store, last: Option<&str>) -> Result<&'a Provider> {
+        let p = if store.mode == "manual" {
+            store
+                .providers
+                .iter()
+                .find(|p| Some(&p.id) == store.selected.as_ref())
+        } else {
+            last.and_then(|id| store.providers.iter().find(|p| p.id == id))
+                .or_else(|| store.providers.iter().find(|p| p.queued))
+        };
+        p.ok_or_else(|| {
+            AppError::new(
+                "PROVIDER",
+                "没有关闭网关时可用的供应商，请选择供应商或加入故障转移队列",
+            )
+        })
+    }
     pub fn guarded_home(&self) -> bool {
         self.view().running || self.0.data.join("gateway-recovery.json").exists()
     }
     pub fn edit(&self, edit: Edit, expected: &str, home: &Path) -> Result<View> {
+        self.edit_checked(edit, expected, home, None)
+    }
+    pub fn edit_checked(
+        &self,
+        edit: Edit,
+        expected: &str,
+        home: &Path,
+        config_revision: Option<&str>,
+    ) -> Result<View> {
         let mut s = self.0.inner.lock().unwrap();
+        s.home = Some(home.to_owned());
         if expected != s.revision {
             return Err(AppError::new(
                 "CONFLICT",
                 "网关设置已变化，请使用最新状态重试",
             ));
         }
+        if !s.running && self.0.data.join("gateway-recovery.json").exists() {
+            return Err(AppError::new("RECOVERY", "请先处理未完成的配置事务"));
+        }
+        let direct_select = !s.running && matches!(&edit, Edit::Select { .. });
         let mut next = s.store.clone();
         match edit {
             Edit::Reset { id, proxy } => {
@@ -223,15 +308,58 @@ impl Gateway {
             }
             edit => next.edit(edit, s.running)?,
         }
-        let revision = next.persist(&self.0.data.join("gateway.json"), &s.revision)?;
+        let revision = if s.running || direct_select {
+            let p = Self::exit_provider(&next, s.last_successful.as_deref())?;
+            let target = takeover::Pair::new(&p.base_url, &p.token);
+            let path = self.0.data.join("gateway.json");
+            let old = storage::read_optional(&path)?;
+            if storage::revision(old.as_deref()) != s.revision {
+                return Err(AppError::new("CONFLICT", "网关存储已被外部修改"));
+            }
+            let after = serde_json::to_string_pretty(&next)
+                .map_err(|_| AppError::new("STORE", "无法写入网关设置"))?;
+            takeover::commit_store(
+                &self.0.data,
+                home,
+                old.map(|v| String::from_utf8(v).unwrap()),
+                after.clone(),
+                target,
+                s.running,
+                config_revision,
+            )?;
+            storage::digest(after.as_bytes())
+        } else {
+            next.persist(&self.0.data.join("gateway.json"), &s.revision)?
+        };
+        if s.last_successful
+            .as_ref()
+            .is_some_and(|id| !next.providers.iter().any(|p| &p.id == id))
+        {
+            s.last_successful = None;
+        }
         s.store = next;
         s.revision = revision;
+        self.0.quota.retain(
+            &s.store
+                .providers
+                .iter()
+                .map(|p| (p.id.clone(), Self::quota_version(&s.store, p)))
+                .collect(),
+        );
         drop(s);
         self.0.clients.lock().unwrap().clear();
         self.changed();
         Ok(self.view())
     }
     pub async fn start(&self, expected: &str, home: &Path) -> Result<View> {
+        self.start_checked(expected, home, None).await
+    }
+    pub async fn start_checked(
+        &self,
+        expected: &str,
+        home: &Path,
+        config_revision: Option<&str>,
+    ) -> Result<View> {
         let _guard = self.0.lifecycle.lock().await;
         let (port, token) = {
             let s = self.0.inner.lock().unwrap();
@@ -262,7 +390,19 @@ impl Gateway {
             if s.revision != expected {
                 return Err(AppError::new("CONFLICT", "设置已变化，请重试"));
             }
-            takeover::attach(&self.0.data, home, port, &token)?;
+            let p = Self::exit_provider(&s.store, None)?;
+            let exit = takeover::Pair::new(&p.base_url, &p.token);
+            let (current, _) = takeover::read(home)?;
+            takeover::attach(
+                &self.0.data,
+                home,
+                port,
+                &token,
+                exit,
+                config_revision.unwrap_or(&current),
+            )?;
+            s.home = Some(home.to_owned());
+            s.last_successful = None;
             s.running = true;
             s.shutdown = Some(tx);
             s.error = None;
@@ -276,14 +416,27 @@ impl Gateway {
         Ok(self.view())
     }
     pub async fn stop(&self) -> Result<View> {
+        self.stop_checked(None).await
+    }
+    pub async fn stop_checked(&self, expected_config: Option<&str>) -> Result<View> {
         let _guard = self.0.lifecycle.lock().await;
-        if let Err(e) = takeover::detach(&self.0.data) {
-            self.0.inner.lock().unwrap().error = Some(e.message.clone());
-            self.changed();
-            return Err(e);
-        }
         let listener_task = {
             let mut s = self.0.inner.lock().unwrap();
+            if let (Some(expected), Some(home)) = (expected_config, &s.home) {
+                if takeover::read(home)?.0 != expected {
+                    return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
+                }
+            }
+            if let Err(e) = takeover::recover(&self.0.data) {
+                s.error = Some(e.message.clone());
+                drop(s);
+                self.changed();
+                return Err(e);
+            }
+            // Recovery may have completed a store/config transaction interrupted by an I/O failure.
+            let (store, revision) = Store::load(&self.0.data.join("gateway.json"))?;
+            s.store = store;
+            s.revision = revision;
             if let Some(tx) = s.shutdown.take() {
                 let _ = tx.send(true);
             }
@@ -297,6 +450,87 @@ impl Gateway {
         self.0.clients.lock().unwrap().clear();
         self.changed();
         Ok(self.view())
+    }
+    fn successful_response(&self, provider: &Provider) {
+        let mut s = self.0.inner.lock().unwrap();
+        if !s.running
+            || !s
+                .store
+                .providers
+                .iter()
+                .any(|p| p.id == provider.id && p.version == provider.version)
+        {
+            return;
+        }
+        if s.store.mode == "auto" {
+            if let Err(e) = takeover::update_exit(
+                &self.0.data,
+                takeover::Pair::new(&provider.base_url, &provider.token),
+            ) {
+                s.error = Some(e.message);
+                drop(s);
+                self.changed();
+                return;
+            }
+        }
+        s.last_successful = Some(provider.id.clone());
+        drop(s);
+        self.changed();
+    }
+    fn quota_version(store: &Store, p: &Provider) -> String {
+        format!(
+            "{}:{}",
+            p.version,
+            p.proxy_id
+                .as_ref()
+                .and_then(|id| store.proxies.iter().find(|x| &x.id == id))
+                .map(|x| x.version.as_str())
+                .unwrap_or("direct")
+        )
+    }
+    pub fn quota_events(&self) -> broadcast::Receiver<QuotaView> {
+        self.0.quota.subscribe()
+    }
+    pub async fn query_quota(&self, id: &str, force: bool) -> Result<QuotaView> {
+        let input = {
+            let s = self.0.inner.lock().unwrap();
+            let p = s
+                .store
+                .providers
+                .iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| AppError::new("PROVIDER", "供应商不存在"))?;
+            let proxy = p
+                .proxy_id
+                .as_ref()
+                .and_then(|id| s.store.proxies.iter().find(|x| &x.id == id))
+                .cloned();
+            quota::Query {
+                id: p.id.clone(),
+                version: Self::quota_version(&s.store, p),
+                base: p.base_url.clone(),
+                token: p.token.clone(),
+                client: Client::builder(TokioExecutor::new())
+                    .retry_canceled_requests(false)
+                    .build(Connector::new(
+                        proxy,
+                        Duration::from_secs(10),
+                        s.store.settings.port,
+                    )),
+            }
+        };
+        let version = input.version.clone();
+        let result = self.0.quota.query(input, force).await?;
+        let s = self.0.inner.lock().unwrap();
+        if !s
+            .store
+            .providers
+            .iter()
+            .any(|p| p.id == id && Self::quota_version(&s.store, p) == version)
+        {
+            return Err(AppError::new("STALE", "供应商配置已变化，已丢弃旧额度结果"));
+        }
+        Ok(result)
     }
     pub async fn test_connection(&self, id: &str) -> Result<u64> {
         let (p, proxy, cfg) = {

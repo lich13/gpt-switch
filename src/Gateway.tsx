@@ -1,3 +1,4 @@
+import { QuotaInfo, useProviderQuota } from "./Quota";
 import { useEffect, useRef, useState } from "react";
 import {
   Plus,
@@ -50,6 +51,7 @@ export default function Gateway({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<Dialog>(null);
+  const quota = useProviderQuota(state?.providers ?? [], section === "gateway");
   useEffect(() => {
     let disposed = false,
       clean: (() => void) | undefined;
@@ -86,6 +88,9 @@ export default function Gateway({
     const next = await command<GatewayState>("update_gateway", {
       edit: payload,
       expectedRevision: expected ?? state.revision,
+      ...(payload.op === "select" && !state.running
+        ? { expectedConfigRevision: state.configRevision }
+        : {}),
     });
     setState(next);
   };
@@ -127,7 +132,10 @@ export default function Gateway({
                     state.running || state.recoveryPending
                       ? "stop_gateway"
                       : "start_gateway",
-                    { expectedRevision: state.revision },
+                    {
+                      expectedRevision: state.revision,
+                      expectedConfigRevision: state.configRevision,
+                    },
                   ),
                 );
               })
@@ -137,7 +145,7 @@ export default function Gateway({
             {state.running
               ? "停用网关"
               : state.recoveryPending
-                ? "恢复原配置"
+                ? "处理配置事务"
                 : "启用网关"}
           </button>
         ) : (
@@ -169,6 +177,29 @@ export default function Gateway({
               {state.activeConnections} 个连接
             </span>
           </div>
+          {state.configError && (
+            <div className="banner error" role="alert">
+              {state.configError}
+            </div>
+          )}
+          <div className="config-binding" aria-label="配置使用状态">
+            <span>
+              配置使用：
+              {state.configState === "gateway"
+                ? "本地网关"
+                : (state.providers.find((p) => p.id === state.configProvider)
+                    ?.name ?? "未匹配供应商")}
+            </span>
+            {state.mode === "auto" && state.lastSuccessful && (
+              <span>
+                最近成功：
+                {
+                  state.providers.find((p) => p.id === state.lastSuccessful)
+                    ?.name
+                }
+              </span>
+            )}
+          </div>
           <div className="gateway-toolbar">
             <div className="segmented" aria-label="路由模式">
               <button
@@ -187,6 +218,13 @@ export default function Gateway({
               </button>
             </div>
             <div className="inline-actions">
+              <button
+                className="secondary"
+                onClick={() => quota.refreshAll()}
+                disabled={!state.providers.length}
+              >
+                刷新额度
+              </button>
               <button
                 className="secondary"
                 disabled={busy}
@@ -243,7 +281,11 @@ export default function Gateway({
                     onClick={() =>
                       run(async () => {
                         await edit({ op: "select", id: p.id });
-                        notify("已选择供应商，新请求立即生效");
+                        notify(
+                          state.running
+                            ? "已切换供应商，新请求立即生效"
+                            : "文件已切换，请重新打开 Codex",
+                        );
                       })
                     }
                   >
@@ -257,6 +299,11 @@ export default function Gateway({
                     )}
                   </button>
                 </div>
+                <QuotaInfo
+                  provider={p}
+                  quota={quota.quotaFor(p)}
+                  refresh={() => void quota.refresh(p.id)}
+                />
                 <div className="provider-controls">
                   <label className="check-label">
                     <input

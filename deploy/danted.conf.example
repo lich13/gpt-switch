@@ -57,8 +57,25 @@ socks block {
     from: 0.0.0.0/0 to: 240.0.0.0/4
     log: error
 }
+# Block only non-public IPv6: a blanket ::/0 also rejects dual-stack DNS names.
 socks block {
-    from: 0.0.0.0/0 to: ::/0
+    from: 0.0.0.0/0 to: ::/128
+    log: error
+}
+socks block {
+    from: 0.0.0.0/0 to: ::1/128
+    log: error
+}
+socks block {
+    from: 0.0.0.0/0 to: fc00::/7
+    log: error
+}
+socks block {
+    from: 0.0.0.0/0 to: fe80::/10
+    log: error
+}
+socks block {
+    from: 0.0.0.0/0 to: ff00::/8
     log: error
 }
 socks pass {

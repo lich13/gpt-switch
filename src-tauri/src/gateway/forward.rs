@@ -364,6 +364,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         permits.proxy_success(&settings);
         let status = response.status();
         if status == StatusCode::SWITCHING_PROTOCOLS && websocket {
+            gateway.successful_response(&route.provider);
             permits.success(&settings);
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             let (mut response_parts, _) = response.into_parts();
@@ -446,6 +447,9 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 continue;
             }
         };
+        if status.is_success() {
+            gateway.successful_response(&route.provider);
+        }
         let total_deadline = tokio::time::Instant::now()
             + Duration::from_secs(settings.total_seconds).saturating_sub(began.elapsed());
         let mut observe = Observe::new(stream, gateway.clone(), route.provider.id.clone());
