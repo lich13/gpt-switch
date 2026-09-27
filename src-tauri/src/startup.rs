@@ -75,8 +75,11 @@ impl Service {
         let previous = auto_launch(old.launch_to_tray)?;
         let was_enabled = previous.is_enabled().map_err(system_error)?;
         let next = auto_launch(prefs.launch_to_tray)?;
-        let system_changed =
-            was_enabled != enabled || (enabled && old.launch_to_tray != prefs.launch_to_tray);
+        // Re-register an already enabled item too. Older releases may have
+        // created the same login item without the current hidden argument.
+        // Replacing it makes the persisted silent-launch preference effective
+        // after an upgrade as well as after a normal setting change.
+        let system_changed = was_enabled != enabled || enabled;
         if system_changed {
             if was_enabled {
                 previous.disable().map_err(system_error)?;
