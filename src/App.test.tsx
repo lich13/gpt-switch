@@ -122,6 +122,23 @@ beforeEach(() => {
   );
 });
 describe("user workflows", () => {
+  it("preserves Windows CRLF when the editor changes content", async () => {
+    doc.text = '# keep\r\nmodel = "original"\r\n';
+    const u = userEvent.setup();
+    render(<App />);
+    await screen.findByText("你的账号，一个入口。");
+    await u.click(screen.getByRole("button", { name: "配置" }));
+    fireEvent.change(await screen.findByLabelText("TOML 编辑器"), {
+      target: { value: '# keep\nmodel = "updated"\n' },
+    });
+    await u.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() =>
+      expect(mocks.command).toHaveBeenCalledWith("save_config", {
+        text: '# keep\r\nmodel = "updated"\r\n',
+        expectedRevision: "cfg-1",
+      }),
+    );
+  });
   it("switches through the native command without saving config", async () => {
     const u = userEvent.setup();
     render(<App />);

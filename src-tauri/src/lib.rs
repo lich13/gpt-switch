@@ -371,7 +371,7 @@ fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> R
             }
             Ok(())
         })();
-        let data = serde_json::json!({"ok":result.is_ok(),"version":env!("CARGO_PKG_VERSION"),"webview":true,"tray":app.tray_by_id("switch").is_some(),"platform":std::env::consts::OS,"error":result.err()});
+        let data = serde_json::json!({"ok":result.is_ok(),"version":env!("CARGO_PKG_VERSION"),"revision":env!("GPT_SWITCH_REVISION"),"webview":true,"tray":app.tray_by_id("switch").is_some(),"platform":std::env::consts::OS,"error":result.err()});
         storage::atomic_write(
             output,
             serde_json::to_string_pretty(&data).unwrap().as_bytes(),

@@ -4,6 +4,8 @@
 
 <img src="assets/icon.svg" alt="Prism Relay icon" width="100" />
 
+![账号界面（脱敏示例）](docs/accounts.png)
+
 - 菜单栏／托盘左键展开账号列表，一键切换 `auth.json`。
 - 添加 ChatGPT 登录、导入现有凭据和添加 API Key；同一身份的 Token 刷新自动回存。
 - 独立 CodeMirror TOML 原文编辑器，支持高亮、查找、语法检查、保存冲突保护。

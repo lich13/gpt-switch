@@ -58,7 +58,7 @@ jobs:
           $process = Start-Process -FilePath $exe.FullName -ArgumentList @('--smoke-test', $report) -PassThru
           if (!$process.WaitForExit(60000)) { $process.Kill(); throw 'Smoke timed out' }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (!$result.ok -or !$result.webview -or !$result.tray) { throw 'Smoke failed' }
+          if (!$result.ok -or !$result.webview -or !$result.tray -or $result.revision -ne $env:GITHUB_SHA) { throw 'Smoke failed' }
           Get-Content $report
       - name: macOS app smoke test
         if: runner.os == 'macOS'
@@ -72,7 +72,7 @@ jobs:
             sleep 1
           done
           if [ ! -f "$report" ]; then kill "$pid"; exit 1; fi
-          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["ok"] and d["webview"] and d["tray"]; print(d)' "$report"
+          python3 -c 'import json,sys,os; d=json.load(open(sys.argv[1])); assert d["ok"] and d["webview"] and d["tray"] and d["revision"] == os.environ["GITHUB_SHA"]; print(d)' "$report"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
@@ -94,10 +94,12 @@ jobs:
           merge-multiple: true
       - name: Package icon sources and checksums
         run: |
-          zip -r artifacts/gpt-Switch-icons.zip assets src-tauri/icons
-          cd artifacts
+          mkdir release-assets
+          find artifacts -type f \( -name '*.dmg' -o -name '*.exe' \) -exec cp {} release-assets/ \;
+          zip -r release-assets/gpt-Switch-icons.zip assets src-tauri/icons
+          cd release-assets
           sha256sum *.dmg *.exe *.zip > SHA256SUMS
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" artifacts/* --verify-tag --title "gpt-Switch $GITHUB_REF_NAME" --notes-file RELEASE.md
+        run: gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --title "gpt-Switch $GITHUB_REF_NAME" --notes-file RELEASE.md

@@ -192,7 +192,13 @@ export default function ConfigEditor({
       <div className="editor-body">
         <CodeMirror
           value={text}
-          onChange={setText}
+          onChange={(value) =>
+            setText(
+              docRef.current?.text.includes("\r\n")
+                ? value.replace(/\r?\n/g, "\r\n")
+                : value,
+            )
+          }
           theme={theme}
           height="100%"
           extensions={extensions}
