@@ -3,6 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +33,8 @@ struct Store {
     profiles: Vec<Profile>,
     preferences: Preferences,
     seen_roots: Vec<String>,
+    #[serde(default)]
+    observed_auth_revisions: BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -249,6 +252,7 @@ impl Core {
                     theme: "system".into(),
                 },
                 seen_roots: vec![],
+                observed_auth_revisions: BTreeMap::new(),
             },
         };
         if store.schema != 1 {
@@ -378,23 +382,27 @@ impl Core {
             .as_ref()
             .and_then(|i| i.as_ref().ok())
             .map(|i| i.identity.as_str());
+        let auth_revision = storage::revision(auth.as_deref());
+        let root = self.store.preferences.codex_home.clone();
+        let changed = self.store.observed_auth_revisions.get(&root) != Some(&auth_revision);
         let old = self.store.clone();
-        let mut updated = false;
         if let Some(profile) = self
             .store
             .profiles
             .iter_mut()
-            .find(|p| Some(p.identity.as_str()) == identity)
+            .find(|p| changed && Some(p.identity.as_str()) == identity)
         {
             if let Some(raw) = auth.as_deref().and_then(|b| std::str::from_utf8(b).ok()) {
                 if raw != profile.auth {
                     profile.auth = raw.into();
                     profile.updated_at = now();
-                    updated = true;
                 }
             }
         }
-        if updated {
+        if changed {
+            self.store
+                .observed_auth_revisions
+                .insert(root, auth_revision.clone());
             if let Err(e) = self.persist() {
                 self.store = old;
                 return Err(e);
@@ -424,7 +432,7 @@ impl Core {
         };
         Ok(ViewState {
             accounts,
-            auth_revision: storage::revision(auth.as_deref()),
+            auth_revision,
             config_revision: storage::revision(config.as_deref()),
             current_state: status.into(),
             auth_source: source(config.as_deref()),
@@ -580,6 +588,26 @@ mod tests {
         assert!(std::fs::read_to_string(c.home().join("auth.json"))
             .unwrap()
             .contains("new"));
+    }
+    #[test]
+    fn explicit_new_login_is_not_replaced_by_unchanged_disk_credentials() {
+        let (t, mut c) = setup();
+        let a = c.import_raw(&oauth("a", "old"), None).unwrap();
+        c.switch_account(&a, "missing").unwrap();
+        let before = std::fs::read(c.home().join("auth.json")).unwrap();
+        c.import_raw(&oauth("a", "new-login"), None).unwrap();
+        c.state().unwrap();
+        assert_eq!(std::fs::read(c.home().join("auth.json")).unwrap(), before);
+        let mut reopened = Core::new(t.path().join("app"), c.home()).unwrap();
+        let revision = reopened.state().unwrap().auth_revision;
+        reopened.switch_account(&a, &revision).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(c.home().join("auth.json")).unwrap(),
+            oauth("a", "new-login")
+        );
+        std::fs::write(c.home().join("auth.json"), oauth("a", "external-refresh")).unwrap();
+        reopened.state().unwrap();
+        assert!(reopened.store.profiles[0].auth.contains("external-refresh"));
     }
     #[test]
     fn conflicts_do_not_overwrite_external_files() {
