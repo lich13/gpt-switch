@@ -581,6 +581,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("gpt-Switch initialization failed")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = &event {
+                let _ = show(app, "accounts");
+            }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if code.is_none() {
                     api.prevent_exit();
