@@ -49,3 +49,62 @@ export const errorOf = (e: unknown): AppError =>
         code: "UNKNOWN",
         message: typeof e === "string" ? e : "操作失败，请重新尝试",
       };
+
+export type GatewaySettings = {
+  port: number;
+  maxRetries: number;
+  failureThreshold: number;
+  successThreshold: number;
+  cooldownSeconds: number;
+  errorRate: number;
+  minRequests: number;
+  firstByteSeconds: number;
+  idleSeconds: number;
+  totalSeconds: number;
+  connectSeconds: number;
+};
+export type Health = {
+  state: "closed" | "open" | "half_open";
+  failures: number;
+  requests: number;
+  retryIn: number;
+};
+export type Provider = {
+  id: string;
+  name: string;
+  baseUrl: string;
+  proxyId: string | null;
+  queued: boolean;
+  health: Health;
+};
+export type ProxyProfile = {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  hasPassword: boolean;
+  health: Health;
+};
+export type GatewayState = {
+  revision: string;
+  running: boolean;
+  address: string;
+  mode: "manual" | "auto";
+  selected: string | null;
+  providers: Provider[];
+  proxies: ProxyProfile[];
+  settings: GatewaySettings;
+  activeConnections: number;
+  recent: {
+    provider: string;
+    proxy: string | null;
+    status: number | null;
+    elapsedMs: number;
+    retries: number;
+    category: string;
+    at: number;
+  }[];
+  error: string | null;
+  recoveryPending: boolean;
+};

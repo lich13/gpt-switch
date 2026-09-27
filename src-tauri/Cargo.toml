@@ -1,6 +1,6 @@
 [package]
 name = "gpt-switch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight Codex account switcher and TOML editor"
 edition = "2021"
 rust-version = "1.85"
@@ -25,8 +25,26 @@ dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 toml = "0.9"
-tokio = { version = "1", features = ["process", "io-util", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["process", "io-util", "time", "sync", "macros", "net", "fs", "rt-multi-thread", "test-util"] }
 open = "5"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+futures-util = "0.3"
+async-stream = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+tower-service = "0.3"
+url = "2"
+toml_edit = "0.23"
+httpdate = "1"
+flate2 = "1"
+zstd = "0.13"
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

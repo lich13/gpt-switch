@@ -1,0 +1,420 @@
+mod circuit;
+mod connector;
+mod forward;
+mod model;
+mod replay;
+mod takeover;
+#[cfg(test)]
+mod tests;
+use crate::storage::{self, AppError, Result};
+use circuit::{Circuit, Health};
+use connector::Connector;
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+pub use model::{Edit, Settings};
+use model::{Provider, Proxy, Store};
+use replay::WireBody;
+use serde::Serialize;
+use std::{
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
+use tokio::sync::{broadcast, watch};
+type HttpClient = Client<Connector, WireBody>;
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderView {
+    pub id: String,
+    pub name: String,
+    base_url: String,
+    proxy_id: Option<String>,
+    queued: bool,
+    health: Health,
+}
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyView {
+    id: String,
+    name: String,
+    host: String,
+    port: u16,
+    username: String,
+    has_password: bool,
+    health: Health,
+}
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Recent {
+    pub provider: String,
+    pub proxy: Option<String>,
+    pub status: Option<u16>,
+    pub elapsed_ms: u64,
+    pub retries: usize,
+    pub category: String,
+    pub at: u64,
+}
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct View {
+    pub revision: String,
+    pub running: bool,
+    pub address: String,
+    pub mode: String,
+    pub selected: Option<String>,
+    pub providers: Vec<ProviderView>,
+    pub proxies: Vec<ProxyView>,
+    pub settings: Settings,
+    pub active_connections: usize,
+    pub recent: Vec<Recent>,
+    pub error: Option<String>,
+    pub recovery_pending: bool,
+}
+struct Inner {
+    store: Store,
+    revision: String,
+    running: bool,
+    shutdown: Option<watch::Sender<bool>>,
+    error: Option<String>,
+    circuits: HashMap<String, Circuit>,
+    recent: VecDeque<Recent>,
+    affinity: HashMap<String, (String, Instant)>,
+}
+struct Shared {
+    inner: Mutex<Inner>,
+    lifecycle: tokio::sync::Mutex<()>,
+    clients: Mutex<HashMap<String, HttpClient>>,
+    data: PathBuf,
+    spool: tempfile::TempDir,
+    active: AtomicUsize,
+    events: broadcast::Sender<()>,
+}
+#[derive(Clone)]
+pub struct Gateway(Arc<Shared>);
+#[derive(Clone)]
+struct Route {
+    provider: Provider,
+    proxy: Option<Proxy>,
+    client: HttpClient,
+    provider_circuit: Circuit,
+    proxy_circuit: Option<Circuit>,
+}
+fn pkey(p: &Provider) -> String {
+    format!("provider:{}:{}", p.id, p.version)
+}
+fn xkey(p: &Proxy) -> String {
+    format!("proxy:{}:{}", p.id, p.version)
+}
+impl Gateway {
+    pub fn new(data: PathBuf) -> Result<Self> {
+        storage::private_dir(&data)?;
+        let error = takeover::detach(&data).err().map(|e| e.message);
+        let (store, revision) = Store::load(&data.join("gateway.json"))?;
+        let spool = tempfile::Builder::new()
+            .prefix("gateway-spool-")
+            .tempdir_in(&data)
+            .map_err(storage::io_error)?;
+        storage::protect(spool.path(), true)?;
+        let (events, _) = broadcast::channel(32);
+        Ok(Self(Arc::new(Shared {
+            inner: Mutex::new(Inner {
+                store,
+                revision,
+                running: false,
+                shutdown: None,
+                error,
+                circuits: HashMap::new(),
+                recent: VecDeque::new(),
+                affinity: HashMap::new(),
+            }),
+            lifecycle: tokio::sync::Mutex::new(()),
+            clients: Mutex::new(HashMap::new()),
+            data,
+            spool,
+            active: AtomicUsize::new(0),
+            events,
+        })))
+    }
+    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+        self.0.events.subscribe()
+    }
+    fn changed(&self) {
+        let _ = self.0.events.send(());
+    }
+    pub fn view(&self) -> View {
+        let s = self.0.inner.lock().unwrap();
+        let health = |key: String| s.circuits.get(&key).cloned().unwrap_or_default().health();
+        View {
+            revision: s.revision.clone(),
+            running: s.running,
+            address: format!("http://127.0.0.1:{}/v1", s.store.settings.port),
+            mode: s.store.mode.clone(),
+            selected: s.store.selected.clone(),
+            settings: s.store.settings.clone(),
+            providers: s
+                .store
+                .providers
+                .iter()
+                .map(|p| ProviderView {
+                    id: p.id.clone(),
+                    name: p.name.clone(),
+                    base_url: p.base_url.clone(),
+                    proxy_id: p.proxy_id.clone(),
+                    queued: p.queued,
+                    health: health(pkey(p)),
+                })
+                .collect(),
+            proxies: s
+                .store
+                .proxies
+                .iter()
+                .map(|p| ProxyView {
+                    id: p.id.clone(),
+                    name: p.name.clone(),
+                    host: p.host.clone(),
+                    port: p.port,
+                    username: p.username.clone(),
+                    has_password: !p.password.is_empty(),
+                    health: health(xkey(p)),
+                })
+                .collect(),
+            active_connections: self.0.active.load(Ordering::Relaxed),
+            recent: s.recent.iter().cloned().collect(),
+            error: s.error.clone(),
+            recovery_pending: self.0.data.join("gateway-recovery.json").exists(),
+        }
+    }
+    pub fn guarded_home(&self) -> bool {
+        self.view().running || self.0.data.join("gateway-recovery.json").exists()
+    }
+    pub fn edit(&self, edit: Edit, expected: &str, home: &Path) -> Result<View> {
+        let mut s = self.0.inner.lock().unwrap();
+        if expected != s.revision {
+            return Err(AppError::new(
+                "CONFLICT",
+                "网关设置已变化，请使用最新状态重试",
+            ));
+        }
+        let mut next = s.store.clone();
+        match edit {
+            Edit::Reset { id, proxy } => {
+                let prefix = format!("{}:{id}:", if proxy { "proxy" } else { "provider" });
+                for (k, c) in &s.circuits {
+                    if k.starts_with(&prefix) {
+                        c.reset();
+                    }
+                }
+            }
+            Edit::Import => {
+                let (base_url, token) = takeover::import(home)?;
+                next.edit(
+                    Edit::SaveProvider {
+                        id: None,
+                        base_url,
+                        token,
+                    },
+                    s.running,
+                )?;
+            }
+            edit => next.edit(edit, s.running)?,
+        }
+        let revision = next.persist(&self.0.data.join("gateway.json"), &s.revision)?;
+        s.store = next;
+        s.revision = revision;
+        drop(s);
+        self.0.clients.lock().unwrap().clear();
+        self.changed();
+        Ok(self.view())
+    }
+    pub async fn start(&self, expected: &str, home: &Path) -> Result<View> {
+        let _guard = self.0.lifecycle.lock().await;
+        let (port, token) = {
+            let s = self.0.inner.lock().unwrap();
+            if expected != s.revision {
+                return Err(AppError::new("CONFLICT", "网关设置已变化，请重试"));
+            }
+            if s.running {
+                drop(s);
+                return Ok(self.view());
+            }
+            if s.store.providers.is_empty() {
+                return Err(AppError::new("PROVIDER", "请先添加供应商"));
+            }
+            (s.store.settings.port, s.store.local_token.clone())
+        };
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .map_err(|_| AppError::new("PORT", "无法绑定本地端口，请检查端口占用或修改端口"))?;
+        {
+            let s = self.0.inner.lock().unwrap();
+            if s.revision != expected {
+                return Err(AppError::new("CONFLICT", "绑定端口期间设置已变化，请重试"));
+            }
+        }
+        let (tx, rx) = watch::channel(false);
+        {
+            let mut s = self.0.inner.lock().unwrap();
+            if s.revision != expected {
+                return Err(AppError::new("CONFLICT", "设置已变化，请重试"));
+            }
+            takeover::attach(&self.0.data, home, port, &token)?;
+            s.running = true;
+            s.shutdown = Some(tx);
+            s.error = None;
+        }
+        let gateway = self.clone();
+        tokio::spawn(async move {
+            forward::serve(gateway, listener, rx).await;
+        });
+        self.changed();
+        Ok(self.view())
+    }
+    pub async fn stop(&self) -> Result<View> {
+        let _guard = self.0.lifecycle.lock().await;
+        if let Err(e) = takeover::detach(&self.0.data) {
+            self.0.inner.lock().unwrap().error = Some(e.message.clone());
+            self.changed();
+            return Err(e);
+        }
+        {
+            let mut s = self.0.inner.lock().unwrap();
+            if let Some(tx) = s.shutdown.take() {
+                let _ = tx.send(true);
+            }
+            s.running = false;
+            s.error = None;
+        }
+        self.0.clients.lock().unwrap().clear();
+        self.changed();
+        Ok(self.view())
+    }
+    pub async fn test_connection(&self, id: &str) -> Result<u64> {
+        let (p, proxy, cfg) = {
+            let s = self.0.inner.lock().unwrap();
+            let p = s
+                .store
+                .providers
+                .iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| AppError::new("PROVIDER", "供应商不存在"))?
+                .clone();
+            let proxy = p
+                .proxy_id
+                .as_ref()
+                .and_then(|id| s.store.proxies.iter().find(|x| &x.id == id))
+                .cloned();
+            (p, proxy, s.store.settings.clone())
+        };
+        let connector = Connector::new(proxy, Duration::from_secs(cfg.connect_seconds), cfg.port);
+        let began = Instant::now();
+        let uri = p
+            .base_url
+            .parse()
+            .map_err(|_| AppError::new("URL", "base_url 无效"))?;
+        connector
+            .connect(uri)
+            .await
+            .map_err(|e| AppError::new("CONNECT", &e.to_string()))?;
+        Ok(began.elapsed().as_millis() as u64)
+    }
+    fn route(&self, id: &str) -> Option<Route> {
+        let mut s = self.0.inner.lock().unwrap();
+        let provider = s.store.providers.iter().find(|p| p.id == id)?.clone();
+        let proxy = provider
+            .proxy_id
+            .as_ref()
+            .and_then(|id| s.store.proxies.iter().find(|p| &p.id == id))
+            .cloned();
+        let provider_circuit = s.circuits.entry(pkey(&provider)).or_default().clone();
+        let proxy_circuit = proxy
+            .as_ref()
+            .map(|p| s.circuits.entry(xkey(p)).or_default().clone());
+        let key = format!(
+            "{}:{}:{}",
+            pkey(&provider),
+            proxy.as_ref().map(xkey).unwrap_or_default(),
+            s.store.settings.connect_seconds
+        );
+        let mut clients = self.0.clients.lock().unwrap();
+        let client = clients
+            .entry(key)
+            .or_insert_with(|| {
+                Client::builder(TokioExecutor::new())
+                    .pool_idle_timeout(Duration::from_secs(60))
+                    .pool_max_idle_per_host(8)
+                    .retry_canceled_requests(false)
+                    .build(Connector::new(
+                        proxy.clone(),
+                        Duration::from_secs(s.store.settings.connect_seconds),
+                        s.store.settings.port,
+                    ))
+            })
+            .clone();
+        Some(Route {
+            provider,
+            proxy,
+            client,
+            provider_circuit,
+            proxy_circuit,
+        })
+    }
+    fn remember(&self, id: &str, provider: &str) {
+        let mut s = self.0.inner.lock().unwrap();
+        s.affinity
+            .retain(|_, (_, at)| at.elapsed() < Duration::from_secs(3600));
+        if s.affinity.len() >= 4096 {
+            if let Some(old) = s
+                .affinity
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(id, _)| id.clone())
+            {
+                s.affinity.remove(&old);
+            }
+        }
+        s.affinity
+            .insert(id.into(), (provider.into(), Instant::now()));
+    }
+    fn record(
+        &self,
+        route: &Route,
+        status: Option<u16>,
+        began: Instant,
+        retries: usize,
+        category: &str,
+    ) {
+        let mut s = self.0.inner.lock().unwrap();
+        s.recent.push_front(Recent {
+            provider: route.provider.name.clone(),
+            proxy: route.proxy.as_ref().map(|p| p.name.clone()),
+            status,
+            elapsed_ms: began.elapsed().as_millis() as u64,
+            retries,
+            category: category.into(),
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        });
+        s.recent.truncate(40);
+        drop(s);
+        self.changed();
+    }
+}
+struct Active(Gateway);
+impl Active {
+    fn new(g: Gateway) -> Self {
+        g.0.active.fetch_add(1, Ordering::Relaxed);
+        g.changed();
+        Self(g)
+    }
+}
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.0 .0.active.fetch_sub(1, Ordering::Relaxed);
+        self.0.changed();
+    }
+}

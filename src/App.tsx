@@ -8,6 +8,8 @@ import {
 } from "react";
 import {
   ArrowLeftRight,
+  Network,
+  Shield,
   Users,
   FileCode2,
   Settings,
@@ -41,6 +43,7 @@ import {
   type Preferences,
   type LoginState,
 } from "./types";
+const Gateway = lazy(() => import("./Gateway"));
 const ConfigEditor = lazy(() => import("./ConfigEditor"));
 type Dialog =
   | "add"
@@ -56,7 +59,9 @@ const emptyLogin: LoginState = {
 };
 export default function App() {
   const [state, setState] = useState<ViewState | null>(null),
-    [page, setPage] = useState<"accounts" | "config">("accounts"),
+    [page, setPage] = useState<"accounts" | "config" | "gateway" | "proxies">(
+      "accounts",
+    ),
     [search, setSearch] = useState(""),
     [dialog, setDialog] = useState<Dialog>(null),
     [error, setError] = useState(""),
@@ -72,17 +77,20 @@ export default function App() {
   dirtyRef.current = dirty;
   pageRef.current = page;
   const notify = useCallback((s: string) => setMessage(s), []);
-  const navigate = useCallback((next: "accounts" | "config") => {
-    if (
-      pageRef.current === "config" &&
-      next !== "config" &&
-      dirtyRef.current &&
-      !window.confirm("离开配置页会丢弃未保存的草稿，是否继续？")
-    )
-      return;
-    setPage(next);
-    if (next !== "config") setDirty(false);
-  }, []);
+  const navigate = useCallback(
+    (next: "accounts" | "config" | "gateway" | "proxies") => {
+      if (
+        pageRef.current === "config" &&
+        next !== "config" &&
+        dirtyRef.current &&
+        !window.confirm("离开配置页会丢弃未保存的草稿，是否继续？")
+      )
+        return;
+      setPage(next);
+      if (next !== "config") setDirty(false);
+    },
+    [],
+  );
   useEffect(() => {
     let disposed = false;
     const cleaners: (() => void)[] = [];
@@ -104,7 +112,15 @@ export default function App() {
       ["switch-state", (p) => setState(p as ViewState)],
       ["switch-notice", (p) => setMessage(String(p))],
       ["switch-error", (p) => setError(errorOf(p).message)],
-      ["navigate", (p) => navigate(p === "config" ? "config" : "accounts")],
+      [
+        "navigate",
+        (p) =>
+          navigate(
+            p === "config" || p === "gateway" || p === "proxies"
+              ? p
+              : "accounts",
+          ),
+      ],
       ["login-state", (p) => setLogin(p as LoginState)],
     ];
     for (const [event, fn] of events)
@@ -170,7 +186,6 @@ export default function App() {
           <img src="/icon.svg" alt="" />
           <div>
             <strong>gpt-Switch</strong>
-            <span>随手切换，即刻就绪</span>
           </div>
         </div>
         <nav aria-label="主导航">
@@ -179,7 +194,7 @@ export default function App() {
             onClick={() => navigate("accounts")}
           >
             <Users size={17} />
-            账号<span className="nav-count">{state?.accounts.length ?? 0}</span>
+            账号
           </button>
           <button
             className={page === "config" ? "nav-item active" : "nav-item"}
@@ -188,15 +203,25 @@ export default function App() {
             <FileCode2 size={17} />
             配置
           </button>
+          <button
+            className={page === "gateway" ? "nav-item active" : "nav-item"}
+            onClick={() => navigate("gateway")}
+          >
+            <Network size={17} />
+            网关
+          </button>
+          <button
+            className={page === "proxies" ? "nav-item active" : "nav-item"}
+            onClick={() => navigate("proxies")}
+          >
+            <Shield size={17} />
+            代理设置
+          </button>
         </nav>
         <div className="sidebar-bottom">
-          <div className="local-label">
-            <span className="dot" />
-            本地存储
-          </div>
           <button className="nav-item" onClick={() => setDialog("settings")}>
             <Settings size={17} />
-            设置<span className="version">v0.1.0</span>
+            设置<span className="version">v0.2.0</span>
           </button>
         </div>
       </aside>
@@ -234,12 +259,7 @@ export default function App() {
           <section className="accounts-page">
             <div className="page-heading">
               <div>
-                <div className="eyebrow">
-                  <ArrowLeftRight size={14} />
-                  账号切换
-                </div>
-                <h1>你的账号，一个入口。</h1>
-                <p>选择账号，接着完成手上的工作。</p>
+                <h1>账号</h1>
               </div>
               <button
                 className="primary"
@@ -256,6 +276,12 @@ export default function App() {
               </div>
               <div className="source-detail">
                 <strong>当前认证来源</strong>
+                {state?.authSource.warning && (
+                  <details className="auth-help">
+                    <summary>独立认证设置</summary>
+                    <p>{state.authSource.warning}</p>
+                  </details>
+                )}
                 <div className="source-values">
                   <span>{state?.authSource.provider ?? "—"}</span>
                   <span>
@@ -278,12 +304,7 @@ export default function App() {
                 <ArrowUpRight size={14} />
               </button>
             </div>
-            {state?.authSource.warning && (
-              <div className="banner warning">
-                <AlertTriangle size={16} />
-                <span>{state.authSource.warning}</span>
-              </div>
-            )}
+
             {(state?.currentState === "unsaved" ||
               state?.currentState === "missing" ||
               state?.currentState === "invalid") && (
@@ -425,14 +446,11 @@ export default function App() {
                 ))
               )}
             </div>
-            <div className="account-footer">
-              <span>
-                <ArrowLeftRight size={14} />
-                也可以左键点击菜单栏或托盘图标切换
-              </span>
-              <span>{state?.accounts.length ?? 0} 个账号</span>
-            </div>
           </section>
+        ) : page === "gateway" || page === "proxies" ? (
+          <Suspense fallback={<div className="empty">正在打开网关…</div>}>
+            <Gateway section={page} notify={notify} />
+          </Suspense>
         ) : (
           state && (
             <Suspense fallback={<div className="empty">正在打开编辑器…</div>}>
@@ -689,7 +707,7 @@ function AddAccount({
           <div className="import-area">
             <Upload size={26} />
             <h3>导入已有 auth.json</h3>
-            <p>完整保留账号凭据和附加字段。</p>
+
             <button
               className="primary"
               disabled={busy}
@@ -747,7 +765,7 @@ function AddAccount({
               placeholder="输入 API Key"
             />
           </label>
-          <p className="dialog-help">API 地址与模型在配置页单独编辑。</p>
+
           <button
             className="primary full"
             disabled={busy || !key.trim() || !name.trim()}
@@ -762,7 +780,6 @@ function AddAccount({
           {error}
         </p>
       )}
-      <p className="privacy-note">凭据仅保存在这台设备。</p>
     </div>
   );
 }
@@ -842,7 +859,7 @@ function SettingsForm({
           </button>
         </div>
       </label>
-      <p className="dialog-help">仅添加 ChatGPT 账号时需要官方 Codex CLI。</p>
+
       <label className="field">外观</label>
       <div className="segments theme-options">
         {(["system", "dark", "light"] as const).map((t) => (

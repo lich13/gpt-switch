@@ -1,4 +1,5 @@
 mod core;
+mod gateway;
 mod login;
 mod storage;
 use core::{ConfigDocument, Core, Preferences, ViewState};
@@ -19,8 +20,10 @@ use tauri_plugin_dialog::DialogExt;
 
 struct Runtime {
     core: Mutex<Core>,
+    gateway: gateway::Gateway,
     login: Mutex<login::Session>,
     quitting: AtomicBool,
+    quit_pending: AtomicBool,
     smoke: Option<PathBuf>,
     fixture: Mutex<Option<tempfile::TempDir>>,
 }
@@ -82,9 +85,43 @@ fn tray_menu(app: &tauri::AppHandle, state: &ViewState) -> tauri::Result<Menu<ta
             None::<&str>,
         )?)?;
     }
+    if let Some(runtime) = app.try_state::<Arc<Runtime>>() {
+        let g = runtime.gateway.view();
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        menu.append(&MenuItem::with_id(
+            app,
+            "gateway-heading",
+            if g.running {
+                "网关 · 运行中"
+            } else {
+                "网关 · 已关闭"
+            },
+            false,
+            None::<&str>,
+        )?)?;
+        menu.append(&CheckMenuItem::with_id(
+            app,
+            "gateway-auto",
+            "自动故障转移",
+            true,
+            g.mode == "auto",
+            None::<&str>,
+        )?)?;
+        for p in &g.providers {
+            menu.append(&CheckMenuItem::with_id(
+                app,
+                format!("provider:{}", p.id),
+                p.name.replace('&', "&&"),
+                true,
+                g.mode == "manual" && g.selected.as_deref() == Some(&p.id),
+                None::<&str>,
+            )?)?;
+        }
+    }
     for (id, label) in [
         ("open", "打开 gpt-Switch"),
         ("config", "编辑配置"),
+        ("gateway", "打开网关"),
         ("quit", "退出 gpt-Switch"),
     ] {
         menu.append(&MenuItem::with_id(app, id, label, true, None::<&str>)?)?;
@@ -221,6 +258,13 @@ fn set_preferences(
     if login_active(&lock(&r.login)?.state) {
         return Err(AppError::new("LOGIN_BUSY", "请先完成或取消登录"));
     }
+    if r.gateway.guarded_home() && lock(&r.core)?.preferences().codex_home != preferences.codex_home
+    {
+        return Err(AppError::new(
+            "GATEWAY_ACTIVE",
+            "更换 Codex 目录前请先停用网关并恢复配置",
+        ));
+    }
     let s = lock(&r.core)?.set_preferences(preferences)?;
     publish(&app, s.clone());
     Ok(s)
@@ -339,21 +383,73 @@ fn open_login_url(r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
         .ok_or_else(|| AppError::new("LOGIN_URL", "登录链接尚未生成"))?;
     open::that(url).map_err(|_| AppError::new("OPEN", "无法打开浏览器"))
 }
-fn quit(app: &tauri::AppHandle, r: &Runtime) {
-    r.quitting.store(true, Ordering::Relaxed);
-    if let Ok(mut s) = r.login.lock() {
-        if let Some(tx) = s.cancel.take() {
-            let _ = tx.send(());
-            return;
-        }
-        if login_active(&s.state) {
-            return;
-        }
+fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
+    if r.quit_pending.swap(true, Ordering::Relaxed) {
+        return;
     }
-    app.exit(0);
+    let runtime = r.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = runtime.gateway.stop().await {
+            runtime.quit_pending.store(false, Ordering::Relaxed);
+            let _ = app.emit("switch-error", e);
+            let _ = show(&app, "gateway");
+            return;
+        }
+        runtime.quitting.store(true, Ordering::Relaxed);
+        if let Ok(mut s) = runtime.login.lock() {
+            if let Some(tx) = s.cancel.take() {
+                let _ = tx.send(());
+                return;
+            }
+            if login_active(&s.state) {
+                return;
+            }
+        }
+        app.exit(0);
+    });
 }
 #[tauri::command]
-fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
+fn get_gateway(r: tauri::State<'_, Arc<Runtime>>) -> gateway::View {
+    r.gateway.view()
+}
+#[tauri::command]
+fn update_gateway(
+    r: tauri::State<'_, Arc<Runtime>>,
+    edit: gateway::Edit,
+    expected_revision: String,
+) -> Result<gateway::View> {
+    let home = lock(&r.core)?.home();
+    r.gateway.edit(edit, &expected_revision, &home)
+}
+#[tauri::command]
+async fn start_gateway(
+    app: tauri::AppHandle,
+    r: tauri::State<'_, Arc<Runtime>>,
+    expected_revision: String,
+) -> Result<gateway::View> {
+    let home = lock(&r.core)?.home();
+    let result = r.gateway.start(&expected_revision, &home).await?;
+    let _ = refresh(&app, &r);
+    let _ = app.emit("switch-notice", "网关已启用，请重新打开 Codex");
+    Ok(result)
+}
+#[tauri::command]
+async fn stop_gateway(
+    app: tauri::AppHandle,
+    r: tauri::State<'_, Arc<Runtime>>,
+) -> Result<gateway::View> {
+    let result = r.gateway.stop().await?;
+    let _ = refresh(&app, &r);
+    let _ = app.emit("switch-notice", "原配置已恢复，请重新打开 Codex");
+    Ok(result)
+}
+#[tauri::command]
+async fn test_provider(r: tauri::State<'_, Arc<Runtime>>, id: String) -> Result<u64> {
+    r.gateway.test_connection(&id).await
+}
+#[tauri::command]
+async fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
     if let Some(output) = &r.smoke {
         let result = (|| -> Result<()> {
             let mut c = lock(&r.core)?;
@@ -371,7 +467,11 @@ fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> R
             }
             Ok(())
         })();
-        let data = serde_json::json!({"ok":result.is_ok(),"version":env!("CARGO_PKG_VERSION"),"revision":env!("GPT_SWITCH_REVISION"),"webview":true,"tray":app.tray_by_id("switch").is_some(),"platform":std::env::consts::OS,"error":result.err()});
+        let result = match result {
+            Ok(()) => gateway_smoke(&r).await,
+            Err(e) => Err(e),
+        };
+        let data = serde_json::json!({"gateway":result.is_ok(),"ok":result.is_ok(),"version":env!("CARGO_PKG_VERSION"),"revision":env!("GPT_SWITCH_REVISION"),"webview":true,"tray":app.tray_by_id("switch").is_some(),"platform":std::env::consts::OS,"error":result.err()});
         storage::atomic_write(
             output,
             serde_json::to_string_pretty(&data).unwrap().as_bytes(),
@@ -384,6 +484,58 @@ fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> R
         app.exit(if data["ok"] == true { 0 } else { 1 });
     } else {
         show(&app, "accounts")?;
+    }
+    Ok(())
+}
+async fn gateway_smoke(r: &Runtime) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let home = lock(&r.core)?.home();
+    let auth = storage::read_optional(&home.join("auth.json"))?;
+    let config = storage::read_optional(&home.join("config.toml"))?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(storage::io_error)?;
+    let port = listener.local_addr().map_err(storage::io_error)?.port();
+    drop(listener);
+    r.gateway.edit(
+        gateway::Edit::Settings {
+            settings: gateway::Settings {
+                port,
+                ..Default::default()
+            },
+        },
+        &r.gateway.view().revision,
+        &home,
+    )?;
+    r.gateway.edit(
+        gateway::Edit::SaveProvider {
+            id: None,
+            base_url: "https://example.invalid/v1".into(),
+            token: "fixture-only".into(),
+        },
+        &r.gateway.view().revision,
+        &home,
+    )?;
+    r.gateway.start(&r.gateway.view().revision, &home).await?;
+    let mut connection = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(storage::io_error)?;
+    connection
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .map_err(storage::io_error)?;
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        connection.read_to_end(&mut response),
+    )
+    .await
+    .map_err(|_| AppError::new("SMOKE", "网关响应超时"))?
+    .map_err(storage::io_error)?;
+    r.gateway.stop().await?;
+    if !response.starts_with(b"HTTP/1.1 401")
+        || auth != storage::read_optional(&home.join("auth.json"))?
+        || config != storage::read_optional(&home.join("config.toml"))?
+    {
+        return Err(AppError::new("SMOKE", "网关或恢复校验失败"));
     }
     Ok(())
 }
@@ -430,16 +582,32 @@ pub fn run() {
                         .map(PathBuf::from)
                         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
                 });
+            let gateway = gateway::Gateway::new(data.clone())?;
             let core = Core::new(data, home)?;
             let runtime = Arc::new(Runtime {
                 core: Mutex::new(core),
+                gateway,
                 login: Mutex::new(Default::default()),
                 quitting: AtomicBool::new(false),
+                quit_pending: AtomicBool::new(false),
                 smoke,
                 fixture: Mutex::new(fixture),
             });
             let state = lock(&runtime.core)?.state()?;
             app.manage(runtime.clone());
+            let mut gateway_events = runtime.gateway.subscribe();
+            let gateway_runtime = runtime.clone();
+            let gateway_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match gateway_events.recv().await {
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => (),
+                        Err(_) => break,
+                    }
+                    let _ = gateway_app.emit("gateway-state", gateway_runtime.gateway.view());
+                    let _ = refresh(&gateway_app, &gateway_runtime);
+                }
+            });
             let mut tray = TrayIconBuilder::with_id("switch")
                 .menu(&tray_menu(app.handle(), &state)?)
                 .show_menu_on_left_click(true)
@@ -483,7 +651,34 @@ pub fn run() {
                         let _ = show(app, "config");
                     }
                     "quit" => quit(app, &r),
+                    "gateway" => {
+                        let _ = show(app, "gateway");
+                    }
+                    "gateway-auto" => {
+                        if let Ok(c) = lock(&r.core) {
+                            let _ = r.gateway.edit(
+                                gateway::Edit::Mode {
+                                    mode: "auto".into(),
+                                },
+                                &r.gateway.view().revision,
+                                &c.home(),
+                            );
+                        }
+                    }
                     _ => {
+                        if let Some(provider) = id.strip_prefix("provider:") {
+                            if let Ok(c) = lock(&r.core) {
+                                if let Err(e) = r.gateway.edit(
+                                    gateway::Edit::Select {
+                                        id: provider.into(),
+                                    },
+                                    &r.gateway.view().revision,
+                                    &c.home(),
+                                ) {
+                                    let _ = app.emit("switch-error", e);
+                                }
+                            }
+                        }
                         if let Some(id) = id.strip_prefix("account:") {
                             let result = lock(&r.core).and_then(|mut c| {
                                 let revision = c.state()?.auth_revision;
@@ -560,6 +755,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_gateway,
+            update_gateway,
+            start_gateway,
+            stop_gateway,
+            test_provider,
             get_state,
             switch_account,
             import_current,

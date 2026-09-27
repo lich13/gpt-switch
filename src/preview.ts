@@ -1,3 +1,4 @@
+import { gatewayPreview } from "./gateway-preview";
 import type { ViewState, ConfigDocument, LoginState } from "./types";
 const callbacks = new Map<string, Set<(p: never) => void>>();
 export function subscribe<T>(event: string, fn: (p: T) => void) {
@@ -68,6 +69,19 @@ export async function run(
   name: string,
   args: Record<string, unknown>,
 ): Promise<unknown> {
+  if (
+    [
+      "get_gateway",
+      "start_gateway",
+      "stop_gateway",
+      "update_gateway",
+      "test_provider",
+    ].includes(name)
+  ) {
+    const result = gatewayPreview(name, args);
+    if (name !== "test_provider") emit("gateway-state", result);
+    return result;
+  }
   switch (name) {
     case "get_state":
       return structuredClone(demo);

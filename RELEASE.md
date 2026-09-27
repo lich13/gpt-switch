@@ -1,10 +1,11 @@
-# gpt-Switch v0.1.0
+# gpt-Switch v0.2.0
 
-首个版本提供 Codex 账号列表、菜单栏／托盘左键快捷切换、官方 ChatGPT 登录、凭据导入、API Key 添加和独立 TOML 编辑器。
+新增本地 Codex API 网关、供应商热切换、自动故障转移和供应商独立 SOCKS5 代理。升级后网关关闭，供应商默认直连。
 
-- 原创 Prism Relay 图标，跟随系统的深浅主题。
-- 切换只写 `auth.json`；TOML 原文保存，外部修改冲突保护。
-- 文件权限限制、原子写入、回读校验、Token 刷新回存与一份最近回滚。
-- macOS Apple Silicon / Intel DMG、Windows x64 NSIS 安装包及 SHA-256。
+- 通用 HTTP / SSE / WebSocket 转发，保持原始请求载荷、模型与参数；供应商 API 只需 base_url、experimental_bearer_token。
+- 故障转移参考固定版本 cc-switch，支持顺序优先级、熔断、单个半开探测、Retry-After、共享代理故障隔离和响应归属固定。已开始的流与 WebSocket 不跨供应商重放。
+- SOCKS5 支持密码认证、远端 DNS、严格目标 TLS 验证；失败不静默直连。独立代理设置、连接测试及托盘供应商选择。
+- 受管 provider 的配置接管、原文恢复、外部修改冲突和崩溃恢复；网关不改 auth.json。
+- 精简界面说明，保留原有账号、官方登录、导入、API Key、TOML 编辑、托盘和 Prism Relay 图标。
 
-需要本机 Codex CLI 才能添加 ChatGPT 登录。切换文件后请自行重新打开 Codex。macOS 使用 ad-hoc 签名；Windows 安装包未商业签名。
+macOS Apple Silicon / Intel DMG、Windows x64 NSIS、图标资源与 SHA256SUMS。macOS 使用 ad-hoc 签名；Windows 安装包未商业签名。真实账号与代理凭据只在本机私有数据中保存，不随安装包发布。

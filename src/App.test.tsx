@@ -126,7 +126,7 @@ describe("user workflows", () => {
     doc.text = '# keep\r\nmodel = "original"\r\n';
     const u = userEvent.setup();
     render(<App />);
-    await screen.findByText("你的账号，一个入口。");
+    await screen.findByRole("heading", { name: "账号", level: 1 });
     await u.click(screen.getByRole("button", { name: "配置" }));
     fireEvent.change(await screen.findByLabelText("TOML 编辑器"), {
       target: { value: '# keep\nmodel = "updated"\n' },
@@ -157,7 +157,7 @@ describe("user workflows", () => {
   it("preserves unsaved drafts when external state changes and blocks conflicting saves", async () => {
     const u = userEvent.setup();
     render(<App />);
-    await screen.findByText("你的账号，一个入口。");
+    await screen.findByRole("heading", { name: "账号", level: 1 });
     await u.click(screen.getByRole("button", { name: "配置" }));
     const edit = await screen.findByLabelText("TOML 编辑器");
     fireEvent.change(edit, { target: { value: '# my draft\nmodel="draft"' } });
@@ -174,7 +174,7 @@ describe("user workflows", () => {
   it("keeps invalid TOML in the editor after save failure", async () => {
     const u = userEvent.setup();
     render(<App />);
-    await screen.findByText("你的账号，一个入口。");
+    await screen.findByRole("heading", { name: "账号", level: 1 });
     await u.click(screen.getByRole("button", { name: "配置" }));
     const edit = await screen.findByLabelText("TOML 编辑器");
     fireEvent.change(edit, { target: { value: "# keep\nbad = [" } });
@@ -192,7 +192,7 @@ describe("user workflows", () => {
   });
   it("receives tray changes and refreshes the selected account", async () => {
     render(<App />);
-    await screen.findByText("你的账号，一个入口。");
+    await screen.findByRole("heading", { name: "账号", level: 1 });
     mocks.listeners.get("switch-state")?.({
       ...state,
       accounts: state.accounts.map((a) => ({ ...a, current: a.id === "b" })),
@@ -210,12 +210,12 @@ describe("user workflows", () => {
     const u = userEvent.setup();
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     render(<App />);
-    await screen.findByText("你的账号，一个入口。");
+    await screen.findByRole("heading", { name: "账号", level: 1 });
     await u.click(screen.getByRole("button", { name: "配置" }));
     fireEvent.change(await screen.findByLabelText("TOML 编辑器"), {
       target: { value: 'model="draft"' },
     });
-    await u.click(screen.getByRole("button", { name: /账号\s*2/ }));
+    await u.click(screen.getByRole("button", { name: "账号" }));
     expect(confirm).toHaveBeenCalled();
     expect(screen.getByLabelText("TOML 编辑器")).toHaveValue('model="draft"');
   });

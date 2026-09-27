@@ -334,12 +334,19 @@ mod tests {
         let execution = run(&script, "browser", rx, events);
         tokio::pin!(execution);
         tokio::select! {_=&mut execution=>panic!("login ended before cancel"),_ = receiver.recv()=>{}}
-        for _ in 0..50 {
-            if marker.exists() {
-                break;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::metadata(&marker).is_ok_and(|m| m.len() > 0) {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut execution => panic!("login ended before marker"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => (),
+                }
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("fixture CLI did not start");
         let path = std::fs::read_to_string(marker).unwrap();
         cancel.send(()).unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(3), execution)
