@@ -1,4 +1,5 @@
 use super::{
+    admission::{Admission, Budget, Rejected},
     circuit::{self, Outcome, Permit},
     connector::{self, BoxError},
     model::Settings,
@@ -34,7 +35,7 @@ pub async fn serve(
         }
     }
 }
-fn error(status: StatusCode, code: &str, message: &str) -> Response<WireBody> {
+pub(super) fn error(status: StatusCode, code: &str, message: &str) -> Response<WireBody> {
     Response::builder().status(status).header(header::CONTENT_TYPE,"application/json")
         .body(replay::full(serde_json::to_vec(&serde_json::json!({"error":{"type":"gpt_switch_gateway","code":code,"message":message}})).unwrap())).unwrap()
 }
@@ -231,6 +232,22 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         .get(header::UPGRADE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    if websocket
+        && matches!(
+            request.uri().path().trim_end_matches('/'),
+            "/responses" | "/v1/responses"
+        )
+    {
+        return super::websocket::accept(
+            gateway,
+            request,
+            settings,
+            mode == "manual",
+            ids,
+            routes,
+            active,
+        );
+    }
     let downstream_upgrade = websocket.then(|| hyper::upgrade::on(&mut request));
     let (parts, body) = request.into_parts();
     let replay = match tokio::time::timeout(
@@ -300,16 +317,42 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
     let mut last = None;
     let mut attempted = 0usize;
     let mut last_category = "NO_PROVIDER";
-    for id in ids {
-        if attempted > settings.max_retries || (pinned && attempted >= 1) {
-            break;
-        }
-        let Some(route) = routes.get(&id).cloned() else {
-            continue;
+    let mut wait_budget = Budget::new(settings.queue_seconds);
+    while !ids.is_empty() && attempted <= settings.max_retries && (!pinned || attempted == 0) {
+        let candidates: Vec<_> = ids
+            .iter()
+            .filter_map(|id| routes.get(id).cloned())
+            .collect();
+        let Admission {
+            route,
+            mut permits,
+            slot,
+        } = match gateway
+            .0
+            .admission
+            .acquire(
+                &candidates,
+                mode == "manual",
+                settings.max_waiting,
+                &mut wait_budget,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(Rejected::Full | Rejected::Timeout) => {
+                let mut response = error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "CAPACITY",
+                    "供应商并发已满，等待队列已满或等待超时",
+                );
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+                return response;
+            }
+            Err(_) => break,
         };
-        let Some(mut permits) = Permits::acquire(&route, mode == "manual") else {
-            continue;
-        };
+        ids.retain(|id| id != &route.provider.id);
         let uri = match target(&route.provider.base_url, &parts.uri) {
             Ok(uri) => uri,
             Err(_) => continue,
@@ -374,6 +417,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             let cfg = settings.clone();
             tokio::spawn(async move {
                 let _active = active;
+                let _slot = slot;
                 let connected = tokio::try_join!(upstream_upgrade, downstream);
                 if let Ok((a, b)) = connected {
                     // Opaque tunnel preserves every data/control/close frame, including binary payloads.
@@ -458,6 +502,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         let neutral = status.as_u16() >= 400;
         let output = async_stream::try_stream! {
             let _active=active;
+            let _slot=slot;
             if let Some(frame)=first {if let Some(data)=frame.data_ref(){observe.feed(data);}yield frame;}
             loop {
                 let limit=if stream {tokio::time::Instant::now()+Duration::from_secs(cfg.idle_seconds)}else{total_deadline};
@@ -491,12 +536,12 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         )
     })
 }
-struct Permits {
+pub(super) struct Permits {
     provider: Option<Permit>,
     proxy: Option<Permit>,
 }
 impl Permits {
-    fn acquire(route: &Route, manual: bool) -> Option<Self> {
+    pub(super) fn acquire(route: &Route, manual: bool) -> Option<Self> {
         let proxy = match &route.proxy_circuit {
             Some(c) => Some(c.acquire(manual)?),
             None => None,
@@ -506,22 +551,22 @@ impl Permits {
             proxy,
         })
     }
-    fn proxy_success(&mut self, cfg: &Settings) {
+    pub(super) fn proxy_success(&mut self, cfg: &Settings) {
         if let Some(p) = self.proxy.take() {
             p.finish(Outcome::Success, cfg);
         }
     }
-    fn success(&mut self, cfg: &Settings) {
+    pub(super) fn success(&mut self, cfg: &Settings) {
         if let Some(p) = self.provider.take() {
             p.finish(Outcome::Success, cfg);
         }
     }
-    fn neutral(&mut self, cfg: &Settings) {
+    pub(super) fn neutral(&mut self, cfg: &Settings) {
         if let Some(p) = self.provider.take() {
             p.finish(Outcome::Neutral, cfg);
         }
     }
-    fn failure(&mut self, cfg: &Settings, proxy: bool, retry: Option<Duration>) {
+    pub(super) fn failure(&mut self, cfg: &Settings, proxy: bool, retry: Option<Duration>) {
         if proxy {
             // A failed shared proxy is unavailable immediately; it must not poison each provider.
             if let Some(p) = self.proxy.take() {

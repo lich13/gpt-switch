@@ -60,6 +60,14 @@ pub struct Permit {
     complete: bool,
 }
 impl Circuit {
+    pub fn available(&self, manual: bool) -> bool {
+        let s = self.0.lock().unwrap();
+        match s.phase {
+            CircuitState::Closed => true,
+            CircuitState::Open => manual || s.until.is_none_or(|at| at <= Instant::now()),
+            CircuitState::HalfOpen => !s.probe,
+        }
+    }
     pub fn health(&self) -> Health {
         let s = self.0.lock().unwrap();
         Health {

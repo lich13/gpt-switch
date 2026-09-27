@@ -1,6 +1,6 @@
 [package]
 name = "gpt-switch"
-version = "0.3.0"
+version = "0.4.0"
 description = "Lightweight Codex account switcher and TOML editor"
 edition = "2021"
 rust-version = "1.85"
@@ -20,6 +20,7 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sha1 = "0.10"
 base64 = "0.22"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
@@ -42,6 +43,12 @@ toml_edit = "0.23"
 httpdate = "1"
 flate2 = "1"
 zstd = "0.13"
+yawc = { version = "0.4.2", default-features = false, features = ["zlib", "rustls-ring"] }
+auto-launch = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder"] }
 
 [dev-dependencies]
 tokio-tungstenite = "0.29"

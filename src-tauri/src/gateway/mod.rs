@@ -1,9 +1,11 @@
+mod admission;
 mod circuit;
 mod connector;
 mod forward;
 mod model;
 mod quota;
 mod replay;
+mod websocket;
 pub use quota::QuotaView;
 mod takeover;
 #[cfg(test)]
@@ -38,6 +40,8 @@ pub struct ProviderView {
     health: Health,
     quota_version: String,
     quota: Option<QuotaView>,
+    pub max_concurrency: u32,
+    pub active_requests: usize,
 }
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +82,7 @@ pub struct View {
     pub proxies: Vec<ProxyView>,
     pub settings: Settings,
     pub active_connections: usize,
+    pub waiting_requests: usize,
     pub recent: Vec<Recent>,
     pub error: Option<String>,
     pub recovery_pending: bool,
@@ -104,6 +109,7 @@ struct Shared {
     active: AtomicUsize,
     events: broadcast::Sender<()>,
     quota: quota::Service,
+    admission: admission::Scheduler,
 }
 #[derive(Clone)]
 pub struct Gateway(Arc<Shared>);
@@ -132,6 +138,8 @@ impl Gateway {
             .map_err(storage::io_error)?;
         storage::protect(spool.path(), true)?;
         let (events, _) = broadcast::channel(32);
+        let admission = admission::Scheduler::new(events.clone());
+        admission.configure(&store.providers, false);
         Ok(Self(Arc::new(Shared {
             inner: Mutex::new(Inner {
                 store,
@@ -153,6 +161,7 @@ impl Gateway {
             active: AtomicUsize::new(0),
             events,
             quota: quota::Service::new(),
+            admission,
         })))
     }
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
@@ -163,6 +172,7 @@ impl Gateway {
     }
     pub fn view(&self) -> View {
         let s = self.0.inner.lock().unwrap();
+        let (occupied, waiting) = self.0.admission.counts();
         let health = |key: String| s.circuits.get(&key).cloned().unwrap_or_default().health();
         let config = s.home.as_ref().map(|h| takeover::read(h));
         let config_revision = config
@@ -214,6 +224,8 @@ impl Gateway {
                     queued: p.queued,
                     health: health(pkey(p)),
                     quota_version: Self::quota_version(&s.store, p),
+                    max_concurrency: p.max_concurrency,
+                    active_requests: occupied.get(&p.id).copied().unwrap_or(0),
                     quota: self
                         .0
                         .quota
@@ -235,6 +247,7 @@ impl Gateway {
                 })
                 .collect(),
             active_connections: self.0.active.load(Ordering::Relaxed),
+            waiting_requests: waiting,
             recent: s.recent.iter().cloned().collect(),
             error: s.error.clone(),
             recovery_pending: self.0.data.join("gateway-recovery.json").exists(),
@@ -311,6 +324,11 @@ impl Gateway {
         let revision = if s.running || direct_select {
             let p = Self::exit_provider(&next, s.last_successful.as_deref())?;
             let target = takeover::Pair::new(&p.base_url, &p.token);
+            next.resume = Some(model::Resume {
+                home: home.to_owned(),
+                desired: s.running,
+                pair_hash: target.fingerprint(),
+            });
             let path = self.0.data.join("gateway.json");
             let old = storage::read_optional(&path)?;
             if storage::revision(old.as_deref()) != s.revision {
@@ -339,6 +357,7 @@ impl Gateway {
         }
         s.store = next;
         s.revision = revision;
+        self.0.admission.configure(&s.store.providers, s.running);
         self.0.quota.retain(
             &s.store
                 .providers
@@ -393,19 +412,35 @@ impl Gateway {
             let p = Self::exit_provider(&s.store, None)?;
             let exit = takeover::Pair::new(&p.base_url, &p.token);
             let (current, _) = takeover::read(home)?;
-            takeover::attach(
+            let mut next = s.store.clone();
+            next.resume = Some(model::Resume {
+                home: home.to_owned(),
+                desired: true,
+                pair_hash: exit.fingerprint(),
+            });
+            let before = storage::read_optional(&self.0.data.join("gateway.json"))?;
+            if storage::revision(before.as_deref()) != s.revision {
+                return Err(AppError::new("CONFLICT", "网关存储已被外部修改"));
+            }
+            let after = serde_json::to_string_pretty(&next)
+                .map_err(|_| AppError::new("STORE", "无法生成网关启动事务"))?;
+            takeover::attach_store(
                 &self.0.data,
                 home,
                 port,
                 &token,
                 exit,
                 config_revision.unwrap_or(&current),
+                Some((before.map(|b| String::from_utf8(b).unwrap()), after.clone())),
             )?;
+            s.store = next;
+            s.revision = storage::digest(after.as_bytes());
             s.home = Some(home.to_owned());
             s.last_successful = None;
             s.running = true;
             s.shutdown = Some(tx);
             s.error = None;
+            self.0.admission.configure(&s.store.providers, true);
         }
         let gateway = self.clone();
         let task = tokio::spawn(async move {
@@ -419,12 +454,113 @@ impl Gateway {
         self.stop_checked(None).await
     }
     pub async fn stop_checked(&self, expected_config: Option<&str>) -> Result<View> {
+        self.stop_internal(expected_config, false).await
+    }
+    pub async fn stop_for_exit(&self) -> Result<View> {
+        self.stop_internal(None, true).await
+    }
+    pub async fn resume(&self, home: &Path) -> Result<()> {
+        if self.0.inner.lock().unwrap().running {
+            return Ok(());
+        }
+        let (revision, intent) = {
+            let s = self.0.inner.lock().unwrap();
+            (s.revision.clone(), s.store.resume.clone())
+        };
+        let Some(intent) = intent.filter(|i| i.desired) else {
+            return Ok(());
+        };
+        let result = async {
+            if intent.home != home {
+                return Err(AppError::new(
+                    "RESUME_CONFLICT",
+                    "Codex 目录已变化，自动恢复已停止",
+                ));
+            }
+            let (config_revision, pair) = takeover::read(home)?;
+            if pair.fingerprint() != intent.pair_hash {
+                return Err(AppError::new(
+                    "RESUME_CONFLICT",
+                    "custom 的地址或 Token 在退出后已被修改，自动恢复已停止",
+                ));
+            }
+            self.start_checked(&revision, home, Some(&config_revision))
+                .await
+                .map(|_| ())
+        }
+        .await;
+        if let Err(error) = &result {
+            self.0.inner.lock().unwrap().error = Some(error.message.clone());
+            self.changed();
+        }
+        result
+    }
+    async fn stop_internal(
+        &self,
+        expected_config: Option<&str>,
+        preserve_intent: bool,
+    ) -> Result<View> {
         let _guard = self.0.lifecycle.lock().await;
         let listener_task = {
             let mut s = self.0.inner.lock().unwrap();
             if let (Some(expected), Some(home)) = (expected_config, &s.home) {
                 if takeover::read(home)?.0 != expected {
                     return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
+                }
+            }
+            if !preserve_intent {
+                let mut next = s.store.clone();
+                if let Some(intent) = next.resume.as_mut().filter(|r| r.desired) {
+                    intent.desired = false;
+                    if s.running {
+                        let home = s
+                            .home
+                            .as_ref()
+                            .ok_or_else(|| AppError::new("STATE", "缺少运行目录"))?;
+                        let exit = takeover::exit_pair(&self.0.data)?;
+                        let target = match exit.as_ref() {
+                            Some(pair) => pair.clone(),
+                            None => {
+                                let (_, pair) = takeover::read(home)?;
+                                if pair.fingerprint() != intent.pair_hash {
+                                    return Err(AppError::new(
+                                        "RECOVERY",
+                                        "缺少停止目标且配置未恢复",
+                                    ));
+                                }
+                                pair
+                            }
+                        };
+                        intent.pair_hash = target.fingerprint();
+                        let before = storage::read_optional(&self.0.data.join("gateway.json"))?;
+                        if storage::revision(before.as_deref()) != s.revision {
+                            return Err(AppError::new("CONFLICT", "网关存储已被外部修改"));
+                        }
+                        let after = serde_json::to_string_pretty(&next)
+                            .map_err(|_| AppError::new("STORE", "无法生成停止事务"))?;
+                        if exit.is_some() {
+                            takeover::commit_store(
+                                &self.0.data,
+                                home,
+                                before.map(|b| String::from_utf8(b).unwrap()),
+                                after.clone(),
+                                target,
+                                true,
+                                expected_config,
+                            )?;
+                        } else {
+                            storage::atomic_write(
+                                &self.0.data.join("gateway.json"),
+                                after.as_bytes(),
+                                Some(&s.revision),
+                            )?;
+                        }
+                        s.revision = storage::digest(after.as_bytes());
+                    } else {
+                        s.revision =
+                            next.persist(&self.0.data.join("gateway.json"), &s.revision)?;
+                    }
+                    s.store = next;
                 }
             }
             if let Err(e) = takeover::recover(&self.0.data) {
@@ -441,6 +577,7 @@ impl Gateway {
                 let _ = tx.send(true);
             }
             s.running = false;
+            self.0.admission.configure(&s.store.providers, false);
             s.error = None;
             s.listener_task.take()
         };
@@ -463,10 +600,45 @@ impl Gateway {
             return;
         }
         if s.store.mode == "auto" {
-            if let Err(e) = takeover::update_exit(
-                &self.0.data,
-                takeover::Pair::new(&provider.base_url, &provider.token),
-            ) {
+            let target = takeover::Pair::new(&provider.base_url, &provider.token);
+            let update = (|| -> Result<()> {
+                if s.store
+                    .resume
+                    .as_ref()
+                    .is_some_and(|r| r.pair_hash == target.fingerprint())
+                {
+                    return Ok(());
+                }
+                let home = s
+                    .home
+                    .as_ref()
+                    .ok_or_else(|| AppError::new("STATE", "缺少运行目录"))?;
+                let mut next = s.store.clone();
+                next.resume = Some(model::Resume {
+                    home: home.clone(),
+                    desired: true,
+                    pair_hash: target.fingerprint(),
+                });
+                let before = storage::read_optional(&self.0.data.join("gateway.json"))?;
+                if storage::revision(before.as_deref()) != s.revision {
+                    return Err(AppError::new("CONFLICT", "网关存储已被外部修改"));
+                }
+                let after = serde_json::to_string_pretty(&next)
+                    .map_err(|_| AppError::new("STORE", "无法记录最近供应商"))?;
+                takeover::commit_store(
+                    &self.0.data,
+                    home,
+                    before.map(|b| String::from_utf8(b).unwrap()),
+                    after.clone(),
+                    target,
+                    true,
+                    None,
+                )?;
+                s.store = next;
+                s.revision = storage::digest(after.as_bytes());
+                Ok(())
+            })();
+            if let Err(e) = update {
                 s.error = Some(e.message);
                 drop(s);
                 self.changed();
@@ -603,6 +775,9 @@ impl Gateway {
         })
     }
     fn remember(&self, id: &str, provider: &str) {
+        if id.is_empty() || id.len() > 1024 {
+            return;
+        }
         let mut s = self.0.inner.lock().unwrap();
         s.affinity
             .retain(|_, (_, at)| at.elapsed() < Duration::from_secs(3600));

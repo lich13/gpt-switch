@@ -569,7 +569,7 @@ async fn socks_remote_dns_auth_http_sse_websocket_and_pool_isolation() {
         );
     }
     use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
-    let mut req = format!("ws://127.0.0.1:{}/v1/responses", g.view().settings.port)
+    let mut req = format!("ws://127.0.0.1:{}/v1/opaque-socket", g.view().settings.port)
         .into_client_request()
         .unwrap();
     req.headers_mut().insert(
@@ -1616,3 +1616,6 @@ async fn recognized_expired_sub2_stops_protocol_probing() {
     assert_eq!(result.key_status.as_deref(), Some("已过期"));
     assert_eq!(hits.load(Ordering::Relaxed), 1);
 }
+
+#[path = "concurrency_tests.rs"]
+mod concurrency;

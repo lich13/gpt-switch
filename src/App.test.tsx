@@ -1,4 +1,10 @@
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import {
+  render,
+  screen,
+  waitFor,
+  fireEvent,
+  act,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import type { ViewState, ConfigDocument } from "./types";
@@ -30,6 +36,7 @@ vi.mock("@uiw/react-codemirror", () => ({
   ),
 }));
 import App from "./App";
+import { gatewayDemo } from "./gateway-preview";
 let state: ViewState;
 let doc: ConfigDocument;
 beforeEach(() => {
@@ -77,6 +84,8 @@ beforeEach(() => {
   mocks.command.mockImplementation(
     async (name: string, args: Record<string, unknown>) => {
       switch (name) {
+        case "get_gateway":
+          return structuredClone(gatewayDemo);
         case "get_state":
           return structuredClone(state);
         case "get_login":
@@ -122,6 +131,48 @@ beforeEach(() => {
   );
 });
 describe("user workflows", () => {
+  it("keeps provider secrets in the open draft across activation and protects explicit navigation", async () => {
+    const u = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "账号", level: 1 });
+    await u.click(screen.getByRole("button", { name: "网关" }));
+    await u.click(await screen.findByRole("button", { name: "添加供应商" }));
+    await u.type(
+      screen.getByLabelText("base_url"),
+      "https://draft.example.invalid/v1",
+    );
+    await u.type(
+      screen.getByLabelText("experimental_bearer_token"),
+      "draft-fixture-key",
+    );
+    fireEvent(window, new Event("blur"));
+    fireEvent(window, new Event("focus"));
+    act(() => {
+      mocks.listeners.get("gateway-state")?.({
+        ...structuredClone(gatewayDemo),
+        waitingRequests: 2,
+      });
+      mocks.listeners.get("navigate")?.("gateway");
+    });
+    expect(screen.getByLabelText("experimental_bearer_token")).toHaveValue(
+      "draft-fixture-key",
+    );
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    act(() => mocks.listeners.get("navigate")?.("accounts"));
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(screen.getByLabelText("base_url")).toHaveValue(
+      "https://draft.example.invalid/v1",
+    );
+    confirm.mockReturnValue(true);
+    act(() => mocks.listeners.get("navigate")?.("accounts"));
+    expect(
+      screen.queryByLabelText("experimental_bearer_token"),
+    ).not.toBeInTheDocument();
+    await u.click(screen.getByRole("button", { name: "网关" }));
+    await u.click(await screen.findByRole("button", { name: "添加供应商" }));
+    expect(screen.getByLabelText("experimental_bearer_token")).toHaveValue("");
+    confirm.mockRestore();
+  });
   it("preserves Windows CRLF when the editor changes content", async () => {
     doc.text = '# keep\r\nmodel = "original"\r\n';
     const u = userEvent.setup();

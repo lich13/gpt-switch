@@ -15,6 +15,9 @@ pub struct Pair {
     pub token: Option<String>,
 }
 impl Pair {
+    pub fn fingerprint(&self) -> String {
+        storage::digest(&serde_json::to_vec(self).expect("credential pair serializes"))
+    }
     pub fn new(base: &str, token: &str) -> Self {
         Self {
             base_url: Some(base.into()),
@@ -249,6 +252,7 @@ pub fn import(home: &Path) -> Result<(String, String)> {
     }
     Ok((base, token))
 }
+#[cfg(test)]
 pub fn attach(
     data: &Path,
     home: &Path,
@@ -256,6 +260,18 @@ pub fn attach(
     token: &str,
     exit: Pair,
     expected: &str,
+) -> Result<()> {
+    attach_store(data, home, port, token, exit, expected, None)
+}
+#[allow(clippy::too_many_arguments)]
+pub fn attach_store(
+    data: &Path,
+    home: &Path,
+    port: u16,
+    token: &str,
+    exit: Pair,
+    expected: &str,
+    store: Option<(Option<String>, String)>,
 ) -> Result<()> {
     if data.join(FILE).exists() {
         return Err(AppError::new("RECOVERY", "请先处理现有配置事务"));
@@ -272,8 +288,8 @@ pub fn attach(
         exit,
         live: true,
         config_applied: false,
-        store_before: None,
-        store_after: None,
+        store_before: store.as_ref().and_then(|(before, _)| before.clone()),
+        store_after: store.map(|(_, after)| after),
     };
     save(data, &record)?;
     if let Err(e) = write_pair(&record.path, &record.applied, Some(expected), None) {
@@ -283,7 +299,11 @@ pub fn attach(
         return Err(e);
     }
     record.config_applied = true;
-    save(data, &record)
+    save(data, &record)?;
+    complete_store(data, &mut record)
+}
+pub fn exit_pair(data: &Path) -> Result<Option<Pair>> {
+    Ok(load(data)?.map(|r| r.exit))
 }
 pub fn commit_store(
     data: &Path,
@@ -347,6 +367,7 @@ pub fn commit_store(
     }
     Ok(())
 }
+#[cfg(test)]
 pub fn update_exit(data: &Path, target: Pair) -> Result<()> {
     let mut record = load(data)?.ok_or_else(|| AppError::new("RECOVERY", "缺少网关事务记录"))?;
     if record.store_after.is_some() {

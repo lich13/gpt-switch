@@ -1,6 +1,6 @@
 use crate::storage::{self, AppError, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,6 +12,8 @@ pub struct Provider {
     pub proxy_id: Option<String>,
     pub queued: bool,
     pub version: String,
+    #[serde(default)]
+    pub max_concurrency: u32,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +40,16 @@ pub struct Settings {
     pub idle_seconds: u64,
     pub total_seconds: u64,
     pub connect_seconds: u64,
+    #[serde(default = "default_wait_seconds")]
+    pub queue_seconds: u64,
+    #[serde(default = "default_max_waiting")]
+    pub max_waiting: usize,
+}
+fn default_wait_seconds() -> u64 {
+    30
+}
+fn default_max_waiting() -> usize {
+    100
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -53,6 +65,8 @@ impl Default for Settings {
             idle_seconds: 120,
             total_seconds: 600,
             connect_seconds: 15,
+            queue_seconds: default_wait_seconds(),
+            max_waiting: default_max_waiting(),
         }
     }
 }
@@ -63,6 +77,8 @@ impl Settings {
             || self.failure_threshold == 0
             || self.success_threshold == 0
             || self.min_requests == 0
+            || self.max_waiting == 0
+            || self.max_waiting > 10000
             || !(0.01..=1.0).contains(&self.error_rate)
             || [
                 self.cooldown_seconds,
@@ -70,6 +86,7 @@ impl Settings {
                 self.idle_seconds,
                 self.total_seconds,
                 self.connect_seconds,
+                self.queue_seconds,
             ]
             .iter()
             .any(|s| *s == 0 || *s > 86400)
@@ -89,6 +106,15 @@ pub struct Store {
     pub mode: String,
     pub selected: Option<String>,
     pub local_token: String,
+    #[serde(default)]
+    pub resume: Option<Resume>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Resume {
+    pub home: PathBuf,
+    pub desired: bool,
+    pub pair_hash: String,
 }
 impl Default for Store {
     fn default() -> Self {
@@ -99,6 +125,7 @@ impl Default for Store {
             settings: Settings::default(),
             mode: "manual".into(),
             selected: None,
+            resume: None,
             local_token: format!(
                 "gs_{}{}",
                 uuid::Uuid::new_v4().simple(),
@@ -129,6 +156,10 @@ pub enum Edit {
     QueueProvider {
         id: String,
         queued: bool,
+    },
+    ConcurrencyProvider {
+        id: String,
+        max_concurrency: u32,
     },
     Reorder {
         ids: Vec<String>,
@@ -250,6 +281,7 @@ impl Store {
                         proxy_id: None,
                         queued: true,
                         version: uuid::Uuid::new_v4().to_string(),
+                        max_concurrency: 0,
                     });
                     if self.selected.is_none() {
                         self.selected = Some(id);
@@ -277,6 +309,18 @@ impl Store {
                 p.version = uuid::Uuid::new_v4().to_string();
             }
             Edit::QueueProvider { id, queued } => self.provider_mut(&id)?.queued = queued,
+            Edit::ConcurrencyProvider {
+                id,
+                max_concurrency,
+            } => {
+                if max_concurrency > 100000 {
+                    return Err(AppError::new(
+                        "CONCURRENCY",
+                        "并发上限应为 0–100000，0 表示不限",
+                    ));
+                }
+                self.provider_mut(&id)?.max_concurrency = max_concurrency;
+            }
             Edit::Reorder { ids } => {
                 let mut sorted = ids.clone();
                 sorted.sort();

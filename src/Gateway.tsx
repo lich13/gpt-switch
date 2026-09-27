@@ -43,14 +43,19 @@ const healthText = (h: Health) =>
 export default function Gateway({
   section,
   notify,
+  onDirtyChange,
 }: {
   section: "gateway" | "proxies";
   notify: (s: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [state, setState] = useState<GatewayState | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<Dialog>(null);
+  useEffect(() => {
+    setDialog(null);
+  }, [section]);
   const quota = useProviderQuota(state?.providers ?? [], section === "gateway");
   useEffect(() => {
     let disposed = false,
@@ -176,6 +181,11 @@ export default function Gateway({
               <Activity size={14} />
               {state.activeConnections} 个连接
             </span>
+            {state.waitingRequests > 0 && (
+              <span className="capacity-status">
+                等待 {state.waitingRequests}
+              </span>
+            )}
           </div>
           {state.configError && (
             <div className="banner error" role="alert">
@@ -305,6 +315,19 @@ export default function Gateway({
                   refresh={() => void quota.refresh(p.id)}
                 />
                 <div className="provider-controls">
+                  <ConcurrencyControl
+                    provider={p}
+                    busy={busy}
+                    save={(maxConcurrency) =>
+                      action(() =>
+                        edit({
+                          op: "concurrencyProvider",
+                          id: p.id,
+                          maxConcurrency,
+                        }),
+                      )
+                    }
+                  />
                   <label className="check-label">
                     <input
                       type="checkbox"
@@ -542,6 +565,7 @@ export default function Gateway({
       {dialog && (
         <GatewayDialog
           dialog={dialog}
+          onDirtyChange={onDirtyChange}
           close={() => setDialog(null)}
           save={async (payload) => {
             await edit(payload);
@@ -550,6 +574,66 @@ export default function Gateway({
         />
       )}
     </section>
+  );
+}
+function ConcurrencyControl({
+  provider,
+  busy,
+  save,
+}: {
+  provider: Provider;
+  busy: boolean;
+  save: (limit: number) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState(String(provider.maxConcurrency));
+  useEffect(
+    () => setDraft(String(provider.maxConcurrency)),
+    [provider.maxConcurrency],
+  );
+  const changed = draft !== String(provider.maxConcurrency);
+  const full =
+    provider.maxConcurrency > 0 &&
+    provider.activeRequests >= provider.maxConcurrency;
+  return (
+    <form
+      className="concurrency-control"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (changed) void save(Number(draft)).catch(() => {});
+      }}
+    >
+      <label>
+        并发上限
+        <input
+          aria-label={`${provider.name} 并发上限`}
+          type="number"
+          min={0}
+          max={100000}
+          step={1}
+          required
+          value={draft}
+          disabled={busy}
+          title="0 表示不限"
+          onChange={(e) => setDraft(e.target.value)}
+        />
+      </label>
+      {changed && (
+        <button
+          className="text-button"
+          disabled={busy}
+          aria-label={`保存 ${provider.name} 并发上限`}
+        >
+          保存
+        </button>
+      )}
+      <span
+        className={`capacity-status ${full ? "at-capacity" : ""}`}
+        aria-label={`${provider.name} 并发状态`}
+      >
+        {provider.activeRequests}/{provider.maxConcurrency || "不限"}
+        {full ? " · 满载" : ""}
+      </span>
+    </form>
   );
 }
 function Advanced({
@@ -585,6 +669,8 @@ function Advanced({
     ["idleSeconds", "流静默 / 秒"],
     ["totalSeconds", "非流式总时限 / 秒"],
     ["connectSeconds", "连接超时 / 秒"],
+    ["queueSeconds", "排队等待 / 秒"],
+    ["maxWaiting", "最多等待请求"],
   ];
   return (
     <form
@@ -632,10 +718,12 @@ function GatewayDialog({
   dialog,
   close,
   save,
+  onDirtyChange,
 }: {
   dialog: NonNullable<Dialog>;
   close: () => void;
   save: (p: Edit) => Promise<void>;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const initialSave = useRef(save);
   const ref = useRef<HTMLDialogElement>(null),
@@ -651,6 +739,16 @@ function GatewayDialog({
     [port, setPort] = useState(proxy?.port ?? 1080),
     [username, setUsername] = useState(proxy?.username ?? ""),
     [password, setPassword] = useState("");
+  const initialDraft = useRef(
+    JSON.stringify([baseUrl, token, name, host, port, username, password]),
+  );
+  useEffect(() => {
+    onDirtyChange?.(
+      JSON.stringify([baseUrl, token, name, host, port, username, password]) !==
+        initialDraft.current,
+    );
+  }, [baseUrl, token, name, host, port, username, password, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
   useEffect(() => {
     ref.current?.showModal();
   }, []);

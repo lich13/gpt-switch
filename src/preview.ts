@@ -65,10 +65,29 @@ let login: LoginState = {
   code: null,
   message: "",
 };
+let startup = {
+  launchOnBoot: false,
+  launchToTray: true,
+  restoreGateway: false,
+  revision: "preview-startup",
+};
 export async function run(
   name: string,
   args: Record<string, unknown>,
 ): Promise<unknown> {
+  if (name === "get_startup") return { ...startup };
+  if (name === "set_startup") {
+    startup = {
+      ...startup,
+      ...(args.preferences as {
+        launchToTray: boolean;
+        restoreGateway: boolean;
+      }),
+      launchOnBoot: Boolean(args.enabled),
+      revision: crypto.randomUUID(),
+    };
+    return { ...startup };
+  }
   if (
     [
       "get_gateway",

@@ -27,3 +27,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+## Scheduling reference
+
+Provider slot accounting, bounded waiting and Responses WebSocket turn lifecycle were independently implemented in Rust with behavioral reference to Wei-Shaw/sub2api at a3eb7ef302961cba716dc78b39b93b60c467db0e (LGPL-3.0). No Go implementation or tests are copied.
+
+https://github.com/Wei-Shaw/sub2api/tree/a3eb7ef302961cba716dc78b39b93b60c467db0e/backend/internal
+
+## yawc 0.4.2
+
+Unmodified WebSocket/deflate dependency, MPL-2.0. The full license is bundled in licenses/yawc-MPL-2.0.txt. Source is available at https://crates.io/api/v1/crates/yawc/0.4.2/download and https://github.com/infinitefield/yawc .

@@ -28,6 +28,8 @@ export const gatewayDemo: GatewayState = {
     idleSeconds: 120,
     totalSeconds: 600,
     connectSeconds: 15,
+    queueSeconds: 30,
+    maxWaiting: 100,
   },
   providers: [
     {
@@ -39,6 +41,8 @@ export const gatewayDemo: GatewayState = {
       health: { ...healthy },
       quotaVersion: "preview-quota",
       quota: null,
+      maxConcurrency: 4,
+      activeRequests: 0,
     },
     {
       id: "backup",
@@ -49,6 +53,8 @@ export const gatewayDemo: GatewayState = {
       health: { ...healthy },
       quotaVersion: "preview-quota",
       quota: null,
+      maxConcurrency: 0,
+      activeRequests: 0,
     },
   ],
   proxies: [
@@ -63,6 +69,7 @@ export const gatewayDemo: GatewayState = {
     },
   ],
   activeConnections: 0,
+  waitingRequests: 0,
   recent: [],
   error: null,
   recoveryPending: false,
@@ -126,6 +133,8 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
       }
     }
     if (e.op === "queueProvider" && p) p.queued = Boolean(e.queued);
+    if (e.op === "concurrencyProvider" && p)
+      p.maxConcurrency = Number(e.maxConcurrency);
     if (e.op === "routeProvider" && p) p.proxyId = e.proxyId as string | null;
     if (e.op === "renameProvider" && p) p.name = String(e.name);
     if (e.op === "deleteProvider")
@@ -147,6 +156,8 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
           health: { ...healthy },
           quotaVersion: crypto.randomUUID(),
           quota: null,
+          maxConcurrency: 0,
+          activeRequests: 0,
         });
     }
     if (e.op === "saveProxy") {

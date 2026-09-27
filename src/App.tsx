@@ -36,6 +36,7 @@ import {
   Pencil,
 } from "lucide-react";
 import { command, subscribe, preview } from "./bridge";
+import StartupSettings from "./StartupSettings";
 import {
   errorOf,
   type Account,
@@ -74,11 +75,21 @@ export default function App() {
     [login, setLogin] = useState(emptyLogin);
   const dirtyRef = useRef(false),
     pageRef = useRef(page);
+  const gatewayDirty = useRef(false);
+  const gatewayDraftChanged = useCallback((value: boolean) => {
+    gatewayDirty.current = value;
+  }, []);
   dirtyRef.current = dirty;
   pageRef.current = page;
   const notify = useCallback((s: string) => setMessage(s), []);
   const navigate = useCallback(
     (next: "accounts" | "config" | "gateway" | "proxies") => {
+      if (next === pageRef.current) return;
+      if (
+        gatewayDirty.current &&
+        !window.confirm("离开当前页面会丢弃未保存的表单，是否继续？")
+      )
+        return;
       if (
         pageRef.current === "config" &&
         next !== "config" &&
@@ -221,7 +232,7 @@ export default function App() {
         <div className="sidebar-bottom">
           <button className="nav-item" onClick={() => setDialog("settings")}>
             <Settings size={17} />
-            设置<span className="version">v0.3.0</span>
+            设置<span className="version">v0.4.0</span>
           </button>
         </div>
       </aside>
@@ -449,7 +460,11 @@ export default function App() {
           </section>
         ) : page === "gateway" || page === "proxies" ? (
           <Suspense fallback={<div className="empty">正在打开网关…</div>}>
-            <Gateway section={page} notify={notify} />
+            <Gateway
+              section={page}
+              notify={notify}
+              onDirtyChange={gatewayDraftChanged}
+            />
           </Suspense>
         ) : (
           state && (
@@ -880,6 +895,7 @@ function SettingsForm({
           </button>
         ))}
       </div>
+      <StartupSettings />
       {error && (
         <p className="form-error" role="alert">
           {error}

@@ -1,6 +1,7 @@
 mod core;
 mod gateway;
 mod login;
+mod startup;
 mod storage;
 use core::{ConfigDocument, Core, Preferences, ViewState};
 use std::{
@@ -27,6 +28,8 @@ struct Runtime {
     smoke: Option<PathBuf>,
     smoke_result: Mutex<Option<Result<SmokeSnapshot>>>,
     fixture: Mutex<Option<tempfile::TempDir>>,
+    startup: startup::Service,
+    start_silently: bool,
 }
 struct SmokeSnapshot {
     home: PathBuf,
@@ -71,7 +74,7 @@ fn lock<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {
     m.lock()
         .map_err(|_| AppError::new("STATE", "应用状态异常，请重新启动 gpt-Switch"))
 }
-fn show(app: &tauri::AppHandle, page: &str) -> Result<()> {
+fn show(app: &tauri::AppHandle, page: Option<&str>) -> Result<()> {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Regular)
         .map_err(|_| AppError::new("WINDOW", "无法显示主窗口"))?;
@@ -81,7 +84,9 @@ fn show(app: &tauri::AppHandle, page: &str) -> Result<()> {
             .map_err(|_| AppError::new("WINDOW", "无法显示主窗口"))?;
         let _ = w.set_focus();
         let _ = app.emit("app-visibility", true);
-        let _ = app.emit("navigate", page);
+        if let Some(page) = page {
+            let _ = app.emit("navigate", page);
+        }
     }
     Ok(())
 }
@@ -149,7 +154,16 @@ fn tray_menu(app: &tauri::AppHandle, state: &ViewState) -> tauri::Result<Menu<ta
             menu.append(&CheckMenuItem::with_id(
                 app,
                 format!("provider:{}", p.id),
-                p.name.replace('&', "&&"),
+                format!(
+                    "{} · {}/{}",
+                    p.name.replace('&', "&&"),
+                    p.active_requests,
+                    if p.max_concurrency == 0 {
+                        "不限".into()
+                    } else {
+                        p.max_concurrency.to_string()
+                    }
+                ),
                 true,
                 g.mode == "manual" && g.selected.as_deref() == Some(&p.id),
                 None::<&str>,
@@ -309,6 +323,27 @@ fn set_preferences(
     Ok(s)
 }
 #[tauri::command]
+async fn get_startup(r: tauri::State<'_, Arc<Runtime>>) -> Result<startup::View> {
+    let r = r.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || r.startup.view())
+        .await
+        .map_err(|_| AppError::new("STARTUP", "读取启动设置失败"))?
+}
+#[tauri::command]
+async fn set_startup(
+    r: tauri::State<'_, Arc<Runtime>>,
+    enabled: bool,
+    preferences: startup::Preferences,
+    expected_revision: String,
+) -> Result<startup::View> {
+    let r = r.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        r.startup.update(enabled, preferences, &expected_revision)
+    })
+    .await
+    .map_err(|_| AppError::new("STARTUP", "更新启动设置失败"))?
+}
+#[tauri::command]
 async fn pick_path(app: tauri::AppHandle, kind: String) -> Result<Option<String>> {
     tauri::async_runtime::spawn_blocking(move || {
         let p = if kind == "directory" {
@@ -429,7 +464,7 @@ fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
     let runtime = r.clone();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = runtime.gateway.stop().await {
+        if let Err(e) = runtime.gateway.stop_for_exit().await {
             if runtime.smoke.is_some() {
                 if let Ok(mut result) = runtime.smoke_result.lock() {
                     *result = Some(Err(e));
@@ -440,7 +475,7 @@ fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
             }
             runtime.quit_pending.store(false, Ordering::Relaxed);
             let _ = app.emit("switch-error", e);
-            let _ = show(&app, "gateway");
+            let _ = show(&app, Some("gateway"));
             return;
         }
         runtime.quitting.store(true, Ordering::Relaxed);
@@ -542,6 +577,8 @@ async fn query_provider_quota(
 async fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
     if r.smoke.is_some() {
         let result = (|| -> Result<()> {
+            #[cfg(windows)]
+            startup::smoke_registration()?;
             let mut c = lock(&r.core)?;
             let a = c.add_api_key("Smoke A", "fixture-only-a")?;
             let b = c.add_api_key("Smoke B", "fixture-only-b")?;
@@ -570,7 +607,16 @@ async fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>
         // The report is written only after the exit handler verifies restoration.
         app.exit(0);
     } else {
-        show(&app, "accounts")?;
+        if r.startup.preferences()?.restore_gateway {
+            let home = lock(&r.core)?.home();
+            if let Err(e) = r.gateway.resume(&home).await {
+                let _ = app.emit("switch-error", e);
+                return show(&app, Some("gateway"));
+            }
+        }
+        if !r.start_silently {
+            show(&app, None)?;
+        }
     }
     Ok(())
 }
@@ -721,8 +767,10 @@ pub fn run() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            let _ = show(app, "accounts");
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            if !args.iter().any(|a| a == startup::LOGIN_ARG) {
+                let _ = show(app, None);
+            }
         }))
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -748,6 +796,8 @@ pub fn run() {
                         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
                 });
             let gateway = gateway::Gateway::new(data.clone())?;
+            let startup = startup::Service::new(&data);
+            let start_silently = smoke.is_none() && startup::silent(&args, &startup.preferences()?);
             let core = Core::new(data, home)?;
             let runtime = Arc::new(Runtime {
                 core: Mutex::new(core),
@@ -758,10 +808,16 @@ pub fn run() {
                 smoke,
                 smoke_result: Mutex::new(None),
                 fixture: Mutex::new(fixture),
+                startup,
+                start_silently,
             });
             runtime.gateway.observe_home(&lock(&runtime.core)?.home());
             let state = lock(&runtime.core)?.state()?;
             app.manage(runtime.clone());
+            #[cfg(target_os = "macos")]
+            if start_silently {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
             #[cfg(target_os = "macos")]
             app.set_menu(application_menu(app.handle())?)?;
             let mut quota_events = runtime.gateway.quota_events();
@@ -827,14 +883,14 @@ pub fn run() {
                 let id = e.id().as_ref();
                 match id {
                     "open" => {
-                        let _ = show(app, "accounts");
+                        let _ = show(app, None);
                     }
                     "config" => {
-                        let _ = show(app, "config");
+                        let _ = show(app, Some("config"));
                     }
                     "quit" => quit(app, &r),
                     "gateway" => {
-                        let _ = show(app, "gateway");
+                        let _ = show(app, Some("gateway"));
                     }
                     "gateway-auto" => {
                         if let Ok(c) = lock(&r.core) {
@@ -888,7 +944,7 @@ pub fn run() {
                                 }
                                 Err(e) => {
                                     let _ = app.emit("switch-error", e);
-                                    let _ = show(app, "accounts");
+                                    let _ = show(app, None);
                                 }
                             }
                         }
@@ -979,6 +1035,8 @@ pub fn run() {
             validate_config,
             save_config,
             set_preferences,
+            get_startup,
+            set_startup,
             pick_path,
             get_login,
             start_login,
@@ -991,7 +1049,7 @@ pub fn run() {
         .run(|app, event| {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = &event {
-                let _ = show(app, "accounts");
+                let _ = show(app, None);
             }
             if let tauri::RunEvent::ExitRequested { api, .. } = &event {
                 let r = app.state::<Arc<Runtime>>();
@@ -1004,7 +1062,8 @@ pub fn run() {
                 let r = app.state::<Arc<Runtime>>();
                 // macOS Dock/system termination can bypass ExitRequested.
                 // Serialize restoration with any in-flight takeover before returning to the OS.
-                let restored = tauri::async_runtime::block_on(r.gateway.stop()).map(|_| ());
+                let restored =
+                    tauri::async_runtime::block_on(r.gateway.stop_for_exit()).map(|_| ());
                 if r.smoke.is_some() {
                     let _ = report_exit_smoke(app, &r, restored);
                 }

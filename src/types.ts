@@ -62,6 +62,8 @@ export type GatewaySettings = {
   idleSeconds: number;
   totalSeconds: number;
   connectSeconds: number;
+  queueSeconds: number;
+  maxWaiting: number;
 };
 export type Health = {
   state: "closed" | "open" | "half_open";
@@ -78,6 +80,8 @@ export type Provider = {
   health: Health;
   quotaVersion: string;
   quota: ProviderQuota | null;
+  maxConcurrency: number;
+  activeRequests: number;
 };
 export type ProxyProfile = {
   id: string;
@@ -103,6 +107,7 @@ export type GatewayState = {
   proxies: ProxyProfile[];
   settings: GatewaySettings;
   activeConnections: number;
+  waitingRequests: number;
   recent: {
     provider: string;
     proxy: string | null;
@@ -114,6 +119,12 @@ export type GatewayState = {
   }[];
   error: string | null;
   recoveryPending: boolean;
+};
+export type StartupState = {
+  launchOnBoot: boolean;
+  launchToTray: boolean;
+  restoreGateway: boolean;
+  revision: string;
 };
 
 export type QuotaPlan = {
