@@ -36,6 +36,7 @@ import {
   Pencil,
 } from "lucide-react";
 import { command, subscribe, preview } from "./bridge";
+import AuthSyncNotice from "./AuthSyncNotice";
 import StartupSettings from "./StartupSettings";
 import {
   errorOf,
@@ -126,11 +127,22 @@ export default function App() {
       [
         "navigate",
         (p) =>
-          navigate(
-            p === "config" || p === "gateway" || p === "proxies"
-              ? p
-              : "accounts",
-          ),
+          p === "settings"
+            ? (() => {
+                if (
+                  (gatewayDirty.current || dirtyRef.current) &&
+                  !window.confirm("打开设置会丢弃当前未保存的草稿，是否继续？")
+                )
+                  return;
+                setPage("accounts");
+                setDirty(false);
+                setDialog("settings");
+              })()
+            : navigate(
+                p === "config" || p === "gateway" || p === "proxies"
+                  ? p
+                  : "accounts",
+              ),
       ],
       ["login-state", (p) => setLogin(p as LoginState)],
     ];
@@ -232,7 +244,7 @@ export default function App() {
         <div className="sidebar-bottom">
           <button className="nav-item" onClick={() => setDialog("settings")}>
             <Settings size={17} />
-            设置<span className="version">v0.4.0</span>
+            设置<span className="version">v0.5.0</span>
           </button>
         </div>
       </aside>
@@ -340,6 +352,16 @@ export default function App() {
                   </button>
                 )}
               </div>
+            )}
+            {state && (
+              <AuthSyncNotice
+                state={state}
+                busy={busy}
+                apply={(id) => {
+                  const account = state.accounts.find((a) => a.id === id);
+                  if (account) void switchAccount(account);
+                }}
+              />
             )}
             <div className="list-tools">
               <h2>

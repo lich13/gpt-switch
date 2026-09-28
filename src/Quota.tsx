@@ -8,7 +8,11 @@ import {
   type QuotaPlan,
 } from "./types";
 
-export function useProviderQuota(providers: Provider[], active: boolean) {
+export function useProviderQuota(
+  providers: Provider[],
+  active: boolean,
+  visibilityEvent = "app-visibility",
+) {
   const latest = useRef(providers);
   latest.current = providers;
   const [values, setValues] = useState<Record<string, ProviderQuota>>({});
@@ -33,7 +37,7 @@ export function useProviderQuota(providers: Provider[], active: boolean) {
     let disposed = false;
     for (const promise of [
       subscribe<ProviderQuota>("provider-quota", accept),
-      subscribe<boolean>("app-visibility", setNativeVisible),
+      subscribe<boolean>(visibilityEvent, setNativeVisible),
     ]) {
       void promise.then((fn) => (disposed ? fn() : clean.push(fn)));
     }
@@ -46,7 +50,7 @@ export function useProviderQuota(providers: Provider[], active: boolean) {
       clean.forEach((fn) => fn());
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [accept]);
+  }, [accept, visibilityEvent]);
   const refresh = useCallback(
     async (id: string, force = true) => {
       const provider = latest.current.find((p) => p.id === id);

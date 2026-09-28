@@ -241,7 +241,10 @@ async fn get(input: &Query, url: String, auth: bool) -> std::result::Result<Repl
             .uri(url)
             .header(header::ACCEPT, "application/json")
             .header(header::ACCEPT_ENCODING, "identity")
-            .header(header::USER_AGENT, "gpt-switch/0.3.0");
+            .header(
+                header::USER_AGENT,
+                concat!("gpt-switch/", env!("CARGO_PKG_VERSION")),
+            );
         if auth {
             req = req.header(header::AUTHORIZATION, format!("Bearer {}", input.token));
         }

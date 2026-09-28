@@ -1,6 +1,6 @@
 {
   "identifier": "main",
   "description": "Local gpt-Switch window",
-  "windows": ["main"],
+  "windows": ["main", "quick"],
   "permissions": ["core:default"]
 }

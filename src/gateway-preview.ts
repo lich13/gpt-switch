@@ -43,6 +43,7 @@ export const gatewayDemo: GatewayState = {
       quota: null,
       maxConcurrency: 4,
       activeRequests: 0,
+      allowedModels: null,
     },
     {
       id: "backup",
@@ -55,6 +56,7 @@ export const gatewayDemo: GatewayState = {
       quota: null,
       maxConcurrency: 0,
       activeRequests: 0,
+      allowedModels: null,
     },
   ],
   proxies: [
@@ -158,6 +160,7 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
           quota: null,
           maxConcurrency: 0,
           activeRequests: 0,
+          allowedModels: null,
         });
     }
     if (e.op === "saveProxy") {
@@ -182,6 +185,8 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
         throw new Error("请先解绑或替换引用此代理的供应商");
       s.proxies = s.proxies.filter((x) => x.id !== id);
     }
+    if (e.op === "modelsProvider" && p)
+      p.allowedModels = e.allowedModels as string[] | null;
     if (e.op === "settings") s.settings = e.settings as GatewaySettings;
     if (e.op === "import") throw new Error("预览模式无法读取真实 Codex 配置");
     s.revision = crypto.randomUUID();

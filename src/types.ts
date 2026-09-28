@@ -17,6 +17,12 @@ export type ViewState = {
   configRevision: string;
   currentState: "saved" | "unsaved" | "missing" | "invalid";
   preferences: Preferences;
+  authSync?: {
+    state: string;
+    accountId: string | null;
+    message: string;
+    at: number;
+  } | null;
   authSource: {
     provider: string;
     credentialStore: string;
@@ -82,6 +88,7 @@ export type Provider = {
   quota: ProviderQuota | null;
   maxConcurrency: number;
   activeRequests: number;
+  allowedModels: string[] | null;
 };
 export type ProxyProfile = {
   id: string;
@@ -157,4 +164,14 @@ export type ProviderQuota = {
   expiresAtUnix: number | null;
   today: QuotaUsage | null;
   totalUsage: QuotaUsage | null;
+};
+
+export type ModelCatalog = {
+  providerId: string;
+  version: string;
+  models: string[];
+  checkedAt: number | null;
+  stale: boolean;
+  error: string | null;
+  retryAt: number | null;
 };

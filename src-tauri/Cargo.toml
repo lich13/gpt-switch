@@ -1,6 +1,6 @@
 [package]
 name = "gpt-switch"
-version = "0.4.0"
+version = "0.5.0"
 description = "Lightweight Codex account switcher and TOML editor"
 edition = "2021"
 rust-version = "1.85"
@@ -41,6 +41,9 @@ tower-service = "0.3"
 url = "2"
 toml_edit = "0.23"
 httpdate = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+mime = "0.3"
+multer = "3"
 flate2 = "1"
 zstd = "0.13"
 yawc = { version = "0.4.2", default-features = false, features = ["zlib", "rustls-ring"] }
@@ -48,7 +51,7 @@ auto-launch = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder", "NSStatusItem", "NSStatusBarButton", "NSMenu"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSAppleEventManager", "NSAppleEventDescriptor", "objc2-core-services"] }
 
 [dev-dependencies]

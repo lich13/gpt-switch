@@ -1,3 +1,4 @@
+import ModelPolicyDialog from "./ModelPolicyDialog";
 import { QuotaInfo, useProviderQuota } from "./Quota";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -31,6 +32,7 @@ type Dialog =
   | { kind: "provider"; item?: Provider }
   | { kind: "proxy"; item?: ProxyProfile }
   | { kind: "rename"; item: Provider }
+  | { kind: "models"; item: Provider }
   | null;
 const healthText = (h: Health) =>
   h.state === "open"
@@ -315,6 +317,16 @@ export default function Gateway({
                   refresh={() => void quota.refresh(p.id)}
                 />
                 <div className="provider-controls">
+                  <button
+                    className="model-policy-button"
+                    title={p.allowedModels?.join("\n") ?? "允许所有模型"}
+                    aria-label={`${p.name} 模型设置`}
+                    onClick={() => setDialog({ kind: "models", item: p })}
+                  >
+                    {p.allowedModels
+                      ? `模型 ${p.allowedModels.length}${state.running ? "" : " · 未生效"}`
+                      : "不限模型"}
+                  </button>
                   <ConcurrencyControl
                     provider={p}
                     busy={busy}
@@ -562,7 +574,26 @@ export default function Gateway({
           </details>
         </div>
       )}
-      {dialog && (
+      {dialog?.kind === "models" && (
+        <ModelPolicyDialog
+          provider={dialog.item}
+          version={
+            state.providers.find((p) => p.id === dialog.item.id)
+              ?.quotaVersion ?? "deleted"
+          }
+          onDirtyChange={onDirtyChange}
+          close={() => setDialog(null)}
+          save={async (allowedModels) => {
+            await edit({
+              op: "modelsProvider",
+              id: dialog.item.id,
+              allowedModels,
+            });
+            setDialog(null);
+          }}
+        />
+      )}
+      {dialog && dialog.kind !== "models" && (
         <GatewayDialog
           dialog={dialog}
           onDirtyChange={onDirtyChange}
@@ -720,7 +751,7 @@ function GatewayDialog({
   save,
   onDirtyChange,
 }: {
-  dialog: NonNullable<Dialog>;
+  dialog: Exclude<NonNullable<Dialog>, { kind: "models" }>;
   close: () => void;
   save: (p: Edit) => Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;

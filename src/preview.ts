@@ -71,10 +71,32 @@ let startup = {
   restoreGateway: false,
   revision: "preview-startup",
 };
+let quick = { pinned: false, tab: "providers", visible: true };
 export async function run(
   name: string,
   args: Record<string, unknown>,
 ): Promise<unknown> {
+  if (name === "get_quick") return { ...quick };
+  if (name === "set_quick") {
+    quick = { ...quick, ...args };
+    emit("quick-state", { ...quick });
+    return { ...quick };
+  }
+  if (name === "resize_quick" || name === "hide_quick") return;
+  if (name === "open_main") {
+    location.search = "";
+    return;
+  }
+  if (name === "list_provider_models")
+    return {
+      providerId: args.providerId,
+      version: "preview-quota",
+      models: ["gpt-example", "gpt-example-mini", "gpt-example-pro"],
+      checkedAt: Date.now() / 1000,
+      stale: false,
+      error: null,
+      retryAt: null,
+    };
   if (name === "get_startup") return { ...startup };
   if (name === "set_startup") {
     startup = {

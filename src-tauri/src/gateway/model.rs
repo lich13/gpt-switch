@@ -14,6 +14,8 @@ pub struct Provider {
     pub version: String,
     #[serde(default)]
     pub max_concurrency: u32,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,6 +163,10 @@ pub enum Edit {
         id: String,
         max_concurrency: u32,
     },
+    ModelsProvider {
+        id: String,
+        allowed_models: Option<Vec<String>>,
+    },
     Reorder {
         ids: Vec<String>,
     },
@@ -282,6 +288,7 @@ impl Store {
                         queued: true,
                         version: uuid::Uuid::new_v4().to_string(),
                         max_concurrency: 0,
+                        allowed_models: None,
                     });
                     if self.selected.is_none() {
                         self.selected = Some(id);
@@ -320,6 +327,34 @@ impl Store {
                     ));
                 }
                 self.provider_mut(&id)?.max_concurrency = max_concurrency;
+            }
+            Edit::ModelsProvider { id, allowed_models } => {
+                let allowed = allowed_models
+                    .map(|models| {
+                        let mut result = Vec::new();
+                        for model in models {
+                            let model = model.trim();
+                            if model.is_empty()
+                                || model.len() > 256
+                                || model.chars().any(char::is_control)
+                                || model.contains('*')
+                            {
+                                return Err(AppError::new(
+                                    "MODELS",
+                                    "模型 ID 应为 1–256 字节，不能包含控制字符或通配符",
+                                ));
+                            }
+                            if !result.iter().any(|m| m == model) {
+                                result.push(model.to_owned());
+                            }
+                        }
+                        if result.is_empty() || result.len() > 4096 {
+                            return Err(AppError::new("MODELS", "白名单应包含 1–4096 个模型"));
+                        }
+                        Ok(result)
+                    })
+                    .transpose()?;
+                self.provider_mut(&id)?.allowed_models = allowed;
             }
             Edit::Reorder { ids } => {
                 let mut sorted = ids.clone();

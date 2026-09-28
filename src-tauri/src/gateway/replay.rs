@@ -29,6 +29,7 @@ enum Payload {
 #[derive(serde::Deserialize, Default)]
 pub struct RequestHints {
     pub previous_response_id: Option<String>,
+    pub model: Option<String>,
     #[serde(default)]
     pub stream: bool,
 }
@@ -114,15 +115,20 @@ impl Replay {
         };
         body
     }
-    pub async fn hints(&self, encoding: &str) -> Result<RequestHints, BoxError> {
+    pub async fn inspect(
+        &self,
+        encoding: &str,
+        content_type: &str,
+    ) -> Result<RequestHints, BoxError> {
         let reader: Box<dyn std::io::Read + Send> = match &self.payload {
             Payload::Memory(bytes) => Box::new(std::io::Cursor::new(bytes.clone())),
             Payload::Disk(file) => Box::new(file.reopen()?),
         };
         let encoding = encoding.to_owned();
+        let content_type = content_type.to_owned();
         tokio::task::spawn_blocking(move || {
             use std::io::Read;
-            let decoded: Box<dyn Read> = match encoding.as_str() {
+            let decoded: Box<dyn Read + Send> = match encoding.as_str() {
                 "identity" => reader,
                 "gzip" => Box::new(flate2::read::GzDecoder::new(reader)),
                 "deflate" => Box::new(flate2::read::ZlibDecoder::new(reader)),
@@ -130,7 +136,68 @@ impl Replay {
                 _ => return Err(io::Error::other("unsupported inspection encoding").into()),
             };
             // serde ignores unknown fields while streaming, including large input arrays.
-            let hints: RequestHints = serde_json::from_reader(decoded.take(MAX_BODY + 1))?;
+            let decoded = decoded.take(MAX_BODY + 1);
+            let mime = content_type.parse::<mime::Mime>().ok();
+            let hints: RequestHints = if mime
+                .as_ref()
+                .is_some_and(|m| m.type_() == mime::MULTIPART && m.subtype() == mime::FORM_DATA)
+            {
+                let boundary = mime
+                    .as_ref()
+                    .and_then(|m| m.get_param(mime::BOUNDARY))
+                    .ok_or_else(|| io::Error::other("missing boundary"))?
+                    .as_str();
+                if boundary.len() > 200 {
+                    return Err(io::Error::other("invalid boundary").into());
+                }
+                tokio::runtime::Handle::current().block_on(async move {
+                    let stream =
+                        futures_util::stream::try_unfold(decoded, |mut reader| async move {
+                            let mut chunk = vec![0; 64 * 1024];
+                            let count = reader.read(&mut chunk)?;
+                            if count == 0 {
+                                return Ok::<_, io::Error>(None);
+                            }
+                            chunk.truncate(count);
+                            Ok(Some((Bytes::from(chunk), reader)))
+                        });
+                    let mut parts = multer::Multipart::new(stream, boundary);
+                    let mut hints = RequestHints::default();
+                    while let Some(mut part) = parts.next_field().await? {
+                        let name = part.name().unwrap_or("").to_owned();
+                        if ["model", "previous_response_id", "stream"].contains(&name.as_str()) {
+                            let mut bytes = Vec::new();
+                            while let Some(chunk) = part.chunk().await? {
+                                if bytes.len() + chunk.len() > 1024 {
+                                    return Err::<_, BoxError>(
+                                        io::Error::other("oversized field").into(),
+                                    );
+                                }
+                                bytes.extend_from_slice(&chunk);
+                            }
+                            let value = String::from_utf8(bytes)?;
+                            match name.as_str() {
+                                "model" if hints.model.is_none() => hints.model = Some(value),
+                                "previous_response_id" if hints.previous_response_id.is_none() => {
+                                    hints.previous_response_id = Some(value)
+                                }
+                                "stream" => hints.stream = value == "true",
+                                _ => return Err(io::Error::other("ambiguous field").into()),
+                            }
+                        }
+                    }
+                    Ok(hints)
+                })?
+            } else {
+                serde_json::from_reader(decoded)?
+            };
+            if hints
+                .model
+                .as_ref()
+                .is_some_and(|m| m.is_empty() || m.len() > 256 || m.chars().any(char::is_control))
+            {
+                return Err(io::Error::other("invalid model").into());
+            }
             if hints
                 .previous_response_id
                 .as_ref()

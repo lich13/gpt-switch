@@ -141,3 +141,44 @@ describe("gateway controls", () => {
     expect(notify).toHaveBeenCalledWith("文件已切换，请重新打开 Codex");
   });
 });
+
+it("keeps model choices and manual entries when discovery fails and events refresh", async () => {
+  const user = userEvent.setup();
+  mock.command.mockImplementation(async (name: string) => {
+    if (name === "get_gateway") return structuredClone(state);
+    if (name === "list_provider_models")
+      return { models: ["gpt-A", "gpt-B"], error: null, stale: false };
+    if (name === "update_gateway")
+      throw { code: "CONFLICT", message: "设置已变化" };
+  });
+  render(<Gateway section="gateway" notify={() => {}} />);
+  await user.click(
+    await screen.findByRole("button", { name: "api.example.com 模型设置" }),
+  );
+  await user.click(await screen.findByRole("checkbox", { name: "gpt-A" }));
+  await user.type(
+    screen.getByRole("textbox", { name: "手动添加模型 ID" }),
+    "custom-model",
+  );
+  await user.click(screen.getByRole("button", { name: "添加到白名单" }));
+  act(() =>
+    mock.listeners.get("gateway-state")!({
+      ...state,
+      revision: "changed",
+      activeConnections: 2,
+    }),
+  );
+  expect(screen.getByRole("checkbox", { name: "gpt-A" })).toBeChecked();
+  expect(screen.getByRole("checkbox", { name: "custom-model" })).toBeChecked();
+  await user.click(screen.getByRole("button", { name: "保存" }));
+  expect(await screen.findByText("设置已变化")).toBeInTheDocument();
+  expect(screen.getByRole("checkbox", { name: "custom-model" })).toBeChecked();
+  expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+    edit: {
+      op: "modelsProvider",
+      id: "primary",
+      allowedModels: ["gpt-A", "custom-model"],
+    },
+    expectedRevision: state.revision,
+  });
+});

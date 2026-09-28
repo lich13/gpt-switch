@@ -1,8 +1,11 @@
 mod core;
 mod gateway;
 mod login;
+mod quick;
 mod startup;
 mod storage;
+#[cfg(target_os = "macos")]
+mod tray_macos;
 use core::{ConfigDocument, Core, Preferences, ViewState};
 use std::{
     path::PathBuf,
@@ -13,8 +16,8 @@ use std::{
 };
 use storage::{AppError, Result};
 use tauri::{
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
-    tray::TrayIconBuilder,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager,
 };
 use tauri_plugin_dialog::DialogExt;
@@ -83,108 +86,41 @@ fn show(app: &tauri::AppHandle, page: Option<&str>) -> Result<()> {
         w.show()
             .map_err(|_| AppError::new("WINDOW", "无法显示主窗口"))?;
         let _ = w.set_focus();
-        let _ = app.emit("app-visibility", true);
+        let _ = w.emit("app-visibility", true);
         if let Some(page) = page {
-            let _ = app.emit("navigate", page);
+            let _ = w.emit("navigate", page);
         }
     }
     Ok(())
 }
-fn tray_menu(app: &tauri::AppHandle, state: &ViewState) -> tauri::Result<Menu<tauri::Wry>> {
+fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "heading",
-        "gpt-Switch · 账号",
-        false,
-        None::<&str>,
-    )?)?;
-    if state.accounts.is_empty() {
-        menu.append(&MenuItem::with_id(
-            app,
-            "empty",
-            "暂无已保存账号",
-            false,
-            None::<&str>,
-        )?)?;
-    }
-    for a in &state.accounts {
-        menu.append(&CheckMenuItem::with_id(
-            app,
-            format!("account:{}", a.id),
-            a.name.replace('&', "&&"),
-            true,
-            a.current,
-            None::<&str>,
-        )?)?;
-    }
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    if state.auth_source.warning.is_some() {
-        menu.append(&MenuItem::with_id(
-            app,
-            "source",
-            "当前配置另有认证设置",
-            false,
-            None::<&str>,
-        )?)?;
-    }
-    if let Some(runtime) = app.try_state::<Arc<Runtime>>() {
-        let g = runtime.gateway.view();
-        menu.append(&PredefinedMenuItem::separator(app)?)?;
-        menu.append(&MenuItem::with_id(
-            app,
-            "gateway-heading",
-            if g.running {
-                "网关 · 运行中"
-            } else {
-                "网关 · 已关闭"
-            },
-            false,
-            None::<&str>,
-        )?)?;
-        menu.append(&CheckMenuItem::with_id(
-            app,
-            "gateway-auto",
-            "自动故障转移",
-            true,
-            g.mode == "auto",
-            None::<&str>,
-        )?)?;
-        for p in &g.providers {
-            menu.append(&CheckMenuItem::with_id(
-                app,
-                format!("provider:{}", p.id),
-                format!(
-                    "{} · {}/{}",
-                    p.name.replace('&', "&&"),
-                    p.active_requests,
-                    if p.max_concurrency == 0 {
-                        "不限".into()
-                    } else {
-                        p.max_concurrency.to_string()
-                    }
-                ),
-                true,
-                g.mode == "manual" && g.selected.as_deref() == Some(&p.id),
-                None::<&str>,
-            )?)?;
-        }
-    }
     for (id, label) in [
         ("open", "打开 gpt-Switch"),
         ("config", "编辑配置"),
         ("gateway", "打开网关"),
+        ("settings", "设置"),
         ("quit", "退出 gpt-Switch"),
     ] {
+        if id == "quit" {
+            menu.append(&PredefinedMenuItem::separator(app)?)?;
+        }
         menu.append(&MenuItem::with_id(app, id, label, true, None::<&str>)?)?;
     }
     Ok(menu)
 }
+#[tauri::command]
+fn open_main(app: tauri::AppHandle, page: Option<String>) -> Result<()> {
+    if page.as_ref().is_some_and(|p| {
+        !["accounts", "config", "gateway", "proxies", "settings"].contains(&p.as_str())
+    }) {
+        return Err(AppError::new("WINDOW", "无效页面"));
+    }
+    quick::hide_quick(app.clone())?;
+    show(&app, page.as_deref())
+}
 fn publish(app: &tauri::AppHandle, state: ViewState) {
     if let Some(tray) = app.tray_by_id("switch") {
-        if let Ok(menu) = tray_menu(app, &state) {
-            let _ = tray.set_menu(Some(menu));
-        }
         let current = state
             .accounts
             .iter()
@@ -200,6 +136,14 @@ fn refresh(app: &tauri::AppHandle, r: &Runtime) -> Result<ViewState> {
     r.gateway.observe_home(&lock(&r.core)?.home());
     publish(app, state.clone());
     Ok(state)
+}
+#[tauri::command]
+async fn list_provider_models(
+    r: tauri::State<'_, Arc<Runtime>>,
+    provider_id: String,
+    force: bool,
+) -> Result<gateway::catalog::View> {
+    r.gateway.list_models(&provider_id, force).await
 }
 #[tauri::command]
 fn get_state(r: tauri::State<'_, Arc<Runtime>>) -> Result<ViewState> {
@@ -574,7 +518,14 @@ async fn query_provider_quota(
     r.gateway.query_quota(&provider_id, force).await
 }
 #[tauri::command]
-async fn frontend_ready(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
+async fn frontend_ready(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    r: tauri::State<'_, Arc<Runtime>>,
+) -> Result<()> {
+    if window.label() != "main" {
+        return Ok(());
+    }
     if r.smoke.is_some() {
         let result = (|| -> Result<()> {
             #[cfg(windows)]
@@ -798,6 +749,7 @@ pub fn run() {
             let gateway = gateway::Gateway::new(data.clone())?;
             let startup = startup::Service::new(&data);
             let start_silently = smoke.is_none() && startup::silent(&args, &startup.preferences()?);
+            app.manage(quick::Panel::new(&data)?);
             let core = Core::new(data, home)?;
             let runtime = Arc::new(Runtime {
                 core: Mutex::new(core),
@@ -814,6 +766,7 @@ pub fn run() {
             runtime.gateway.observe_home(&lock(&runtime.core)?.home());
             let state = lock(&runtime.core)?.state()?;
             app.manage(runtime.clone());
+            quick::Panel::create(app.handle())?;
             #[cfg(target_os = "macos")]
             if start_silently {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -847,8 +800,8 @@ pub fn run() {
                 }
             });
             let mut tray = TrayIconBuilder::with_id("switch")
-                .menu(&tray_menu(app.handle(), &state)?)
-                .show_menu_on_left_click(true)
+                .menu(&tray_menu(app.handle())?)
+                .show_menu_on_left_click(false)
                 .tooltip("gpt-Switch");
             #[cfg(target_os = "macos")]
             {
@@ -878,80 +831,47 @@ pub fn run() {
                 };
                 tray = tray.icon(tauri::image::Image::from_bytes(bytes)?);
             }
-            tray.on_menu_event(|app, e| {
-                let r = app.state::<Arc<Runtime>>();
-                let id = e.id().as_ref();
-                match id {
-                    "open" => {
-                        let _ = show(app, None);
-                    }
-                    "config" => {
-                        let _ = show(app, Some("config"));
-                    }
-                    "quit" => quit(app, &r),
-                    "gateway" => {
-                        let _ = show(app, Some("gateway"));
-                    }
-                    "gateway-auto" => {
-                        if let Ok(c) = lock(&r.core) {
-                            if let Err(e) = r.gateway.edit(
-                                gateway::Edit::Mode {
-                                    mode: "auto".into(),
-                                },
-                                &r.gateway.view().revision,
-                                &c.home(),
-                            ) {
-                                let _ = app.emit("switch-error", e);
-                            }
-                        }
-                    }
-                    _ => {
-                        if let Some(provider) = id.strip_prefix("provider:") {
-                            if let Ok(c) = lock(&r.core) {
-                                match r.gateway.edit(
-                                    gateway::Edit::Select {
-                                        id: provider.into(),
-                                    },
-                                    &r.gateway.view().revision,
-                                    &c.home(),
-                                ) {
-                                    Ok(state) => {
-                                        let _ = app.emit(
-                                            "switch-notice",
-                                            if state.running {
-                                                "供应商已切换，新请求已生效"
-                                            } else {
-                                                "配置已切换，请重新打开 Codex"
-                                            },
-                                        );
-                                    }
-                                    Err(e) => {
-                                        let _ = app.emit("switch-error", e);
-                                    }
+            let tray = tray
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button,
+                        button_state,
+                        rect,
+                        ..
+                    } = event
+                    {
+                        if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                            let app = tray.app_handle().clone();
+                            let handle = app.clone();
+                            let _ = app.run_on_main_thread(move || {
+                                if let Err(e) = quick::Panel::show(&handle, Some(rect)) {
+                                    let _ = handle.emit("switch-error", e);
                                 }
-                            }
-                        }
-                        if let Some(id) = id.strip_prefix("account:") {
-                            let result = lock(&r.core).and_then(|mut c| {
-                                let revision = c.state()?.auth_revision;
-                                c.switch_account(id, &revision)
                             });
-                            match result {
-                                Ok(s) => {
-                                    publish(app, s);
-                                    let _ =
-                                        app.emit("switch-notice", "文件已切换，请重新打开 Codex");
-                                }
-                                Err(e) => {
-                                    let _ = app.emit("switch-error", e);
-                                    let _ = show(app, None);
-                                }
+                        }
+                        #[cfg(target_os = "macos")]
+                        if button == MouseButton::Right && button_state == MouseButtonState::Down {
+                            if let Err(e) = tray_macos::context_menu(tray) {
+                                let _ = tray.app_handle().emit("switch-error", e);
                             }
                         }
                     }
-                }
-            })
-            .build(app)?;
+                })
+                .on_menu_event(|app, e| match e.id().as_ref() {
+                    "quit" => quit(app, &app.state::<Arc<Runtime>>()),
+                    "open" => {
+                        let _ = open_main(app.clone(), None);
+                    }
+                    "config" | "gateway" | "settings" => {
+                        let _ = open_main(app.clone(), Some(e.id().as_ref().into()));
+                    }
+                    _ => (),
+                })
+                .build(app)?;
+            #[cfg(target_os = "macos")]
+            tray_macos::install(&tray)?;
+            #[cfg(not(target_os = "macos"))]
+            let _ = tray;
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut last = Some(state);
@@ -1004,6 +924,19 @@ pub fn run() {
             }
         })
         .on_window_event(|w, event| {
+            if w.label() == "quick" {
+                match event {
+                    tauri::WindowEvent::Focused(focused) => {
+                        quick::Panel::focus(w.app_handle(), *focused)
+                    }
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = quick::hide_quick(w.app_handle().clone());
+                    }
+                    _ => (),
+                }
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let r = w.state::<Arc<Runtime>>();
                 if !r.quitting.load(Ordering::Relaxed) {
@@ -1018,12 +951,18 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            open_main,
+            quick::get_quick,
+            quick::set_quick,
+            quick::hide_quick,
+            quick::resize_quick,
             get_gateway,
             update_gateway,
             start_gateway,
             stop_gateway,
             test_provider,
             query_provider_quota,
+            list_provider_models,
             get_state,
             switch_account,
             import_current,

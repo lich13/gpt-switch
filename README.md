@@ -4,7 +4,7 @@
 
 <img src="assets/icon.svg" alt="Prism Relay icon" width="100" />
 
-- 菜单栏／托盘左键展开账号列表，一键切换 `auth.json`。
+- 菜单栏／托盘左键打开供应商／账号快捷面板，右键保留精简原生菜单。
 - 添加 ChatGPT 登录、导入现有凭据和添加 API Key；同一身份的 Token 刷新自动回存。
 - 独立 CodeMirror TOML 原文编辑器，支持高亮、查找、语法检查、保存冲突保护。
 - 跟随系统深浅主题，关闭窗口后驻留；不会自动重启 Codex。
@@ -15,13 +15,19 @@
 
 ## 使用
 
-首次启动导入当前有效账号。点击“添加账号”通过官方 Codex CLI 登录，或导入完整 `auth.json`。选择账号后仅替换认证文件，配置保持不变。现有 Codex 进程可能缓存凭据，需要自行重新打开。
+启动及每 2 秒稳定读取当前 `auth.json`：已有身份的更新版本同步入库，新身份自动加入列表。ChatGPT 按用户与工作区区分，API Key 按指纹区分；不按邮箱合并。比较有效 `last_refresh`、其次 Token 签发时间，保留已保存的较新凭据并提供“使用已保存版本”；无法可靠排序时采用最近检测到的稳定内容。监控不回写 auth 或配置，无效／缺失文件不会删除账号。删除账号后，同一文件版本在重启后也不会重新入库，出现新版本才重新收录。
+
+点击“添加账号”通过官方 Codex CLI 登录，或导入完整 `auth.json`。选择账号后仅替换认证文件，配置保持不变。现有 Codex 进程可能缓存凭据，需要自行重新打开。
 
 ChatGPT 登录需要本机已安装 [官方 Codex CLI](https://developers.openai.com/codex/cli)。应用自动查找 PATH、常见安装目录和 macOS nvm；也可在设置中指定 CLI 路径。Windows npm 安装使用同目录 Codex JavaScript 入口和 Node.js。登录使用独立临时目录，不修改当前 Codex 登录；10 分钟未完成会取消。浏览器授权需本人完成，也支持设备码登录。
 
 默认目录为 `CODEX_HOME` 或 `~/.codex`（Windows 为用户主目录中的 `.codex`），可在设置中修改。账号切换仅影响文件；`keyring` / `auto` / `ephemeral`、provider bearer token、环境变量或命令认证可能使用其他来源，应用会提示。
 
 配置页按原文保存，保留注释、未知字段和换行。外部修改发生时保留未保存草稿并阻止覆盖；复制草稿、重新读取并合并后保存。删除列表中的账号不会注销当前 Codex。
+
+## 快捷面板
+
+左键反复点击菜单栏／托盘图标始终显示并聚焦独立面板，失焦后收起；固定后保留，Escape 或关闭按钮始终可关闭。供应商和账号标签记住上次选择。供应商页可以启停网关、选择模式与供应商，查看优先级、健康、并发、模型范围和已有额度；账号页可搜索并切换。面板不会重置主窗口草稿，也不会更改 Dock 显示状态。右键菜单提供打开主窗口、配置、网关、设置与退出，普通打开保留当前页面。
 
 ## 本地网关
 
@@ -36,6 +42,14 @@ ChatGPT 登录需要本机已安装 [官方 Codex CLI](https://developers.openai
 自动模式每次从 P1 开始，跳过熔断项，每家最多一次，默认最多四家。默认连续失败 4 次、错误率 60% / 最小 10 次、恢复等待 60 秒、半开 2 次成功；半开只放行一个探测。首字节 60 秒、流静默 120 秒、非流式总超时 600 秒。`400/405/406/413/414/415/422/501` 直接返回且不计故障；客户端取消为中性。有效 Retry-After 延长冷却。已向客户端提交输出后不重试，WebSocket 上游连接建立后不换商；已知 previous_response_id 固定原供应商，未知归属仅尝试一次。gzip / deflate / zstd 和磁盘暂存的 JSON 只流式读取路由归属，原始载荷不变；无法解析的 JSON 或未知压缩编码保守地只尝试一次。
 
 请求最多 1 GiB，超过 2 MiB 使用权限受限的临时文件重放，完成或取消后清理。供应商和代理健康独立：代理连接或认证失败会跳过共享代理的其他候选；目标连接和 HTTP 错误归供应商。仅保留内存中的最近 40 条元数据，不记录请求/响应正文与凭据。故障转移来源和改动见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 供应商模型白名单
+
+在供应商列表点击“模型”，选择不限模型或设置非空白名单。完整模型 ID 区分大小写，去除首尾空白及重复项，不支持通配符。可从供应商读取模型、搜索勾选，也可手动输入；读取失败不清除选择，刷新不会自动增删白名单。模型接口为填写的 `base_url` 后追加 `/models`，不猜测 `/v1`；查询使用已有 Key 和指定代理，10 秒超时、2 MB 上限、5 分钟缓存，凭据或代理变化后失效，不调用模型或消耗业务并发。
+
+**白名单只在网关运行时生效，不写入 Codex 配置。** HTTP/SSE 从 JSON 或 multipart 读取模型，兼容 gzip、deflate、zstd，原始载荷不变。模型筛选先于健康、并发和排队；不匹配不计故障或重试，等待期间规则变更会重新检查。手动模式同样受限。已知响应游标固定原供应商，模型省略可继承已知上下文；没有可靠依据时只使用不限模型的供应商。没有匹配项返回 `400 MODEL_NOT_ALLOWED`，无法识别且没有不限供应商返回 `400 MODEL_UNDETERMINED`。明确的文件／模型等资源接口正常透传。
+
+Responses WebSocket 每个 `response.create` 检查模型，连接建立后固定供应商；后续轮次可继承已确认模型，规则更新从下一轮生效。不匹配时以 `1008` 关闭，不向上游发送该轮内容。未知 WebSocket 协议只允许不限模型供应商，仍按整条连接占位。
 
 ## 并发与启动
 
@@ -63,7 +77,7 @@ SOCKS5 本身不加密；HTTPS 供应商内容仍经端到端 TLS 加密。腾�
 
 ## 本地数据
 
-数据目录为 Tauri 的 `com.lich13.gpt-switch` 应用数据目录（macOS：`~/Library/Application Support/com.lich13.gpt-switch`；Windows：`%APPDATA%/com.lich13.gpt-switch`）。`accounts.json` 保存完整账号，`previous-auth.json`、`previous-config.toml` 各保留一份最近写入前的文件。`startup.json` 保存启动偏好。`gateway.json` 独立保存供应商、代理、并发上限、本地访问令牌及网关恢复意图，`gateway-recovery.json` 保存版本化的两字段事务与停止目标，写入完成后清理。供应商 Token 仅用于其上游认证，代理密码仅用于 SOCKS5 握手；凭据不写日志、不返回到列表或事件。文件采用当前用户权限，**未加密**，应像原 `auth.json` 一样保护。
+数据目录为 Tauri 的 `com.lich13.gpt-switch` 应用数据目录（macOS：`~/Library/Application Support/com.lich13.gpt-switch`；Windows：`%APPDATA%/com.lich13.gpt-switch`）。`accounts.json` 保存完整账号，`previous-auth.json`、`previous-config.toml` 各保留一份最近写入前的文件。`startup.json` 保存启动偏好，`quick.json` 保存快捷面板标签与固定状态。`gateway.json` 独立保存供应商、代理、并发上限、模型白名单、本地访问令牌及网关恢复意图，`gateway-recovery.json` 保存版本化的两字段事务与停止目标，写入完成后清理。供应商 Token 仅用于其上游认证，代理密码仅用于 SOCKS5 握手；凭据不写日志、不返回到列表或事件。文件采用当前用户权限，**未加密**，应像原 `auth.json` 一样保护。
 
 ## 开发与验证
 

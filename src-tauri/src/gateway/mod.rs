@@ -1,10 +1,12 @@
 mod admission;
+pub mod catalog;
 mod circuit;
 mod connector;
 mod forward;
 mod model;
 mod quota;
 mod replay;
+mod routing;
 mod websocket;
 pub use quota::QuotaView;
 mod takeover;
@@ -42,6 +44,7 @@ pub struct ProviderView {
     quota: Option<QuotaView>,
     pub max_concurrency: u32,
     pub active_requests: usize,
+    pub allowed_models: Option<Vec<String>>,
 }
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -96,7 +99,7 @@ struct Inner {
     error: Option<String>,
     circuits: HashMap<String, Circuit>,
     recent: VecDeque<Recent>,
-    affinity: HashMap<String, (String, Instant)>,
+    affinity: HashMap<String, (String, Option<String>, Instant)>,
     last_successful: Option<String>,
     home: Option<PathBuf>,
 }
@@ -109,6 +112,7 @@ struct Shared {
     active: AtomicUsize,
     events: broadcast::Sender<()>,
     quota: quota::Service,
+    catalog: catalog::Service,
     admission: admission::Scheduler,
 }
 #[derive(Clone)]
@@ -161,6 +165,7 @@ impl Gateway {
             active: AtomicUsize::new(0),
             events,
             quota: quota::Service::new(),
+            catalog: catalog::Service::new(),
             admission,
         })))
     }
@@ -225,6 +230,7 @@ impl Gateway {
                     health: health(pkey(p)),
                     quota_version: Self::quota_version(&s.store, p),
                     max_concurrency: p.max_concurrency,
+                    allowed_models: p.allowed_models.clone(),
                     active_requests: occupied.get(&p.id).copied().unwrap_or(0),
                     quota: self
                         .0
@@ -664,7 +670,22 @@ impl Gateway {
         self.0.quota.subscribe()
     }
     pub async fn query_quota(&self, id: &str, force: bool) -> Result<QuotaView> {
-        let input = {
+        let input = self.query_input(id)?;
+        let version = input.version.clone();
+        let result = self.0.quota.query(input, force).await?;
+        let s = self.0.inner.lock().unwrap();
+        if !s
+            .store
+            .providers
+            .iter()
+            .any(|p| p.id == id && Self::quota_version(&s.store, p) == version)
+        {
+            return Err(AppError::new("STALE", "供应商配置已变化，已丢弃旧额度结果"));
+        }
+        Ok(result)
+    }
+    fn query_input(&self, id: &str) -> Result<quota::Query> {
+        Ok({
             let s = self.0.inner.lock().unwrap();
             let p = s
                 .store
@@ -690,9 +711,12 @@ impl Gateway {
                         s.store.settings.port,
                     )),
             }
-        };
+        })
+    }
+    pub async fn list_models(&self, id: &str, force: bool) -> Result<catalog::View> {
+        let input = self.query_input(id)?;
         let version = input.version.clone();
-        let result = self.0.quota.query(input, force).await?;
+        let result = self.0.catalog.query(input, force).await?;
         let s = self.0.inner.lock().unwrap();
         if !s
             .store
@@ -700,7 +724,7 @@ impl Gateway {
             .iter()
             .any(|p| p.id == id && Self::quota_version(&s.store, p) == version)
         {
-            return Err(AppError::new("STALE", "供应商配置已变化，已丢弃旧额度结果"));
+            return Err(AppError::new("STALE", "供应商配置已变化，已丢弃旧模型列表"));
         }
         Ok(result)
     }
@@ -774,25 +798,31 @@ impl Gateway {
             proxy_circuit,
         })
     }
+    #[cfg(test)]
     fn remember(&self, id: &str, provider: &str) {
+        self.remember_model(id, provider, None);
+    }
+    fn remember_model(&self, id: &str, provider: &str, model: Option<&str>) {
         if id.is_empty() || id.len() > 1024 {
             return;
         }
         let mut s = self.0.inner.lock().unwrap();
         s.affinity
-            .retain(|_, (_, at)| at.elapsed() < Duration::from_secs(3600));
+            .retain(|_, (_, _, at)| at.elapsed() < Duration::from_secs(3600));
         if s.affinity.len() >= 4096 {
             if let Some(old) = s
                 .affinity
                 .iter()
-                .min_by_key(|(_, (_, at))| *at)
+                .min_by_key(|(_, (_, _, at))| *at)
                 .map(|(id, _)| id.clone())
             {
                 s.affinity.remove(&old);
             }
         }
-        s.affinity
-            .insert(id.into(), (provider.into(), Instant::now()));
+        s.affinity.insert(
+            id.into(),
+            (provider.into(), model.map(str::to_owned), Instant::now()),
+        );
     }
     fn record(
         &self,

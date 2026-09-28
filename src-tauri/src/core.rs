@@ -35,6 +35,8 @@ struct Store {
     seen_roots: Vec<String>,
     #[serde(default)]
     observed_auth_revisions: BTreeMap<String, String>,
+    #[serde(default)]
+    auth_sync_version: u32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +69,7 @@ pub struct ViewState {
     pub auth_source: AuthSource,
     pub preferences: Preferences,
     pub error: Option<String>,
+    pub auth_sync: Option<AuthSync>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,9 +78,19 @@ pub struct ConfigDocument {
     pub revision: String,
     pub path: String,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthSync {
+    pub state: String,
+    pub account_id: Option<String>,
+    pub message: String,
+    pub at: u64,
+}
 pub struct Core {
     data_dir: PathBuf,
     store: Store,
+    auth_sync: Option<AuthSync>,
+    checked_auth: Option<(String, String)>,
 }
 struct AuthInfo {
     identity: String,
@@ -159,6 +172,42 @@ fn auth_info(raw: &str) -> Result<AuthInfo> {
         kind: "chatgpt".into(),
         email,
     })
+}
+fn older(incoming: &str, stored: &str) -> bool {
+    fn timestamps(raw: &str) -> (Option<i64>, Option<i64>) {
+        let Ok(v) = serde_json::from_str::<Value>(raw) else {
+            return (None, None);
+        };
+        let refresh = v
+            .get("last_refresh")
+            .and_then(|v| {
+                v.as_i64().or_else(|| {
+                    v.as_str().and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|d| d.timestamp())
+                    })
+                })
+            })
+            .filter(|t| *t > 0);
+        let issued = ["access_token", "id_token"].iter().find_map(|key| {
+            v.get("tokens")
+                .and_then(|v| v.get(key))
+                .and_then(Value::as_str)
+                .and_then(claims)
+                .and_then(|v| v.get("iat").and_then(Value::as_i64))
+                .filter(|t| *t > 0)
+        });
+        (refresh, issued)
+    }
+    let (a, ai) = timestamps(incoming);
+    let (b, bi) = timestamps(stored);
+    if let (Some(a), Some(b)) = (a, b) {
+        if a != b {
+            return a < b;
+        }
+    }
+    matches!((ai, bi), (Some(a), Some(b)) if a < b)
 }
 pub fn validate_config(text: &str) -> Result<()> {
     if text.len() > 2 * 1024 * 1024 {
@@ -253,6 +302,7 @@ impl Core {
                 },
                 seen_roots: vec![],
                 observed_auth_revisions: BTreeMap::new(),
+                auth_sync_version: 1,
             },
         };
         if store.schema != 1 {
@@ -261,19 +311,19 @@ impl Core {
                 "账号库版本较新，请更新 gpt-Switch",
             ));
         }
-        let mut core = Self { data_dir, store };
-        let home = core.store.preferences.codex_home.clone();
-        if !core.store.seen_roots.contains(&home) {
-            if let Ok(Some(bytes)) = storage::read_optional(&core.home().join("auth.json")) {
-                if let Ok(raw) = String::from_utf8(bytes) {
-                    if auth_info(&raw).is_ok() {
-                        core.import_raw(&raw, None)?;
-                    }
-                }
-            }
-            core.store.seen_roots.push(home);
+        let mut core = Self {
+            data_dir,
+            store,
+            auth_sync: None,
+            checked_auth: None,
+        };
+        if core.store.auth_sync_version == 0 {
+            core.store.observed_auth_revisions.clear();
+            core.store.auth_sync_version = 1;
             core.persist()?;
         }
+        // Scan on every startup; revisions suppress duplicate imports and re-adding a deletion.
+        let _ = core.state();
         Ok(core)
     }
     fn persist(&self) -> Result<()> {
@@ -290,6 +340,18 @@ impl Core {
     pub fn import_raw(&mut self, raw: &str, name: Option<String>) -> Result<String> {
         let info = auth_info(raw)?;
         let old = self.store.clone();
+        if let Ok(Some(bytes)) = storage::read_optional(&self.home().join("auth.json")) {
+            if std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|raw| auth_info(raw).ok())
+                .is_some_and(|disk| disk.identity == info.identity)
+            {
+                self.store.observed_auth_revisions.insert(
+                    self.store.preferences.codex_home.clone(),
+                    storage::digest(&bytes),
+                );
+            }
+        }
         let id = if let Some(p) = self
             .store
             .profiles
@@ -364,6 +426,24 @@ impl Core {
     }
     pub fn delete(&mut self, id: &str) -> Result<()> {
         let old = self.store.clone();
+        if let Ok(Some(bytes)) = storage::read_optional(&self.home().join("auth.json")) {
+            if let Some(info) = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|raw| auth_info(raw).ok())
+            {
+                if self
+                    .store
+                    .profiles
+                    .iter()
+                    .any(|p| p.id == id && p.identity == info.identity)
+                {
+                    self.store.observed_auth_revisions.insert(
+                        self.store.preferences.codex_home.clone(),
+                        storage::digest(&bytes),
+                    );
+                }
+            }
+        }
         self.store.profiles.retain(|p| p.id != id);
         if let Err(e) = self.persist() {
             self.store = old;
@@ -386,26 +466,112 @@ impl Core {
         let root = self.store.preferences.codex_home.clone();
         let changed = self.store.observed_auth_revisions.get(&root) != Some(&auth_revision);
         let old = self.store.clone();
-        if let Some(profile) = self
-            .store
-            .profiles
-            .iter_mut()
-            .find(|p| changed && Some(p.identity.as_str()) == identity)
-        {
-            if let Some(raw) = auth.as_deref().and_then(|b| std::str::from_utf8(b).ok()) {
-                if raw != profile.auth {
-                    profile.auth = raw.into();
-                    profile.updated_at = now();
+        if changed {
+            // A valid intermediate JSON document can still be part of a non-atomic write.
+            if self.checked_auth.as_ref() != Some(&(root.clone(), auth_revision.clone())) {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                if storage::read_optional(&self.home().join("auth.json"))? != auth {
+                    return Err(AppError::new(
+                        "AUTH_PENDING",
+                        "账号文件正在写入，稍后自动重试",
+                    ));
                 }
+                self.checked_auth = Some((root.clone(), auth_revision.clone()));
+            }
+            if let (Some(Ok(info)), Some(raw)) = (
+                &info,
+                auth.as_deref().and_then(|b| std::str::from_utf8(b).ok()),
+            ) {
+                let (kind, id, message) = if let Some(profile) = self
+                    .store
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.identity == info.identity)
+                {
+                    if older(raw, &profile.auth) {
+                        (
+                            "older",
+                            Some(profile.id.clone()),
+                            "检测到旧凭据，已保留已保存版本",
+                        )
+                    } else if raw != profile.auth {
+                        profile.auth = raw.into();
+                        profile.email = info.email.clone();
+                        profile.updated_at = now();
+                        ("updated", Some(profile.id.clone()), "账号凭据已更新")
+                    } else {
+                        ("synced", Some(profile.id.clone()), "")
+                    }
+                } else {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let label = info.email.clone().unwrap_or_else(|| {
+                        if info.kind == "chatgpt" {
+                            "ChatGPT 账号".into()
+                        } else {
+                            "API Key".into()
+                        }
+                    });
+                    self.store.profiles.push(Profile {
+                        id: id.clone(),
+                        name: label.chars().filter(|c| !c.is_control()).take(80).collect(),
+                        identity: info.identity.clone(),
+                        kind: info.kind.clone(),
+                        email: info.email.clone(),
+                        auth: raw.into(),
+                        updated_at: now(),
+                    });
+                    ("added", Some(id), "新账号已自动加入切换列表")
+                };
+                self.store
+                    .observed_auth_revisions
+                    .insert(root, auth_revision.clone());
+                if let Err(e) = self.persist() {
+                    self.store = old;
+                    return Err(e);
+                }
+                self.set_sync(kind, id, message);
+            } else {
+                self.set_sync(
+                    if auth.is_none() { "missing" } else { "invalid" },
+                    None,
+                    if auth.is_none() {
+                        "未找到 auth.json，已有账号已保留"
+                    } else {
+                        "auth.json 暂时无效，已有账号已保留"
+                    },
+                );
             }
         }
-        if changed {
-            self.store
-                .observed_auth_revisions
-                .insert(root, auth_revision.clone());
-            if let Err(e) = self.persist() {
-                self.store = old;
-                return Err(e);
+        if !changed {
+            // A temporary invalid/missing file may recover to the already observed
+            // bytes, so clear its error without importing or touching timestamps.
+            if identity.is_some()
+                && self
+                    .auth_sync
+                    .as_ref()
+                    .is_some_and(|s| ["missing", "invalid"].contains(&s.state.as_str()))
+            {
+                self.set_sync("synced", None, "");
+            }
+            if let Some(profile) = self
+                .store
+                .profiles
+                .iter()
+                .find(|p| Some(p.identity.as_str()) == identity)
+            {
+                if auth
+                    .as_deref()
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .is_some_and(|raw| older(raw, &profile.auth))
+                {
+                    self.set_sync(
+                        "older",
+                        Some(profile.id.clone()),
+                        "检测到旧凭据，已保留已保存版本",
+                    );
+                } else if self.auth_sync.as_ref().is_some_and(|s| s.state == "older") {
+                    self.set_sync("synced", None, "");
+                }
             }
         }
         let accounts: Vec<_> = self
@@ -438,7 +604,23 @@ impl Core {
             auth_source: source(config.as_deref()),
             preferences: self.preferences(),
             error: None,
+            auth_sync: self.auth_sync.clone(),
         })
+    }
+    fn set_sync(&mut self, state: &str, account_id: Option<String>, message: &str) {
+        if self
+            .auth_sync
+            .as_ref()
+            .is_some_and(|s| s.state == state && s.account_id == account_id && s.message == message)
+        {
+            return;
+        }
+        self.auth_sync = Some(AuthSync {
+            state: state.into(),
+            account_id,
+            message: message.into(),
+            at: now(),
+        });
     }
     pub fn switch_account(&mut self, id: &str, expected: &str) -> Result<ViewState> {
         let state = self.state()?;
@@ -583,7 +765,8 @@ mod tests {
         c.state().unwrap();
         std::fs::write(c.home().join("auth.json"), oauth("b", "other")).unwrap();
         let s = c.state().unwrap();
-        assert_eq!(s.current_state, "unsaved");
+        assert_eq!(s.current_state, "saved");
+        assert_eq!(s.accounts.len(), 2);
         c.switch_account(&a, &s.auth_revision).unwrap();
         assert!(std::fs::read_to_string(c.home().join("auth.json"))
             .unwrap()
@@ -660,6 +843,122 @@ mod tests {
         let mut reopened = Core::new(t.path().join("app"), c.home()).unwrap();
         assert!(reopened.state().unwrap().accounts.is_empty());
         assert_eq!(reopened.state().unwrap().current_state, "unsaved");
+    }
+    #[test]
+    fn monitor_adds_and_updates_preserving_identity_name_and_unknown_fields() {
+        let (_t, mut c) = setup();
+        let path = c.home().join("auth.json");
+        let cfg = b"# never change\nmodel='fixture'\n";
+        std::fs::write(c.home().join("config.toml"), cfg).unwrap();
+        std::fs::write(&path, oauth("a", "first")).unwrap();
+        let first = c.state().unwrap();
+        let id = first.accounts[0].id.clone();
+        assert_eq!(first.auth_sync.unwrap().state, "added");
+        c.rename(&id, "Personal name").unwrap();
+        let raw = oauth("a", "refreshed");
+        std::fs::write(&path, &raw).unwrap();
+        let next = c.state().unwrap();
+        assert_eq!(next.accounts[0].name, "Personal name");
+        assert_eq!(next.accounts[0].id, id);
+        assert_eq!(c.store.profiles[0].auth, raw);
+        let stored = std::fs::read(c.data_dir.join("accounts.json")).unwrap();
+        assert_eq!(c.state().unwrap(), next);
+        assert_eq!(
+            std::fs::read(c.data_dir.join("accounts.json")).unwrap(),
+            stored
+        );
+        assert_eq!(std::fs::read(c.home().join("config.toml")).unwrap(), cfg);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        let mut other: Value = serde_json::from_str(&oauth("a", "workspace2")).unwrap();
+        other["tokens"]["account_id"] = json!("other-workspace");
+        std::fs::write(&path, other.to_string()).unwrap();
+        assert_eq!(c.state().unwrap().accounts.len(), 2);
+    }
+    #[test]
+    fn old_credentials_are_retained_across_restart_and_can_be_explicitly_applied() {
+        let (t, mut c) = setup();
+        let path = c.home().join("auth.json");
+        let version = |time: &str, token: &str| {
+            let mut v: Value = serde_json::from_str(&oauth("a", token)).unwrap();
+            v["last_refresh"] = json!(time);
+            v.to_string()
+        };
+        let newer = version("2026-09-28T10:00:00Z", "newer");
+        let old = version("2026-09-27T10:00:00Z", "old");
+        std::fs::write(&path, &newer).unwrap();
+        let id = c.state().unwrap().accounts[0].id.clone();
+        std::fs::write(&path, &old).unwrap();
+        assert_eq!(c.state().unwrap().auth_sync.unwrap().state, "older");
+        assert_eq!(c.store.profiles[0].auth, newer);
+        let mut c = Core::new(t.path().join("app"), c.home()).unwrap();
+        let state = c.state().unwrap();
+        assert_eq!(state.auth_sync.unwrap().state, "older");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        c.switch_account(&id, &state.auth_revision).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        let issued = |n| {
+            let token = format!(
+                "e30.{}.test",
+                URL_SAFE_NO_PAD.encode(json!({"sub":"a","iat":n}).to_string())
+            );
+            json!({"tokens":{"access_token":token}}).to_string()
+        };
+        assert!(older(&issued(100), &issued(200)));
+        assert!(!older(&issued(300), &issued(200)));
+        assert!(!older(&oauth("a", "no-time"), &newer));
+    }
+    #[test]
+    fn invalid_files_deletion_and_failed_persistence_preserve_the_vault() {
+        let (_t, mut c) = setup();
+        let path = c.home().join("auth.json");
+        std::fs::write(&path, oauth("a", "original")).unwrap();
+        let first = c.state().unwrap();
+        let id = first.accounts[0].id.clone();
+        std::fs::write(&path, "{").unwrap();
+        assert_eq!(c.state().unwrap().accounts.len(), 1);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(c.state().unwrap().accounts.len(), 1);
+        std::fs::write(&path, oauth("a", "original")).unwrap();
+        let recovered = c.state().unwrap();
+        assert_eq!(recovered.auth_sync.unwrap().state, "synced");
+        assert_eq!(
+            recovered.accounts[0].updated_at,
+            first.accounts[0].updated_at
+        );
+        c.delete(&id).unwrap();
+        assert!(c.state().unwrap().accounts.is_empty());
+        std::fs::write(&path, oauth("a", "new-version")).unwrap();
+        assert_eq!(c.state().unwrap().accounts.len(), 1);
+        let stored = c.store.clone();
+        let vault = c.data_dir.join("accounts.json");
+        std::fs::remove_file(&vault).unwrap();
+        std::fs::create_dir(&vault).unwrap();
+        std::fs::write(&path, oauth("b", "second")).unwrap();
+        assert!(c.state().is_err());
+        assert_eq!(c.store.profiles.len(), stored.profiles.len());
+        assert_eq!(
+            c.store.observed_auth_revisions,
+            stored.observed_auth_revisions
+        );
+        std::fs::remove_dir(&vault).unwrap();
+        c.persist().unwrap();
+        assert_eq!(c.state().unwrap().accounts.len(), 2);
+    }
+    #[test]
+    fn upgrade_imports_previously_observed_unsaved_account_once() {
+        let (t, mut c) = setup();
+        let raw = oauth("a", "upgrade");
+        std::fs::write(c.home().join("auth.json"), &raw).unwrap();
+        c.store
+            .observed_auth_revisions
+            .insert(c.preferences().codex_home, storage::digest(raw.as_bytes()));
+        c.store.auth_sync_version = 0;
+        c.persist().unwrap();
+        let mut next = Core::new(t.path().join("app"), c.home()).unwrap();
+        assert_eq!(next.state().unwrap().accounts.len(), 1);
+        drop(next);
+        let mut next = Core::new(t.path().join("app"), c.home()).unwrap();
+        assert_eq!(next.state().unwrap().accounts.len(), 1);
     }
     #[test]
     fn source_reports_independent_auth() {

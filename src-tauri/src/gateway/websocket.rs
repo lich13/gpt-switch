@@ -4,7 +4,9 @@ use super::{
     admission::{Admission, Budget, Rejected},
     circuit, forward,
     model::Settings,
-    replay, Active, Gateway, Route,
+    replay,
+    routing::Requirement,
+    Active, Gateway, Route,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
@@ -136,6 +138,7 @@ fn turn_failed(value: &serde_json::Value) -> bool {
 }
 fn rejected(reason: Rejected) -> Failure {
     match reason {
+        Rejected::Model => (1008, "MODEL_NOT_ALLOWED or MODEL_UNDETERMINED"),
         Rejected::Stopped => (1012, "gateway stopped"),
         Rejected::Unavailable => (1013, "no available provider"),
         Rejected::Full | Rejected::Timeout => (1013, "provider concurrency full; retry later"),
@@ -197,12 +200,15 @@ async fn take_slot(
     manual: bool,
     settings: &Settings,
     budget: &mut Budget,
+    requirement: &Requirement,
 ) -> Result<Admission, Failure> {
     if *client.closed.borrow() {
         return Err((1000, "client closed"));
     }
     tokio::select! {
-        admission = g.0.admission.acquire(routes, manual, settings.max_waiting, budget) => admission.map_err(rejected),
+        admission = g.0.admission.acquire_for(routes, manual, settings.max_waiting, budget, requirement) => admission.map_err(|reason| {
+            if matches!(reason, Rejected::Model) { (1008, requirement.code()) } else { rejected(reason) }
+        }),
         _ = client.closed.changed() => Err((1000, "client closed")),
     }
 }
@@ -287,6 +293,38 @@ async fn upstream(
     .map_err(|_| (None, false, None))?;
     Ok(Peer::new(socket))
 }
+fn turn_model(
+    g: &Gateway,
+    frame: &Frame,
+    last: Option<&str>,
+    pinned: Option<&str>,
+) -> Result<Option<String>, Failure> {
+    let v = value(frame).ok_or((1008, "invalid response.create"))?;
+    let previous = v.get("previous_response_id").and_then(|v| v.as_str());
+    let remembered = previous.and_then(|id| {
+        g.0.inner
+            .lock()
+            .unwrap()
+            .affinity
+            .get(id)
+            .filter(|(_, _, at)| at.elapsed() < Duration::from_secs(3600))
+            .cloned()
+    });
+    if let Some((owner, _, _)) = &remembered {
+        if pinned.is_some_and(|p| p != owner) {
+            return Err((1008, "response context belongs to another provider"));
+        }
+    }
+    if let Some(model) = v.get("model") {
+        return Ok(model
+            .as_str()
+            .filter(|m| !m.is_empty() && m.len() <= 256 && !m.chars().any(char::is_control))
+            .map(str::to_owned));
+    }
+    Ok(remembered
+        .and_then(|(_, model, _)| model)
+        .or_else(|| last.map(str::to_owned)))
+}
 #[allow(clippy::too_many_arguments)]
 async fn session(
     g: &Gateway,
@@ -321,16 +359,18 @@ async fn session(
             .map(str::to_owned)
     }) {
         let s = g.0.inner.lock().unwrap();
-        if let Some((owner, _)) = s
+        if let Some((owner, _, _)) = s
             .affinity
             .get(&previous)
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(3600))
+            .filter(|(_, _, at)| at.elapsed() < Duration::from_secs(3600))
         {
             ids = vec![owner.clone()];
         } else {
             ids.truncate(1);
         }
     }
+    let mut current_model = turn_model(g, &first, None, None)?;
+    let requirement = Requirement::model(current_model.as_deref());
     let mut budget = Budget::new(cfg.queue_seconds);
     let mut attempts = 0;
     let (mut upstream_peer, admission) = loop {
@@ -341,7 +381,16 @@ async fn session(
             .iter()
             .filter_map(|id| routes.get(id).cloned())
             .collect();
-        let mut admission = take_slot(g, client, &candidates, manual, cfg, &mut budget).await?;
+        let mut admission = take_slot(
+            g,
+            client,
+            &candidates,
+            manual,
+            cfg,
+            &mut budget,
+            &requirement,
+        )
+        .await?;
         ids.retain(|id| id != &admission.route.provider.id);
         attempts += 1;
         let began = Instant::now();
@@ -378,6 +427,7 @@ async fn session(
     let route = admission.route.clone();
     let mut turn = Some(admission);
     let mut pending: Option<Frame> = None;
+    let mut confirmed_model: Option<String> = None;
     let mut began = Instant::now();
     let mut received = false;
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(cfg.first_byte_seconds);
@@ -390,6 +440,13 @@ async fn session(
     loop {
         if turn.is_none() {
             if let Some(frame) = pending.take() {
+                let model = turn_model(
+                    g,
+                    &frame,
+                    confirmed_model.as_deref(),
+                    Some(&route.provider.id),
+                )?;
+                let requirement = Requirement::model(model.as_deref());
                 let mut budget = Budget::new(cfg.queue_seconds);
                 turn = Some(
                     take_slot(
@@ -399,9 +456,11 @@ async fn session(
                         manual,
                         cfg,
                         &mut budget,
+                        &requirement,
                     )
                     .await?,
                 );
+                current_model = model;
                 began = Instant::now();
                 received = false;
                 deadline =
@@ -430,8 +489,9 @@ async fn session(
                     deadline = tokio::time::Instant::now() + Duration::from_secs(cfg.idle_seconds);
                 }
                 if let Some(v) = value(&frame) {
-                    if let Some(id) = v.pointer("/response/id").or_else(|| v.get("response_id")).and_then(|v| v.as_str()) { g.remember(id, &route.provider.id); }
+                    if let Some(id) = v.pointer("/response/id").or_else(|| v.get("response_id")).and_then(|v| v.as_str()) { g.remember_model(id, &route.provider.id, current_model.as_deref()); }
                     let kind = v.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if matches!(kind, "response.created" | "response.completed" | "response.done") { confirmed_model = current_model.clone(); }
                     if matches!(kind, "response.completed" | "response.done" | "response.failed" | "response.incomplete" | "response.cancelled" | "response.canceled" | "error") {
                         if let Some(mut admission) = turn.take() {
                             if matches!(kind, "response.failed" | "error") {

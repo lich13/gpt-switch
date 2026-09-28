@@ -4,9 +4,11 @@ use super::{
     connector::{self, BoxError},
     model::Settings,
     replay::{self, Replay, WireBody},
+    routing::{self, Requirement},
     Active, Gateway, Route,
 };
 use http_body_util::{BodyExt, StreamBody};
+use hyper::body::Body as _;
 use hyper::{body::Incoming, header, HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use std::{
@@ -125,15 +127,17 @@ struct Observe {
     gateway: Gateway,
     provider: String,
     overflow: bool,
+    model: Option<String>,
 }
 impl Observe {
-    fn new(stream: bool, gateway: Gateway, provider: String) -> Self {
+    fn new(stream: bool, gateway: Gateway, provider: String, model: Option<String>) -> Self {
         Self {
             buffer: vec![],
             stream,
             gateway,
             provider,
             overflow: false,
+            model,
         }
     }
     fn parse(&self, bytes: &[u8]) {
@@ -144,7 +148,8 @@ impl Observe {
                 .filter_map(|v| v.as_str())
             {
                 if !id.is_empty() && id.len() <= 1024 {
-                    self.gateway.remember(id, &self.provider);
+                    self.gateway
+                        .remember_model(id, &self.provider, self.model.as_deref());
                 }
             }
         }
@@ -265,19 +270,21 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             )
         }
     };
-    let json = parts
+    let content_type = parts
         .headers
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
-        .is_some_and(|s| s.contains("json"));
-    let hints = if json {
+        .unwrap_or("");
+    let hints = if content_type.contains("json") || content_type.starts_with("multipart/form-data")
+    {
         replay
-            .hints(
+            .inspect(
                 parts
                     .headers
                     .get(header::CONTENT_ENCODING)
                     .and_then(|h| h.to_str().ok())
                     .unwrap_or("identity"),
+                content_type,
             )
             .await
     } else {
@@ -289,30 +296,38 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             .headers
             .get(header::ACCEPT)
             .is_some_and(|h| h.as_bytes().windows(17).any(|w| w == b"text/event-stream"));
-    let affinity = hints.map(|h| h.previous_response_id);
-    let pinned = match affinity {
-        Ok(Some(id)) => {
+    let mut model = hints.as_ref().ok().and_then(|h| h.model.clone());
+    let pinned = match hints {
+        Ok(hints) if hints.previous_response_id.is_some() => {
+            let previous = hints.previous_response_id.unwrap();
             let owner = gateway
                 .0
                 .inner
                 .lock()
                 .unwrap()
                 .affinity
-                .get(&id)
-                .filter(|(_, at)| at.elapsed() < Duration::from_secs(3600))
-                .map(|(id, _)| id.clone());
-            if let Some(owner) = owner {
+                .get(&previous)
+                .filter(|(_, _, at)| at.elapsed() < Duration::from_secs(3600))
+                .cloned();
+            if let Some((owner, previous_model, _)) = owner {
                 ids = vec![owner];
+                if model.is_none() {
+                    model = previous_model;
+                }
             } else {
                 ids.truncate(1);
             }
             true
         }
-        Err(_) => {
-            ids.truncate(1);
-            true
-        }
-        Ok(None) => false,
+        // The original bytes may contain an uninspectable continuation. Try only
+        // one eligible (unrestricted) route, without cutting off earlier filters.
+        Err(_) => true,
+        _ => false,
+    };
+    let requirement = if !websocket && routing::resource(&parts.method, parts.uri.path()) {
+        Requirement::Resource
+    } else {
+        Requirement::model(model.as_deref())
     };
     let mut last = None;
     let mut attempted = 0usize;
@@ -330,11 +345,12 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         } = match gateway
             .0
             .admission
-            .acquire(
+            .acquire_for(
                 &candidates,
                 mode == "manual",
                 settings.max_waiting,
                 &mut wait_budget,
+                &requirement,
             )
             .await
         {
@@ -349,6 +365,16 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     .headers_mut()
                     .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
                 return response;
+            }
+            Err(Rejected::Model) => {
+                if attempted > 0 {
+                    break;
+                }
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    requirement.code(),
+                    requirement.message(),
+                );
             }
             Err(_) => break,
         };
@@ -496,18 +522,35 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         }
         let total_deadline = tokio::time::Instant::now()
             + Duration::from_secs(settings.total_seconds).saturating_sub(began.elapsed());
-        let mut observe = Observe::new(stream, gateway.clone(), route.provider.id.clone());
+        let mut observe = Observe::new(
+            stream,
+            gateway.clone(),
+            route.provider.id.clone(),
+            model.clone(),
+        );
         let g = gateway.clone();
         let cfg = settings.clone();
         let neutral = status.as_u16() >= 400;
         let output = async_stream::try_stream! {
             let _active=active;
             let _slot=slot;
-            if let Some(frame)=first {if let Some(data)=frame.data_ref(){observe.feed(data);}yield frame;}
+            if let Some(frame)=first {
+                if let Some(data)=frame.data_ref(){observe.feed(data);}
+                let complete=body.is_end_stream();
+                if complete {observe.finish();if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
+                yield frame;
+                if complete {return;}
+            }
             loop {
                 let limit=if stream {tokio::time::Instant::now()+Duration::from_secs(cfg.idle_seconds)}else{total_deadline};
                 match tokio::time::timeout_at(limit,body.frame()).await {
-                    Ok(Some(Ok(frame)))=>{if let Some(data)=frame.data_ref(){observe.feed(data);}yield frame;}
+                    Ok(Some(Ok(frame)))=>{
+                        if let Some(data)=frame.data_ref(){observe.feed(data);}
+                        let complete=body.is_end_stream();
+                        if complete {observe.finish();if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
+                        yield frame;
+                        if complete {break;}
+                    }
                     Ok(None)=>{observe.finish();if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}
                         g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});break;}
                     result=>{

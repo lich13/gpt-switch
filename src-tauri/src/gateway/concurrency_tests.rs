@@ -727,3 +727,77 @@ async fn resume_port_failure_preserves_config_and_legacy_store_defaults() {
     next.resume(t.path()).await.unwrap();
     assert!(!next.view().running);
 }
+
+#[tokio::test]
+async fn websocket_model_rules_recheck_each_turn_and_keep_context_provider() {
+    let (a, ra, seen_a) = response_ws_server().await;
+    let (b, rb, seen_b) = response_ws_server().await;
+    let (t, g) = fixture(vec![
+        format!("http://127.0.0.1:{a}"),
+        format!("http://127.0.0.1:{b}"),
+    ])
+    .await;
+    let ids: Vec<_> = g.view().providers.iter().map(|p| p.id.clone()).collect();
+    update(
+        &g,
+        &t,
+        Edit::ModelsProvider {
+            id: ids[0].clone(),
+            allowed_models: Some(vec!["a".into()]),
+        },
+    );
+    update(
+        &g,
+        &t,
+        Edit::ModelsProvider {
+            id: ids[1].clone(),
+            allowed_models: Some(vec!["b".into()]),
+        },
+    );
+    update(
+        &g,
+        &t,
+        Edit::Mode {
+            mode: "auto".into(),
+        },
+    );
+    start(&g, &t).await;
+    let mut ws = responses_client(&g).await;
+    let create = r#"{"type":"response.create","model":"b","future":42}"#;
+    ws.send(yawc::Frame::text(create)).await.unwrap();
+    ws_next(&mut ws).await;
+    assert_eq!(g.view().providers[0].active_requests, 0);
+    assert_eq!(g.view().providers[1].active_requests, 1);
+    rb.add_permits(1);
+    assert_eq!(ws_next(&mut ws).await.payload(), create.as_bytes());
+    ws_next(&mut ws).await;
+    until(|| g.view().providers[1].active_requests == 0).await;
+    ws.send(yawc::Frame::text(
+        r#"{"type":"response.create","previous_response_id":"resp-fixture"}"#,
+    ))
+    .await
+    .unwrap();
+    ws_next(&mut ws).await;
+    rb.add_permits(1);
+    ws_next(&mut ws).await;
+    ws_next(&mut ws).await;
+    until(|| g.view().providers[1].active_requests == 0).await;
+    update(
+        &g,
+        &t,
+        Edit::ModelsProvider {
+            id: ids[1].clone(),
+            allowed_models: Some(vec!["c".into()]),
+        },
+    );
+    ws.send(yawc::Frame::text(create)).await.unwrap();
+    let closed = ws_next(&mut ws).await;
+    assert_eq!(closed.opcode(), yawc::OpCode::Close);
+    assert_eq!(&closed.payload()[..2], &1008u16.to_be_bytes());
+    assert!(seen_a.lock().unwrap().is_empty());
+    assert_eq!(seen_b.lock().unwrap().len(), 2);
+    assert_eq!(g.view().providers[1].health.failures, 0);
+    drop(ws);
+    drop(ra);
+    g.stop().await.unwrap();
+}

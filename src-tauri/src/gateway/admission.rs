@@ -1,6 +1,6 @@
 //! Request slots and bounded FIFO admission. Behavior informed by Sub2API
 //! a3eb7ef3 concurrency_service / account scheduler; independently implemented in Rust.
-use super::{forward::Permits, model::Provider, Route};
+use super::{forward::Permits, model::Provider, routing::Requirement, Route};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
@@ -21,6 +21,7 @@ struct State {
     epoch: u64,
     next: u64,
     limits: HashMap<String, u32>,
+    models: HashMap<String, Option<Vec<String>>>,
     active: HashMap<String, usize>,
     waiting: VecDeque<(u64, Vec<String>)>,
 }
@@ -43,6 +44,7 @@ pub enum Rejected {
     Unavailable,
     Full,
     Timeout,
+    Model,
 }
 pub struct Budget {
     remaining: Duration,
@@ -72,6 +74,10 @@ impl Scheduler {
             .iter()
             .map(|p| (p.id.clone(), p.max_concurrency))
             .collect();
+        s.models = providers
+            .iter()
+            .map(|p| (p.id.clone(), p.allowed_models.clone()))
+            .collect();
         drop(s);
         self.signal();
     }
@@ -83,12 +89,24 @@ impl Scheduler {
         self.0.wake.notify_waiters();
         let _ = self.0.events.send(());
     }
+    #[cfg(test)]
     pub async fn acquire(
         &self,
         routes: &[Route],
         manual: bool,
         max_waiting: usize,
         budget: &mut Budget,
+    ) -> Result<Admission, Rejected> {
+        self.acquire_for(routes, manual, max_waiting, budget, &Requirement::Resource)
+            .await
+    }
+    pub async fn acquire_for(
+        &self,
+        routes: &[Route],
+        manual: bool,
+        max_waiting: usize,
+        budget: &mut Budget,
+        requirement: &Requirement,
     ) -> Result<Admission, Rejected> {
         let started = Instant::now();
         let epoch = self.0.state.lock().unwrap().epoch;
@@ -103,8 +121,24 @@ impl Scheduler {
                 if !s.running || s.epoch != epoch {
                     break Err(Rejected::Stopped);
                 }
-                let eligible: Vec<_> = routes
+                let matching: Vec<_> = routes
                     .iter()
+                    .filter(|r| s.limits.contains_key(&r.provider.id))
+                    .collect();
+                if matching.is_empty() {
+                    break Err(Rejected::Unavailable);
+                }
+                let matching: Vec<_> = matching
+                    .into_iter()
+                    .filter(|r| {
+                        requirement.allows(s.models.get(&r.provider.id).and_then(|m| m.as_deref()))
+                    })
+                    .collect();
+                if matching.is_empty() {
+                    break Err(Rejected::Model);
+                }
+                let eligible: Vec<_> = matching
+                    .into_iter()
                     .filter(|r| {
                         s.limits.contains_key(&r.provider.id)
                             && r.provider_circuit.available(manual)
@@ -138,7 +172,7 @@ impl Scheduler {
                     if let Some(permits) = Permits::acquire(route, manual) {
                         *s.active.entry(id.clone()).or_default() += 1;
                         accepted = Some(Admission {
-                            route: (*route).clone(),
+                            route: (**route).clone(),
                             permits,
                             slot: Slot {
                                 scheduler: self.clone(),
