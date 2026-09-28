@@ -100,6 +100,7 @@ impl Service {
         })
     }
 }
+#[cfg(target_os = "macos")]
 fn executable() -> Result<PathBuf> {
     std::env::current_exe().map_err(storage::io_error)
 }
