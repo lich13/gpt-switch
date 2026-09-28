@@ -181,13 +181,15 @@ fn older(incoming: &str, stored: &str) -> bool {
         let refresh = v
             .get("last_refresh")
             .and_then(|v| {
-                v.as_i64().or_else(|| {
-                    v.as_str().and_then(|s| {
-                        chrono::DateTime::parse_from_rfc3339(s)
-                            .ok()
-                            .map(|d| d.timestamp())
+                v.as_i64()
+                    .and_then(|n| n.checked_mul(1_000_000))
+                    .or_else(|| {
+                        v.as_str().and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|d| d.timestamp_micros())
+                        })
                     })
-                })
             })
             .filter(|t| *t > 0);
         let issued = ["access_token", "id_token"].iter().find_map(|key| {
@@ -529,6 +531,9 @@ impl Core {
                     self.store = old;
                     return Err(e);
                 }
+                // This is a distinct stable version, even when the action and
+                // account match the previous update. Unchanged polls skip here.
+                self.auth_sync = None;
                 self.set_sync(kind, id, message);
             } else {
                 self.set_sync(
@@ -906,6 +911,10 @@ mod tests {
         assert!(older(&issued(100), &issued(200)));
         assert!(!older(&issued(300), &issued(200)));
         assert!(!older(&oauth("a", "no-time"), &newer));
+        assert!(older(
+            r#"{"last_refresh":"2026-09-28T01:00:00.001Z"}"#,
+            r#"{"last_refresh":"2026-09-28T01:00:00.002Z"}"#,
+        ));
     }
     #[test]
     fn invalid_files_deletion_and_failed_persistence_preserve_the_vault() {
