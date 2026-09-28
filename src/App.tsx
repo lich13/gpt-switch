@@ -9,6 +9,7 @@ import {
 import {
   ArrowLeftRight,
   Network,
+  ChartNoAxesCombined,
   Shield,
   Users,
   FileCode2,
@@ -45,6 +46,7 @@ import {
   type Preferences,
   type LoginState,
 } from "./types";
+const Usage=lazy(()=>import("./Usage"));
 const Gateway = lazy(() => import("./Gateway"));
 const ConfigEditor = lazy(() => import("./ConfigEditor"));
 type Dialog =
@@ -61,7 +63,7 @@ const emptyLogin: LoginState = {
 };
 export default function App() {
   const [state, setState] = useState<ViewState | null>(null),
-    [page, setPage] = useState<"accounts" | "config" | "gateway" | "proxies">(
+    [page, setPage] = useState<"accounts" | "config" | "gateway" | "proxies" | "usage">(
       "accounts",
     ),
     [search, setSearch] = useState(""),
@@ -84,7 +86,7 @@ export default function App() {
   pageRef.current = page;
   const notify = useCallback((s: string) => setMessage(s), []);
   const navigate = useCallback(
-    (next: "accounts" | "config" | "gateway" | "proxies") => {
+    (next: "accounts" | "config" | "gateway" | "proxies" | "usage") => {
       if (next === pageRef.current) return;
       if (
         gatewayDirty.current &&
@@ -139,7 +141,7 @@ export default function App() {
                 setDialog("settings");
               })()
             : navigate(
-                p === "config" || p === "gateway" || p === "proxies"
+                p === "config" || p === "gateway" || p === "proxies" || p === "usage"
                   ? p
                   : "accounts",
               ),
@@ -240,11 +242,12 @@ export default function App() {
             <Shield size={17} />
             代理设置
           </button>
+          <button className={page==="usage"?"nav-item active":"nav-item"} onClick={()=>navigate("usage")}><ChartNoAxesCombined size={17}/>统计</button>
         </nav>
         <div className="sidebar-bottom">
           <button className="nav-item" onClick={() => setDialog("settings")}>
             <Settings size={17} />
-            设置<span className="version">v0.5.0</span>
+            设置<span className="version">v0.6.0</span>
           </button>
         </div>
       </aside>
@@ -480,7 +483,7 @@ export default function App() {
               )}
             </div>
           </section>
-        ) : page === "gateway" || page === "proxies" ? (
+        ) : page === "usage" ? <Suspense fallback={<div className="empty">正在打开统计…</div>}><Usage onDirtyChange={gatewayDraftChanged}/></Suspense> : page === "gateway" || page === "proxies" ? (
           <Suspense fallback={<div className="empty">正在打开网关…</div>}>
             <Gateway
               section={page}

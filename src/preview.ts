@@ -1,3 +1,4 @@
+import {usageCommands,usagePreview} from "./usage-preview";
 import { gatewayPreview } from "./gateway-preview";
 import type { ViewState, ConfigDocument, LoginState } from "./types";
 const callbacks = new Map<string, Set<(p: never) => void>>();
@@ -67,7 +68,6 @@ let login: LoginState = {
 };
 let startup = {
   launchOnBoot: false,
-  launchToTray: true,
   restoreGateway: false,
   revision: "preview-startup",
 };
@@ -76,6 +76,7 @@ export async function run(
   name: string,
   args: Record<string, unknown>,
 ): Promise<unknown> {
+  if (usageCommands.includes(name)) return usagePreview(name,args,emit);
   if (name === "get_quick") return { ...quick };
   if (name === "set_quick") {
     quick = { ...quick, ...args };
@@ -102,8 +103,7 @@ export async function run(
     startup = {
       ...startup,
       ...(args.preferences as {
-        launchToTray: boolean;
-        restoreGateway: boolean;
+              restoreGateway: boolean;
       }),
       launchOnBoot: Boolean(args.enabled),
       revision: crypto.randomUUID(),

@@ -3,6 +3,7 @@ import { ArrowUpRight, Check, Pin, Power, Search, X } from "lucide-react";
 import { command, preview, subscribe } from "./bridge";
 import { errorOf, type GatewayState, type ViewState } from "./types";
 import { QuotaInfo, useProviderQuota } from "./Quota";
+import QuickControls from "./QuickControls";
 import AuthSyncNotice from "./AuthSyncNotice";
 type Preferences = {
   pinned: boolean;
@@ -60,6 +61,7 @@ export default function QuickPanel() {
       .catch((e) => {
         if (!disposed) setError(errorOf(e).message);
       });
+    void command<{message:string}|null>("get_startup_error").then(e=>{if(e&&!disposed)setError(e.message);}).catch(()=>{});
     const media = matchMedia("(prefers-color-scheme: dark)");
     const change = () => setSystemDark(media.matches);
     media.addEventListener("change", change);
@@ -411,6 +413,7 @@ export default function QuickPanel() {
           )}
         </div>
       </div>
+      <QuickControls visible={visible} notify={setNotice} error={setError}/>
       <footer className="quick-footer">
         <button onClick={() => open()}>
           打开 gpt-Switch <ArrowUpRight size={12} />

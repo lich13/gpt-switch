@@ -34,6 +34,9 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    read_bounded(path, 2 * 1024 * 1024)
+}
+pub fn read_bounded(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => {
             return Err(AppError::new(
@@ -41,11 +44,8 @@ pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
                 "目标文件是符号链接，请选择实际文件所在目录",
             ))
         }
-        Ok(m) if !m.is_file() || m.len() > 2 * 1024 * 1024 => {
-            return Err(AppError::new(
-                "FILE_TYPE",
-                "文件必须是小于 2 MiB 的普通文件",
-            ))
+        Ok(m) if !m.is_file() || m.len() > limit => {
+            return Err(AppError::new("FILE_TYPE", "文件不是普通文件或超过允许大小"))
         }
         Ok(_) => (),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -123,6 +123,17 @@ pub fn protect(path: &Path, _directory: bool) -> Result<()> {
     Ok(())
 }
 pub fn atomic_write(path: &Path, bytes: &[u8], expected: Option<&str>) -> Result<()> {
+    atomic_write_bounded(path, bytes, expected, 2 * 1024 * 1024)
+}
+pub fn atomic_write_bounded(
+    path: &Path,
+    bytes: &[u8],
+    expected: Option<&str>,
+    limit: u64,
+) -> Result<()> {
+    if bytes.len() as u64 > limit {
+        return Err(AppError::new("FILE_SIZE", "文件超过允许大小"));
+    }
     let parent = path
         .parent()
         .ok_or_else(|| AppError::new("PATH", "目标路径无效"))?;
@@ -133,7 +144,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8], expected: Option<&str>) -> Result
     protect(temp.path(), false)?;
     temp.write_all(bytes).map_err(io_error)?;
     temp.as_file().sync_all().map_err(io_error)?;
-    let current = read_optional(path)?;
+    let current = read_bounded(path, limit)?;
     if expected.is_some_and(|e| e != revision(current.as_deref())) {
         return Err(AppError::new(
             "CONFLICT",
@@ -145,7 +156,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8], expected: Option<&str>) -> Result
     fs::File::open(parent)
         .and_then(|f| f.sync_all())
         .map_err(io_error)?;
-    let actual = read_optional(path)?;
+    let actual = read_bounded(path, limit)?;
     if actual.as_deref() != Some(bytes) {
         return Err(AppError::new(
             "VERIFY",

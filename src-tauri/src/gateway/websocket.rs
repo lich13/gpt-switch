@@ -373,7 +373,8 @@ async fn session(
     let requirement = Requirement::model(current_model.as_deref());
     let mut budget = Budget::new(cfg.queue_seconds);
     let mut attempts = 0;
-    let (mut upstream_peer, admission) = loop {
+    let logical_id = uuid::Uuid::new_v4().to_string();
+    let (mut upstream_peer, admission, initial_usage) = loop {
         if ids.is_empty() || attempts > cfg.max_retries {
             return Err((1013, "all providers failed"));
         }
@@ -394,6 +395,18 @@ async fn session(
         ids.retain(|id| id != &admission.route.provider.id);
         attempts += 1;
         let began = Instant::now();
+        let first_value = value(&first);
+        let mut usage = g.0.usage.begin(
+            &logical_id,
+            attempts - 1,
+            &admission.route.provider.id,
+            &admission.route.provider.name,
+            current_model.as_deref(),
+            first_value
+                .as_ref()
+                .and_then(|v| v["service_tier"].as_str()),
+            true,
+        );
         let mut closed = client.closed.clone();
         let result = tokio::select! {
             result = upstream(&admission.route, &uri, &headers, cfg) => result,
@@ -402,9 +415,10 @@ async fn session(
         match result {
             Ok(peer) => {
                 admission.permits.proxy_success(cfg);
-                break (peer, admission);
+                break (peer, admission, usage);
             }
             Err((status, proxy, retry)) => {
+                usage.finish(status, if proxy { "PROXY" } else { "WS_HANDSHAKE" });
                 let retryable = status.is_none_or(circuit::retryable);
                 if retryable {
                     admission.permits.failure(cfg, proxy, retry);
@@ -426,6 +440,7 @@ async fn session(
     };
     let route = admission.route.clone();
     let mut turn = Some(admission);
+    let mut usage = Some(initial_usage);
     let mut pending: Option<Frame> = None;
     let mut confirmed_model: Option<String> = None;
     let mut began = Instant::now();
@@ -461,6 +476,16 @@ async fn session(
                     .await?,
                 );
                 current_model = model;
+                let v = value(&frame);
+                usage = Some(g.0.usage.begin(
+                    &uuid::Uuid::new_v4().to_string(),
+                    0,
+                    &route.provider.id,
+                    &route.provider.name,
+                    current_model.as_deref(),
+                    v.as_ref().and_then(|v| v["service_tier"].as_str()),
+                    true,
+                ));
                 began = Instant::now();
                 received = false;
                 deadline =
@@ -477,11 +502,13 @@ async fn session(
             biased;
             frame = upstream_peer.incoming.recv() => {
                 let Some(frame) = frame else {
+                    if let Some(mut u)=usage.take(){u.finish(Some(101),"STREAM_INTERRUPTED");}
                     if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, false, None); g.record(&route, Some(101), began, 0, "STREAM_INTERRUPTED"); }
                     return Err((1011, "upstream disconnected"));
                 };
                 let closing = frame.opcode() == OpCode::Close;
                 if closing {
+                    if let Some(mut u)=usage.take(){u.finish(Some(101),"STREAM_INTERRUPTED");}
                     if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, false, None); g.record(&route, Some(101), began, 0, "STREAM_INTERRUPTED"); }
                 }
                 if !frame.opcode().is_control() {
@@ -489,6 +516,7 @@ async fn session(
                     deadline = tokio::time::Instant::now() + Duration::from_secs(cfg.idle_seconds);
                 }
                 if let Some(v) = value(&frame) {
+                    if let Some(u)=&mut usage {u.value(&v);}
                     if let Some(id) = v.pointer("/response/id").or_else(|| v.get("response_id")).and_then(|v| v.as_str()) { g.remember_model(id, &route.provider.id, current_model.as_deref()); }
                     let kind = v.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if matches!(kind, "response.created" | "response.completed" | "response.done") { confirmed_model = current_model.clone(); }
@@ -499,6 +527,10 @@ async fn session(
                             } else if matches!(kind, "response.cancelled" | "response.canceled") {
                                 admission.permits.neutral(cfg);
                             } else { admission.permits.success(cfg); g.successful_response(&route.provider); }
+                            if let Some(mut u)=usage.take() {
+                                let outcome=match kind {"response.completed"|"response.done"=>"OK","response.cancelled"|"response.canceled"=>"CANCELLED",_=>"UPSTREAM_ERROR"};
+                                u.finish(Some(101),outcome);
+                            }
                             g.record(&route, Some(101), began, 0, "WEBSOCKET_TURN");
                         }
                     }
@@ -516,6 +548,7 @@ async fn session(
                 if closing { return Ok(()); }
             },
             _ = tokio::time::sleep_until(deadline), if turn.is_some() => {
+                if let Some(mut u)=usage.take(){u.finish(Some(101),if received {"STREAM_TIMEOUT"}else{"FIRST_BYTE_TIMEOUT"});}
                 if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, false, None); }
                 g.record(&route, Some(101), began, 0, if received { "STREAM_TIMEOUT" } else { "FIRST_BYTE_TIMEOUT" });
                 upstream_peer.close(1011, "upstream timeout").await;

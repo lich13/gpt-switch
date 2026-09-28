@@ -11,7 +11,7 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/lich13/gpt-switch/releases) 下载 macOS Apple Silicon / Intel DMG 或 Windows x64 安装程序。macOS 包使用 ad-hoc 签名，Windows 包未配置商业代码签名；系统可能要求确认来自非商店开发者的应用。校验下载文件时使用 Release 中的 `SHA256SUMS`。
+从 [GitHub Releases](https://github.com/lich13/gpt-switch/releases) 下载 macOS Apple Silicon DMG 或 Windows x64 安装程序。macOS 包使用 ad-hoc 签名，Windows 包未配置商业代码签名；系统可能要求确认来自非商店开发者的应用。校验下载文件时使用 Release 中的 `SHA256SUMS`。
 
 ## 使用
 
@@ -57,9 +57,9 @@ Responses WebSocket 每个 `response.create` 检查模型，连接建立后固�
 
 Responses WebSocket 按每轮 `response.create` 生成计数，空闲长连接不占业务名额。首轮读取后选路；后续轮次固定已有上游，等待超时以 1013 关闭，请客户端重连。通过协议处理识别轮次和压缩／分片，消息内容不重新序列化；Ping/Pong、关闭信息与背压保留。单条 Responses WebSocket 消息上限 64 MiB，最多额外缓存一轮生成；未知 WebSocket 路径继续使用通用隧道，并按连接计数。
 
-设置中提供开机自动启动、自启动时静默驻留托盘、启动时恢复网关。macOS 使用系统登录项，Windows 使用当前用户启动注册；仅在用户开启后注册。应用正常退出仍将配置写为当前供应商，并保留上次开启意图；明确停用网关会清除该意图。启用恢复后，下次启动检查 Codex 目录和两字段指纹，先完成崩溃事务，再绑定端口并接管两字段；外部修改受控字段、端口占用或配置不满足 custom 契约时显示错误，不覆盖现场。
+设置中提供开机静默启动、启动时恢复网关。macOS 使用用户级 LaunchAgent，Windows 使用当前用户启动注册；仅在用户开启后注册。应用正常退出仍将配置写为当前供应商，并保留上次开启意图；明确停用网关会清除该意图。启用恢复后，下次启动检查 Codex 目录和两字段指纹，先完成崩溃事务，再绑定端口并接管两字段；外部修改受控字段、端口占用或配置不满足 custom 契约时显示错误，不覆盖现场。
 
-macOS 通过系统的登录启动 Apple event 识别启动来源，兼容系统忽略旧登录项隐藏属性的情况；手动打开仍显示窗口。Windows 使用专用登录启动参数，重复的登录启动信号不弹出窗口。
+macOS 通过用户级 LaunchAgent 和系统的登录启动 Apple event 识别启动来源，兼容系统忽略旧登录项隐藏属性的情况；手动打开仍显示窗口。Windows 使用专用登录启动参数，重复的登录启动信号不弹出窗口。
 
 切换应用、Dock 重新打开或托盘普通打开保留当前页面、弹窗与内存草稿。明确导航离开未保存的供应商／代理表单时需要确认；取消或退出清除草稿中的凭据。
 
@@ -95,6 +95,15 @@ pnpm tauri dev
 
 `pnpm dev` 是标明“预览”的模拟界面，真实凭据只能在桌面应用中操作。`--smoke-test <绝对输出路径>` 使用独立临时账号和配置，验证 WebView、托盘、账号切换、网关监听与认证、两字段切换、退出恢复和 auth 不变后退出，不接触真实 Codex 目录。
 
-`pnpm icons` 从原创 SVG 生成 9 档 PNG、黑白托盘图标、ICNS 和 ICO。发布通过 CI 构建三平台安装包及校验和；真实 OAuth 和操作系统托盘交互验收与自动冒烟测试分别记录。
+`pnpm icons` 从原创 SVG 生成 9 档 PNG、黑白托盘图标、ICNS 和 ICO。发布通过 CI 构建 macOS Apple Silicon DMG 与 Windows x64 NSIS 安装包及校验和；真实 OAuth 和操作系统托盘交互验收与自动冒烟测试分别记录。
 
 MIT License。独立项目，与 OpenAI 无隶属关系。
+
+
+## 使用统计与动态定价
+
+“统计”只记录实际经过本地网关的上游请求，不读取其他客户端会话。概览支持今日、最近 24 小时、7／14／30 天和自定义范围，提供 Token 分类、估算费用、趋势、日志详情、供应商及模型统计；明细默认保留 30 天，日汇总长期保存。未报告用量、未定价和真实零价格分别显示。
+
+价格页默认从 LiteLLM 原始价格源更新，使用 ETag 和 SHA-256 缓存；也可固定手动价格、按服务等级和长上下文设置分层，并从 models.dev 选择模型导入或自动同步。价格同步不携带供应商凭据、不进入业务熔断，断网时沿用最后有效缓存。
+
+快捷面板底部提供“强制退出 ChatGPT / Codex”和 macOS 电池“合盖不休眠”。前者在本版本只做模拟验收，不会在开发预览中终止真实进程；后者使用系统授权执行固定 `pmset` 操作，恢复原电池休眠值。

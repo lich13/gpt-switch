@@ -114,6 +114,7 @@ struct Shared {
     quota: quota::Service,
     catalog: catalog::Service,
     admission: admission::Scheduler,
+    usage: crate::usage::Service,
 }
 #[derive(Clone)]
 pub struct Gateway(Arc<Shared>);
@@ -144,6 +145,8 @@ impl Gateway {
         let (events, _) = broadcast::channel(32);
         let admission = admission::Scheduler::new(events.clone());
         admission.configure(&store.providers, false);
+        let prices = crate::pricing::Service::new(&data)?;
+        let usage = crate::usage::Service::new(&data, prices);
         Ok(Self(Arc::new(Shared {
             inner: Mutex::new(Inner {
                 store,
@@ -167,10 +170,14 @@ impl Gateway {
             quota: quota::Service::new(),
             catalog: catalog::Service::new(),
             admission,
+            usage,
         })))
     }
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.0.events.subscribe()
+    }
+    pub fn usage(&self) -> crate::usage::Service {
+        self.0.usage.clone()
     }
     fn changed(&self) {
         let _ = self.0.events.send(());

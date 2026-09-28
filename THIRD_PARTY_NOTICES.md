@@ -43,3 +43,14 @@ Unmodified WebSocket/deflate dependency, MPL-2.0. The full license is bundled in
 The separate quick panel, delayed blur handling and temporary macOS context-menu attachment follow the behavior of lich13/sub2api-ops-companion at 4d0eafc1e64385d1cdb6f6bd92eacb0b5c2e6f29. Adapted for gpt-Switch's window-scoped lifecycle and shared account/gateway state.
 
 https://github.com/lich13/sub2api-ops-companion/tree/4d0eafc1e64385d1cdb6f6bd92eacb0b5c2e6f29/desktop
+
+
+## Usage and pricing references
+
+Usage and pricing UI behavior was independently implemented with behavioral reference to cc-switch commit `846de29c13ac4d65f164db8c15dd5fd58e29f972` (MIT). No source code is copied.
+
+https://github.com/farion1231/cc-switch/tree/846de29c13ac4d65f164db8c15dd5fd58e29f972/src/components/usage
+
+LiteLLM model price data is bundled from the public MIT-licensed repository at https://github.com/BerriAI/litellm . The bundled seed records its source URL, download timestamp and SHA-256; prices are used only for estimates.
+
+models.dev model metadata and pricing are read from https://models.dev/api.json . The models.dev project is MIT licensed; its data remains attributed to that source.

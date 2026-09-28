@@ -15,10 +15,6 @@ jobs:
             target: aarch64-apple-darwin
             bundles: dmg
             label: macos-arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            bundles: dmg
-            label: macos-x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis
@@ -76,6 +72,7 @@ jobs:
           hdiutil detach "$mount"
           executable="$RUNNER_TEMP/gpt-Switch.app/Contents/MacOS/gpt-switch"
           test -x "$executable"
+          test "$(lipo -archs "$executable")" = "arm64"
           python3 -c 'import pathlib,sys; assert "Copyright (c) 2025 Jason Young" in pathlib.Path(sys.argv[1]).read_text()' "$RUNNER_TEMP/gpt-Switch.app/Contents/Resources/THIRD_PARTY_NOTICES.md"
           "$executable" --smoke-test "$report" &
           pid=$!
@@ -109,7 +106,7 @@ jobs:
       - name: Package icon sources and checksums
         run: |
           mkdir release-assets
-          find artifacts -type f \( -name '*.dmg' -o -name '*.exe' \) -exec cp {} release-assets/ \;
+          python3 scripts/collect-release.py artifacts release-assets "${GITHUB_REF_NAME#v}"
           zip -r release-assets/gpt-Switch-icons.zip assets src-tauri/icons
           cd release-assets
           sha256sum *.dmg *.exe *.zip > SHA256SUMS

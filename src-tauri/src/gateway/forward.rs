@@ -37,9 +37,13 @@ pub async fn serve(
         }
     }
 }
+#[derive(Clone)]
+struct LocalError(String);
 pub(super) fn error(status: StatusCode, code: &str, message: &str) -> Response<WireBody> {
-    Response::builder().status(status).header(header::CONTENT_TYPE,"application/json")
-        .body(replay::full(serde_json::to_vec(&serde_json::json!({"error":{"type":"gpt_switch_gateway","code":code,"message":message}})).unwrap())).unwrap()
+    let mut response=Response::builder().status(status).header(header::CONTENT_TYPE,"application/json")
+        .body(replay::full(serde_json::to_vec(&serde_json::json!({"error":{"type":"gpt_switch_gateway","code":code,"message":message}})).unwrap())).unwrap();
+    response.extensions_mut().insert(LocalError(code.into()));
+    response
 }
 pub(super) fn target(base: &str, incoming: &Uri) -> Result<Uri, BoxError> {
     let path = incoming.path();
@@ -188,7 +192,22 @@ impl Observe {
         }
     }
 }
-async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<WireBody> {
+async fn forward(gateway: Gateway, request: Request<Incoming>) -> Response<WireBody> {
+    let logical_id = uuid::Uuid::new_v4().to_string();
+    let response = forward_inner(gateway.clone(), request, logical_id.clone()).await;
+    if let Some(error) = response.extensions().get::<LocalError>() {
+        gateway
+            .0
+            .usage
+            .rejected(&logical_id, response.status().as_u16(), &error.0, None);
+    }
+    response
+}
+async fn forward_inner(
+    gateway: Gateway,
+    mut request: Request<Incoming>,
+    logical_id: String,
+) -> Response<WireBody> {
     let began = Instant::now();
     let (settings, mode, mut ids, token, running) = {
         let s = gateway.0.inner.lock().unwrap();
@@ -297,6 +316,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             .get(header::ACCEPT)
             .is_some_and(|h| h.as_bytes().windows(17).any(|w| w == b"text/event-stream"));
     let mut model = hints.as_ref().ok().and_then(|h| h.model.clone());
+    let service_tier = hints.as_ref().ok().and_then(|h| h.service_tier.clone());
     let pinned = match hints {
         Ok(hints) if hints.previous_response_id.is_some() => {
             let previous = hints.previous_response_id.unwrap();
@@ -406,6 +426,15 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         let attempt = attempted;
         attempted += 1;
         let started = Instant::now();
+        let mut usage = gateway.0.usage.begin(
+            &logical_id,
+            attempt,
+            &route.provider.id,
+            &route.provider.name,
+            model.as_deref(),
+            service_tier.as_deref(),
+            stream_hint,
+        );
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(if stream_hint {
                 settings.first_byte_seconds
@@ -421,17 +450,30 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 last_category = if proxy_failure { "PROXY" } else { "NETWORK" };
                 permits.failure(&settings, proxy_failure, None);
                 gateway.record(&route, None, started, attempt, last_category);
+                usage.finish(None, last_category);
                 continue;
             }
             Err(_) => {
                 last_category = "FIRST_BYTE_TIMEOUT";
                 permits.failure(&settings, false, None);
                 gateway.record(&route, None, started, attempt, last_category);
+                usage.finish(None, last_category);
                 continue;
             }
         };
         permits.proxy_success(&settings);
         let status = response.status();
+        let response_stream = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|h| h.starts_with("text/event-stream"));
+        let encoding = response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        usage.response(status.as_u16(), response_stream, encoding);
         if status == StatusCode::SWITCHING_PROTOCOLS && websocket {
             gateway.successful_response(&route.provider);
             permits.success(&settings);
@@ -450,6 +492,14 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     let result =
                         tokio::io::copy_bidirectional(&mut TokioIo::new(a), &mut TokioIo::new(b))
                             .await;
+                    usage.finish(
+                        Some(101),
+                        if result.is_ok() {
+                            "OK"
+                        } else {
+                            "STREAM_INTERRUPTED"
+                        },
+                    );
                     permits.neutral(&cfg);
                     g.record(
                         &route,
@@ -482,7 +532,11 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             permits.failure(&settings, false, cooldown);
             gateway.record(&route, Some(status.as_u16()), started, attempt, "HTTP");
             if let Ok(Ok(body)) = captured {
+                body.observe_usage(&mut usage).await;
+                usage.finish(Some(status.as_u16()), "HTTP");
                 last = Some(Response::from_parts(response_parts, body.body()));
+            } else {
+                usage.finish(Some(status.as_u16()), "STREAM_INTERRUPTED");
             }
             last_category = "HTTP";
             continue;
@@ -514,6 +568,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     "FIRST_BYTE_TIMEOUT",
                 );
                 last_category = "FIRST_BYTE_TIMEOUT";
+                usage.finish(Some(status.as_u16()), last_category);
                 continue;
             }
         };
@@ -535,9 +590,9 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             let _active=active;
             let _slot=slot;
             if let Some(frame)=first {
-                if let Some(data)=frame.data_ref(){observe.feed(data);}
+                if let Some(data)=frame.data_ref(){observe.feed(data);usage.feed(data);}
                 let complete=body.is_end_stream();
-                if complete {observe.finish();if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
+                if complete {observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
                 yield frame;
                 if complete {return;}
             }
@@ -545,16 +600,17 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 let limit=if stream {tokio::time::Instant::now()+Duration::from_secs(cfg.idle_seconds)}else{total_deadline};
                 match tokio::time::timeout_at(limit,body.frame()).await {
                     Ok(Some(Ok(frame)))=>{
-                        if let Some(data)=frame.data_ref(){observe.feed(data);}
+                        if let Some(data)=frame.data_ref(){observe.feed(data);usage.feed(data);}
                         let complete=body.is_end_stream();
-                        if complete {observe.finish();if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
+                        if complete {observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
                         yield frame;
                         if complete {break;}
                     }
-                    Ok(None)=>{observe.finish();if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}
+                    Ok(None)=>{observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}
                         g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});break;}
                     result=>{
                         let category=if result.is_err(){"STREAM_TIMEOUT"}else{"STREAM_INTERRUPTED"};
+                        usage.finish(Some(status.as_u16()),category);
                         permits.failure(&cfg,false,None);g.record(&route,Some(status.as_u16()),began,attempt,category);
                         Err::<(),BoxError>(std::io::Error::other("上游流中断").into())?;
                     }

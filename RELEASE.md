@@ -1,4 +1,4 @@
-# gpt-Switch v0.5.0
+# gpt-Switch v0.6.0
 
 菜单栏／托盘左键现在打开独立快捷面板，右键保留主窗口、配置、网关、设置和退出菜单。面板支持供应商／账号标签、固定、搜索、快捷切换和网关控制；重复点击聚焦，失焦收起，保留主窗口页面与草稿。
 
@@ -8,4 +8,6 @@
 - 修复普通 HTTP 响应完成时的健康统计和响应游标归属记录，确保后续请求能继承模型与供应商。
 - 保留账号登录、TOML 草稿、额度、SOCKS5、并发排队、故障转移、WebSocket、自启动和恢复。网关配置继续仅写已有 custom 的 base_url 与 experimental_bearer_token。
 
-提供 macOS Apple Silicon / Intel DMG、Windows x64 NSIS、图标资源及 SHA256SUMS。macOS 使用 ad-hoc 签名；Windows 安装包未商业签名。
+提供 macOS Apple Silicon DMG、Windows x64 NSIS、图标资源及 SHA256SUMS。
+
+统计仅记录经过本地网关的请求；额度查询沿用既有行为，本版本不调整额度恢复逻辑。开机启动固定为静默模式，快捷面板提供模拟可验收的客户端退出入口和合盖不休眠控制。macOS 使用 ad-hoc 签名；Windows 安装包未商业签名。

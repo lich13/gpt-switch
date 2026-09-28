@@ -7,25 +7,15 @@ use std::{
     sync::Mutex,
 };
 pub const LOGIN_ARG: &str = "--gpt-switch-login-startup";
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Preferences {
-    pub launch_to_tray: bool,
     pub restore_gateway: bool,
-}
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            launch_to_tray: true,
-            restore_gateway: false,
-        }
-    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
     pub launch_on_boot: bool,
-    pub launch_to_tray: bool,
     pub restore_gateway: bool,
     pub revision: String,
 }
@@ -54,68 +44,100 @@ impl Service {
         Ok((settings, storage::revision(raw.as_deref())))
     }
     pub fn view(&self) -> Result<View> {
-        let _lock = self.lock.lock().unwrap();
+        let _guard = self.lock.lock().unwrap();
         let (prefs, revision) = self.read()?;
-        let launch_on_boot = auto_launch(prefs.launch_to_tray)?
-            .is_enabled()
-            .map_err(system_error)?;
         Ok(View {
-            launch_on_boot,
-            launch_to_tray: prefs.launch_to_tray,
+            launch_on_boot: registered()?,
             restore_gateway: prefs.restore_gateway,
             revision,
         })
     }
+    pub fn migrate(&self) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let old = auto_launch(true)?;
+            let legacy = old.is_enabled().map_err(system_error)?;
+            if legacy {
+                let was = registered()?;
+                register(true)?;
+                if let Err(e) = old.disable() {
+                    let _ = register(was);
+                    return Err(system_error(e));
+                }
+                if old.is_enabled().map_err(system_error)? {
+                    return Err(AppError::new("STARTUP", "旧登录项未能移除"));
+                }
+            }
+        }
+        let (prefs, rev) = self.read()?;
+        if rev != "missing" {
+            storage::atomic_write(
+                &self.path,
+                &serde_json::to_vec_pretty(&prefs).unwrap(),
+                Some(&rev),
+            )?;
+        }
+        Ok(())
+    }
     pub fn update(&self, enabled: bool, prefs: Preferences, expected: &str) -> Result<View> {
-        let _lock = self.lock.lock().unwrap();
-        let (old, revision) = self.read()?;
+        let _guard = self.lock.lock().unwrap();
+        let (_, revision) = self.read()?;
         if revision != expected {
             return Err(AppError::new("CONFLICT", "启动设置已变化，请重新打开设置"));
         }
-        let previous = auto_launch(old.launch_to_tray)?;
-        let was_enabled = previous.is_enabled().map_err(system_error)?;
-        let next = auto_launch(prefs.launch_to_tray)?;
-        // Re-register an already enabled item too. Older releases may have
-        // created the same login item without the current hidden argument.
-        // Replacing it makes the persisted silent-launch preference effective
-        // after an upgrade as well as after a normal setting change.
-        let system_changed = was_enabled != enabled || enabled;
-        if system_changed {
-            if was_enabled {
-                previous.disable().map_err(system_error)?;
-            }
-            if enabled {
-                if let Err(e) = next.enable() {
-                    if was_enabled {
-                        let _ = previous.enable();
-                    }
-                    return Err(system_error(e));
-                }
-            }
-        }
-        let actual = next.is_enabled().map_err(system_error)?;
-        if actual != enabled {
-            return Err(AppError::new("STARTUP", "系统登录项状态与请求不一致"));
-        }
-        let bytes = serde_json::to_vec_pretty(&prefs)
-            .map_err(|_| AppError::new("STARTUP", "无法保存启动设置"))?;
+        let previous = registered()?;
+        register(enabled)?;
+        let bytes = serde_json::to_vec_pretty(&prefs).unwrap();
         if let Err(e) = storage::atomic_write(&self.path, &bytes, Some(expected)) {
-            if system_changed {
-                let _ = next.disable();
-                if was_enabled {
-                    let _ = previous.enable();
-                }
-            }
+            let _ = register(previous);
             return Err(e);
         }
         Ok(View {
-            launch_on_boot: actual,
-            launch_to_tray: prefs.launch_to_tray,
+            launch_on_boot: enabled,
             restore_gateway: prefs.restore_gateway,
             revision: storage::digest(&bytes),
         })
     }
 }
+fn executable() -> Result<PathBuf> {
+    std::env::current_exe().map_err(storage::io_error)
+}
+fn registered() -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::startup_macos::actual(&executable()?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        auto_launch(true)?.is_enabled().map_err(system_error)
+    }
+}
+fn register(enabled: bool) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = executable()?;
+        if bundle_path(&exe).extension().is_none_or(|e| e != "app") {
+            return Err(AppError::new("STARTUP", "请使用正式安装的应用设置开机启动"));
+        }
+        crate::startup_macos::set(enabled, &exe)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let launch = auto_launch(true)?;
+        if enabled {
+            launch.enable()
+        } else {
+            launch.disable()
+        }
+        .map_err(system_error)?;
+        if launch.is_enabled().map_err(system_error)? != enabled {
+            return Err(AppError::new("STARTUP", "启动注册状态不匹配"));
+        }
+        Ok(())
+    }
+}
+
 fn system_error(_: auto_launch::Error) -> AppError {
     AppError::new(
         "STARTUP",
@@ -242,8 +264,8 @@ fn is_login_event(event: u32, origin: Option<u32>) -> bool {
     [u32::from_be_bytes(*b"oapp"), u32::from_be_bytes(*b"rapp")].contains(&event)
         && origin == Some(u32::from_be_bytes(*b"lgit"))
 }
-pub fn silent(args: &[String], prefs: &Preferences) -> bool {
-    prefs.launch_to_tray && login_source(args)
+pub fn silent(args: &[String], _prefs: &Preferences) -> bool {
+    login_source(args)
 }
 
 #[cfg(test)]
@@ -258,7 +280,9 @@ mod tests {
             PathBuf::from("/Applications/gpt-Switch.app")
         );
         let prefs: Preferences = serde_json::from_str("{}").unwrap();
-        assert!(prefs.launch_to_tray);
+        let old: Preferences =
+            serde_json::from_str(r#"{"launchToTray":false,"restoreGateway":true}"#).unwrap();
+        assert!(silent(&[LOGIN_ARG.into()], &old));
         assert!(!prefs.restore_gateway);
         assert!(is_login_event(
             u32::from_be_bytes(*b"oapp"),
@@ -274,12 +298,5 @@ mod tests {
             r#""C:\Program Files\gpt-Switch\gpt-switch.exe""#
         );
         assert!(silent(&[LOGIN_ARG.into()], &prefs));
-        assert!(!silent(
-            &[LOGIN_ARG.into()],
-            &Preferences {
-                launch_to_tray: false,
-                restore_gateway: true
-            }
-        ));
     }
 }

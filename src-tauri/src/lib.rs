@@ -1,11 +1,18 @@
+mod commands;
 mod core;
 mod gateway;
 mod login;
+mod power;
+mod pricing;
+mod process_control;
 mod quick;
 mod startup;
+#[cfg(target_os = "macos")]
+mod startup_macos;
 mod storage;
 #[cfg(target_os = "macos")]
 mod tray_macos;
+mod usage;
 use core::{ConfigDocument, Core, Preferences, ViewState};
 use std::{
     path::PathBuf,
@@ -33,6 +40,10 @@ struct Runtime {
     fixture: Mutex<Option<tempfile::TempDir>>,
     startup: startup::Service,
     start_silently: bool,
+    frontend_started: AtomicBool,
+    force_quitting: AtomicBool,
+    power: power::Service,
+    startup_error: Mutex<Option<AppError>>,
 }
 struct SmokeSnapshot {
     home: PathBuf,
@@ -526,6 +537,9 @@ async fn frontend_ready(
     if window.label() != "main" {
         return Ok(());
     }
+    if r.frontend_started.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
     if r.smoke.is_some() {
         let result = (|| -> Result<()> {
             #[cfg(windows)]
@@ -561,8 +575,8 @@ async fn frontend_ready(
         if r.startup.preferences()?.restore_gateway {
             let home = lock(&r.core)?.home();
             if let Err(e) = r.gateway.resume(&home).await {
+                *r.startup_error.lock().unwrap() = Some(e.clone());
                 let _ = app.emit("switch-error", e);
-                return show(&app, Some("gateway"));
             }
         }
         if !r.start_silently {
@@ -750,6 +764,7 @@ pub fn run() {
             let startup = startup::Service::new(&data);
             let start_silently = smoke.is_none() && startup::silent(&args, &startup.preferences()?);
             app.manage(quick::Panel::new(&data)?);
+            let power = power::Service::new(&data);
             let core = Core::new(data, home)?;
             let runtime = Arc::new(Runtime {
                 core: Mutex::new(core),
@@ -762,6 +777,10 @@ pub fn run() {
                 fixture: Mutex::new(fixture),
                 startup,
                 start_silently,
+                power,
+                frontend_started: AtomicBool::new(false),
+                force_quitting: AtomicBool::new(false),
+                startup_error: Mutex::new(None),
             });
             runtime.gateway.observe_home(&lock(&runtime.core)?.home());
             let state = lock(&runtime.core)?.state()?;
@@ -773,6 +792,40 @@ pub fn run() {
             }
             #[cfg(target_os = "macos")]
             app.set_menu(application_menu(app.handle())?)?;
+            if runtime.smoke.is_none() {
+                let r = runtime.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(e) = r.startup.migrate() {
+                        *r.startup_error.lock().unwrap() = Some(e);
+                    }
+                });
+                let svc = runtime.gateway.usage();
+                tauri::async_runtime::spawn(async move {
+                    let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
+                    loop {
+                        timer.tick().await;
+                        let old = svc.prices().snapshot().version.clone();
+                        let _ = svc.prices().sync(false).await;
+                        if old != svc.prices().snapshot().version {
+                            svc.backfill();
+                        }
+                    }
+                });
+            }
+            let mut usage_events = runtime.gateway.usage().subscribe();
+            let usage_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while usage_events.recv().await.is_ok() {
+                    let _ = usage_app.emit("usage-state", ());
+                }
+            });
+            let mut pricing_events = runtime.gateway.usage().prices().subscribe();
+            let pricing_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while pricing_events.recv().await.is_ok() {
+                    let _ = pricing_app.emit("pricing-state", ());
+                }
+            });
             let mut quota_events = runtime.gateway.quota_events();
             let quota_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -951,6 +1004,22 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_usage_state,
+            commands::set_usage_settings,
+            commands::get_usage_dashboard,
+            commands::get_usage_logs,
+            commands::get_usage_detail,
+            commands::get_pricing,
+            commands::update_pricing,
+            commands::sync_pricing,
+            commands::list_models_dev,
+            commands::import_models_dev,
+            commands::reload_pricing,
+            commands::open_pricing_folder,
+            commands::get_clamshell_state,
+            commands::set_clamshell_awake,
+            commands::force_quit_codex_clients,
+            commands::get_startup_error,
             open_main,
             quick::get_quick,
             quick::set_quick,
@@ -1005,6 +1074,7 @@ pub fn run() {
                 // Serialize restoration with any in-flight takeover before returning to the OS.
                 let restored =
                     tauri::async_runtime::block_on(r.gateway.stop_for_exit()).map(|_| ());
+                r.gateway.usage().flush();
                 if r.smoke.is_some() {
                     let _ = report_exit_smoke(app, &r, restored);
                 }

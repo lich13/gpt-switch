@@ -20,7 +20,7 @@ export default function StartupSettings() {
     };
   }, []);
   const update = async (
-    key: "launchOnBoot" | "launchToTray" | "restoreGateway",
+    key: "launchOnBoot" | "restoreGateway",
     value: boolean,
   ) => {
     if (!state) return;
@@ -32,7 +32,6 @@ export default function StartupSettings() {
         await command<StartupState>("set_startup", {
           enabled: next.launchOnBoot,
           preferences: {
-            launchToTray: next.launchToTray,
             restoreGateway: next.restoreGateway,
           },
           expectedRevision: state.revision,
@@ -49,8 +48,7 @@ export default function StartupSettings() {
       <legend>启动</legend>
       {(
         [
-          ["launchOnBoot", "开机自动启动"],
-          ["launchToTray", "自启动时静默驻留托盘"],
+          ["launchOnBoot", "开机静默启动"],
           ["restoreGateway", "启动时恢复网关"],
         ] as const
       ).map(([key, label]) => (

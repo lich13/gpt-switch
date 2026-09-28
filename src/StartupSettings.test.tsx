@@ -6,7 +6,6 @@ vi.mock("./bridge", () => ({ command }));
 import StartupSettings from "./StartupSettings";
 const initial = {
   launchOnBoot: false,
-  launchToTray: true,
   restoreGateway: false,
   revision: "old",
 };
@@ -19,12 +18,12 @@ describe("native startup settings", () => {
       revision: "verified",
     });
     render(<StartupSettings />);
-    const box = await screen.findByLabelText("开机自动启动");
+    const box = await screen.findByLabelText("开机静默启动");
     await waitFor(() => expect(box).toBeEnabled());
     await userEvent.click(box);
     expect(command).toHaveBeenLastCalledWith("set_startup", {
       enabled: true,
-      preferences: { launchToTray: true, restoreGateway: false },
+      preferences: { restoreGateway: false },
       expectedRevision: "old",
     });
     await waitFor(() => expect(box).toBeChecked());
@@ -35,7 +34,7 @@ describe("native startup settings", () => {
       message: "系统登录项操作失败",
     });
     render(<StartupSettings />);
-    const box = await screen.findByLabelText("开机自动启动");
+    const box = await screen.findByLabelText("开机静默启动");
     await waitFor(() => expect(box).toBeEnabled());
     await userEvent.click(box);
     expect(await screen.findByRole("alert")).toHaveTextContent(
