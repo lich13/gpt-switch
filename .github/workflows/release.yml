@@ -79,8 +79,8 @@ jobs:
           $process = Start-Process -FilePath $exe.FullName -ArgumentList @('--smoke-test', $report) -PassThru
           if (!$process.WaitForExit(60000)) { $process.Kill(); throw 'Smoke timed out' }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (!$result.ok -or !$result.webview -or !$result.tray -or !$result.gateway -or !$result.safeExit -or $result.revision -ne $env:GITHUB_SHA) { throw 'Smoke failed' }
           Get-Content $report
+          if (!$result.ok -or !$result.webview -or !$result.tray -or !$result.gateway -or !$result.safeExit -or $result.revision -ne $env:GITHUB_SHA) { throw 'Smoke failed' }
           $remove = Start-Process "$installDir/uninstall.exe" -ArgumentList '/S' -Wait -PassThru
           if ($remove.ExitCode -ne 0 -or (Test-Path "$uninstall/gpt-Switch") -or (Test-Path $exe.FullName)) { throw 'Uninstall failed' }
           if ((Get-Item $protocol).GetValue('') -ne $beforeProtocol -or !(Test-Path $marker)) { throw 'Uninstall damaged other app or data' }
@@ -108,7 +108,7 @@ jobs:
           done
           if [ ! -f "$report" ]; then kill "$pid" 2>/dev/null || true; exit 1; fi
           wait "$pid"
-          python3 -c 'import json,sys,os; d=json.load(open(sys.argv[1])); assert d["ok"] and d["webview"] and d["tray"] and d["gateway"] and d["safeExit"] and d["revision"] == os.environ["GITHUB_SHA"]; print(d)' "$report"
+          python3 -c 'import json,sys,os; d=json.load(open(sys.argv[1])); print(d); assert d["ok"] and d["webview"] and d["tray"] and d["gateway"] and d["safeExit"] and d["revision"] == os.environ["GITHUB_SHA"]' "$report"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}

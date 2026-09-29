@@ -873,6 +873,8 @@ pub fn run() {
             let power = power::Service::new(&data);
             let mut core = Core::new(data.clone(), home)?;
             if let Some(fixture) = &fixture {
+                storage::private_dir(&core.home())?;
+                storage::private_dir(&fixture.path().join("claude"))?;
                 let mut preferences = core.preferences();
                 preferences.claude_home =
                     fixture.path().join("claude").to_string_lossy().into_owned();
