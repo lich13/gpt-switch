@@ -45,18 +45,12 @@ The separate quick panel, delayed blur handling and temporary macOS context-menu
 https://github.com/lich13/sub2api-ops-companion/tree/4d0eafc1e64385d1cdb6f6bd92eacb0b5c2e6f29/desktop
 
 
-## Usage and pricing references
+## Provider interface and import links
 
-Usage and pricing UI behavior was independently implemented with behavioral reference to cc-switch commit `846de29c13ac4d65f164db8c15dd5fd58e29f972` (MIT). No source code is copied.
+The compact provider controls and ccswitch://v1/import provider format follow cc-switch at `846de29c13ac4d65f164db8c15dd5fd58e29f972` (MIT). The notice above applies. The native default-handler integration and in-memory import queue are original implementations; no external application is modified.
 
-https://github.com/farion1231/cc-switch/tree/846de29c13ac4d65f164db8c15dd5fd58e29f972/src/components/usage
+https://github.com/farion1231/cc-switch/tree/846de29c13ac4d65f164db8c15dd5fd58e29f972
 
-The v0.6.1 independent 429 cooldown and operations overview also use behavioral references from Wei-Shaw/sub2api at `9a62841fd124d026cf3694fcf9b79e98addcdbdc`: `backend/internal/service/rate_limit_429_cooldown_test.go` and `backend/internal/repository/ops_repo_dashboard.go` (LGPL-3.0). No Go code or tests are copied. gpt-Switch counts client logical requests, retains separate upstream attempts, and separates business rejection/cancellation from service failure.
+Independent 429 cooldown behavior references Wei-Shaw/sub2api at `9a62841fd124d026cf3694fcf9b79e98addcdbdc`, `backend/internal/service/rate_limit_429_cooldown_test.go` (LGPL-3.0). No Go implementation or tests are copied.
 
-https://github.com/Wei-Shaw/sub2api/tree/9a62841fd124d026cf3694fcf9b79e98addcdbdc/backend/internal
-
-LiteLLM model price data is bundled from the public MIT-licensed repository at https://github.com/BerriAI/litellm . The bundled seed records its source URL, download timestamp and SHA-256; prices are used only for estimates.
-
-models.dev model metadata and pricing are read from https://models.dev/api.json . The models.dev project is MIT licensed; its data remains attributed to that source.
-
-The v0.6.2 final request log projection, nine-column display, HTTP status colors, final-attempt costs, response ID deduplication and pagination follow cc-switch commit `846de29c13ac4d65f164db8c15dd5fd58e29f972`, specifically `src/components/usage/RequestLogTable.tsx` and `src-tauri/src/proxy/response_processor.rs`. The MIT notice above applies. Logical overview statistics remain independent. The native power helper is an original implementation using public macOS XPC and Security APIs; no One Switch code or helper is used.
+The native power helper is an original implementation using public macOS XPC and Security APIs; no One Switch code or helper is used.

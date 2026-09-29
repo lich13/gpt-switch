@@ -378,7 +378,8 @@ async fn ws_next(ws: &mut yawc::TcpWebSocket) -> yawc::Frame {
         .unwrap()
 }
 #[tokio::test]
-async fn responses_websocket_counts_turns_preserves_compressed_payload_and_spills_new_sessions() {
+async fn responses_websocket_releases_each_turn_preserves_compressed_payload_and_spills_new_sessions(
+) {
     let (a, ra, seen_a) = response_ws_server().await;
     let (b, rb, seen_b) = response_ws_server().await;
     let (t, g) = fixture(vec![
@@ -415,25 +416,39 @@ async fn responses_websocket_counts_turns_preserves_compressed_payload_and_spill
         .send(yawc::Frame::text(payload.clone()))
         .await
         .unwrap();
-    ws_next(&mut second).await;
+    assert!(ws_next(&mut second)
+        .await
+        .as_str()
+        .contains("response.created"));
     assert_eq!(g.view().providers[1].active_requests, 1);
     ra.add_permits(1);
     assert_eq!(ws_next(&mut first).await.payload(), payload.as_bytes());
-    ws_next(&mut first).await;
+    let completed: serde_json::Value =
+        serde_json::from_slice(ws_next(&mut first).await.payload()).unwrap();
+    assert_eq!(completed["type"], "response.completed");
+    assert_eq!(completed["response"]["id"], "resp-fixture");
     until(|| g.view().providers[0].active_requests == 0).await;
+    assert_eq!(g.view().providers[0].health.requests, 1);
     // An idle connection must not reserve provider capacity; the next turn reacquires it.
     first
         .send(yawc::Frame::text(payload.clone()))
         .await
         .unwrap();
-    ws_next(&mut first).await;
+    assert!(ws_next(&mut first)
+        .await
+        .as_str()
+        .contains("response.created"));
     assert_eq!(g.view().providers[0].active_requests, 1);
     ra.add_permits(1);
-    ws_next(&mut first).await;
-    ws_next(&mut first).await;
+    assert_eq!(ws_next(&mut first).await.payload(), payload.as_bytes());
+    let completed: serde_json::Value =
+        serde_json::from_slice(ws_next(&mut first).await.payload()).unwrap();
+    assert_eq!(completed["type"], "response.completed");
     rb.add_permits(1);
-    ws_next(&mut second).await;
-    ws_next(&mut second).await;
+    assert_eq!(ws_next(&mut second).await.payload(), payload.as_bytes());
+    let completed: serde_json::Value =
+        serde_json::from_slice(ws_next(&mut second).await.payload()).unwrap();
+    assert_eq!(completed["type"], "response.completed");
     until(|| g.view().providers.iter().all(|p| p.active_requests == 0)).await;
     assert_eq!(
         seen_a.lock().unwrap().as_slice(),
@@ -444,37 +459,29 @@ async fn responses_websocket_counts_turns_preserves_compressed_payload_and_spill
     let pong = ws_next(&mut first).await;
     assert_eq!(pong.opcode(), yawc::OpCode::Pong);
     assert_eq!(pong.payload().as_ref(), b"control-ping");
-    g.usage().flush();
-    let summary = g
-        .usage()
-        .dashboard(crate::usage::Filters::default())
-        .unwrap()
-        .summary;
-    assert_eq!(
-        (
-            summary.requests,
-            summary.successes,
-            summary.failures,
-            summary.attempts
-        ),
-        (3, 3, 0, 3)
-    );
+    let view = g.view();
+    assert_eq!(view.waiting_requests, 0);
+    assert_eq!(view.providers[0].health.requests, 2);
+    assert_eq!(view.providers[1].health.requests, 1);
+    assert!(view
+        .providers
+        .iter()
+        .all(|p| { p.health.failures == 0 && p.health.available && !p.health.probe_in_flight }));
     first
         .send(yawc::Frame::close(1000.into(), "done"))
         .await
         .unwrap();
     drop(first);
     drop(second);
+    until(|| g.view().active_connections == 0).await;
+    let view = g.view();
+    assert_eq!(view.providers[0].health.requests, 2);
+    assert_eq!(view.providers[1].health.requests, 1);
+    assert!(view
+        .providers
+        .iter()
+        .all(|p| p.active_requests == 0 && p.health.failures == 0));
     g.stop().await.unwrap();
-    g.usage().flush();
-    assert_eq!(
-        g.usage()
-            .dashboard(crate::usage::Filters::default())
-            .unwrap()
-            .summary
-            .cancelled,
-        0
-    );
 }
 #[tokio::test]
 async fn responses_websocket_fragmented_messages_and_busy_pinned_turn_close_1013() {

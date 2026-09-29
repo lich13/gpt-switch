@@ -49,13 +49,11 @@ pub enum Rejected {
 }
 pub struct Budget {
     remaining: Duration,
-    pub trace: crate::usage::RoutingTrace,
 }
 impl Budget {
     pub fn new(seconds: u64) -> Self {
         Self {
             remaining: Duration::from_secs(seconds),
-            trace: Default::default(),
         }
     }
 }
@@ -132,19 +130,6 @@ impl Scheduler {
                 if matching.is_empty() {
                     break Err(Rejected::Unavailable);
                 }
-                for r in &matching {
-                    if !requirement.allows(s.models.get(&r.provider.id).and_then(|m| m.as_deref()))
-                    {
-                        budget.trace.push(
-                            &r.provider.id,
-                            &r.provider.name,
-                            "model",
-                            s.active.get(&r.provider.id).copied().unwrap_or(0),
-                            s.limits[&r.provider.id],
-                            0,
-                        );
-                    }
-                }
                 let matching: Vec<_> = matching
                     .into_iter()
                     .filter(|r| {
@@ -187,28 +172,13 @@ impl Scheduler {
                                     )
                                 })
                             });
-                        if let Some((reason, health)) = blocked {
+                        if let Some((_, health)) = blocked {
                             retry_in = retry_in.min(health.retry_in.max(1));
-                            budget.trace.push(
-                                id,
-                                &route.provider.name,
-                                reason,
-                                active,
-                                limit,
-                                health.retry_in,
-                            );
+
                             continue;
                         }
                         any_ready = true;
                         if limit != 0 && active >= limit as usize {
-                            budget.trace.push(
-                                id,
-                                &route.provider.name,
-                                "capacity",
-                                active,
-                                limit,
-                                0,
-                            );
                             continue;
                         }
                         // A waiter pinned to another provider never blocks this provider.
@@ -217,9 +187,6 @@ impl Scheduler {
                             .take_while(|(id, _)| Some(*id) != ticket)
                             .any(|(_, ids)| ids.contains(id))
                         {
-                            budget
-                                .trace
-                                .push(id, &route.provider.name, "fifo", active, limit, 0);
                             continue;
                         }
                         // Capacity cannot change under this lock, but a higher-priority
@@ -246,14 +213,6 @@ impl Scheduler {
                             continue 'selection;
                         }
                         if let Some(permits) = Permits::acquire(route, manual) {
-                            budget.trace.push(
-                                id,
-                                &route.provider.name,
-                                "selected",
-                                active + 1,
-                                limit,
-                                0,
-                            );
                             *s.active.entry(id.clone()).or_default() += 1;
                             accepted = Some(Admission {
                                 route: (**route).clone(),
@@ -265,14 +224,7 @@ impl Scheduler {
                             });
                             break;
                         }
-                        budget.trace.push(
-                            id,
-                            &route.provider.name,
-                            "state_changed",
-                            active,
-                            limit,
-                            0,
-                        );
+
                         if retry_selection {
                             retry_selection = false;
                             any_ready = false;

@@ -9,7 +9,6 @@ import {
 import {
   ArrowLeftRight,
   Network,
-  ChartNoAxesCombined,
   Shield,
   Users,
   FileCode2,
@@ -17,7 +16,6 @@ import {
   Search,
   Plus,
   Check,
-  ArrowUpRight,
   KeyRound,
   UserRound,
   MoreHorizontal,
@@ -40,6 +38,8 @@ import { command, subscribe, preview } from "./bridge";
 import AuthSyncNotice from "./AuthSyncNotice";
 import StartupSettings from "./StartupSettings";
 import PowerSettings from "./PowerSettings";
+import LinkSettings from "./LinkSettings";
+import ProviderImports from "./ProviderImports";
 import {
   errorOf,
   type Account,
@@ -47,7 +47,6 @@ import {
   type Preferences,
   type LoginState,
 } from "./types";
-const Usage=lazy(()=>import("./Usage"));
 const Gateway = lazy(() => import("./Gateway"));
 const ConfigEditor = lazy(() => import("./ConfigEditor"));
 type Dialog =
@@ -64,7 +63,7 @@ const emptyLogin: LoginState = {
 };
 export default function App() {
   const [state, setState] = useState<ViewState | null>(null),
-    [page, setPage] = useState<"accounts" | "config" | "gateway" | "proxies" | "usage">(
+    [page, setPage] = useState<"accounts" | "config" | "gateway" | "proxies">(
       "accounts",
     ),
     [search, setSearch] = useState(""),
@@ -80,6 +79,10 @@ export default function App() {
   const dirtyRef = useRef(false),
     pageRef = useRef(page);
   const gatewayDirty = useRef(false);
+  const [focusProvider, setFocusProvider] = useState<{
+    id: string;
+    sequence: number;
+  } | null>(null);
   const gatewayDraftChanged = useCallback((value: boolean) => {
     gatewayDirty.current = value;
   }, []);
@@ -87,7 +90,7 @@ export default function App() {
   pageRef.current = page;
   const notify = useCallback((s: string) => setMessage(s), []);
   const navigate = useCallback(
-    (next: "accounts" | "config" | "gateway" | "proxies" | "usage") => {
+    (next: "accounts" | "config" | "gateway" | "proxies") => {
       if (next === pageRef.current) return;
       if (
         gatewayDirty.current &&
@@ -106,6 +109,30 @@ export default function App() {
     },
     [],
   );
+  useEffect(() => {
+    const menus = () =>
+      document.querySelectorAll<HTMLDetailsElement>(
+        ".row-menu[open], .account-menu[open]",
+      );
+    const key = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || document.querySelector("dialog[open]"))
+        return;
+      for (const menu of menus()) {
+        menu.open = false;
+        menu.querySelector<HTMLElement>("summary")?.focus();
+      }
+    };
+    const outside = (event: PointerEvent) => {
+      for (const menu of menus())
+        if (!menu.contains(event.target as Node)) menu.open = false;
+    };
+    document.addEventListener("keydown", key);
+    document.addEventListener("pointerdown", outside);
+    return () => {
+      document.removeEventListener("keydown", key);
+      document.removeEventListener("pointerdown", outside);
+    };
+  }, []);
   useEffect(() => {
     let disposed = false;
     const cleaners: (() => void)[] = [];
@@ -142,10 +169,23 @@ export default function App() {
                 setDialog("settings");
               })()
             : navigate(
-                p === "config" || p === "gateway" || p === "proxies" || p === "usage"
+                p === "config" || p === "gateway" || p === "proxies"
                   ? p
                   : "accounts",
               ),
+      ],
+      [
+        "provider-settings",
+        (p) => {
+          if (
+            (gatewayDirty.current || dirtyRef.current) &&
+            !window.confirm("打开供应商设置会丢弃未保存的草稿，是否继续？")
+          )
+            return;
+          setPage("gateway");
+          setDirty(false);
+          setFocusProvider({ id: String(p), sequence: Date.now() });
+        },
       ],
       ["login-state", (p) => setLogin(p as LoginState)],
     ];
@@ -243,12 +283,11 @@ export default function App() {
             <Shield size={17} />
             代理设置
           </button>
-          <button className={page==="usage"?"nav-item active":"nav-item"} onClick={()=>navigate("usage")}><ChartNoAxesCombined size={17}/>统计</button>
         </nav>
         <div className="sidebar-bottom">
           <button className="nav-item" onClick={() => setDialog("settings")}>
             <Settings size={17} />
-            设置<span className="version">v0.6.2</span>
+            设置<span className="version">v0.7.0</span>
           </button>
         </div>
       </aside>
@@ -297,41 +336,6 @@ export default function App() {
                 添加账号
               </button>
             </div>
-            <div className="source-strip">
-              <div className="source-symbol">
-                <Terminal size={18} />
-              </div>
-              <div className="source-detail">
-                <strong>当前认证来源</strong>
-                {state?.authSource.warning && (
-                  <details className="auth-help">
-                    <summary>独立认证设置</summary>
-                    <p>{state.authSource.warning}</p>
-                  </details>
-                )}
-                <div className="source-values">
-                  <span>{state?.authSource.provider ?? "—"}</span>
-                  <span>
-                    {state?.authSource.credentialStore === "file"
-                      ? "auth.json"
-                      : (state?.authSource.credentialStore ?? "—")}
-                  </span>
-                  {state?.authSource.inlineToken && (
-                    <span>独立 bearer token</span>
-                  )}
-                  {state?.authSource.envKey && <span>环境变量凭据</span>}
-                  {state?.authSource.commandAuth && <span>命令获取凭据</span>}
-                </div>
-              </div>
-              <button
-                className="text-button"
-                onClick={() => navigate("config")}
-              >
-                查看配置
-                <ArrowUpRight size={14} />
-              </button>
-            </div>
-
             {(state?.currentState === "unsaved" ||
               state?.currentState === "missing" ||
               state?.currentState === "invalid") && (
@@ -484,9 +488,10 @@ export default function App() {
               )}
             </div>
           </section>
-        ) : page === "usage" ? <Suspense fallback={<div className="empty">正在打开统计…</div>}><Usage onDirtyChange={gatewayDraftChanged}/></Suspense> : page === "gateway" || page === "proxies" ? (
+        ) : page === "gateway" || page === "proxies" ? (
           <Suspense fallback={<div className="empty">正在打开网关…</div>}>
             <Gateway
+              focusProvider={focusProvider}
               section={page}
               notify={notify}
               onDirtyChange={gatewayDraftChanged}
@@ -519,6 +524,7 @@ export default function App() {
           </button>
         </div>
       )}
+      <ProviderImports notify={notify} blocked={dirty} />
       {dialog && state && (
         <Modal
           title={
@@ -923,6 +929,7 @@ function SettingsForm({
       </div>
       <StartupSettings />
       <PowerSettings />
+      <LinkSettings />
       {error && (
         <p className="form-error" role="alert">
           {error}

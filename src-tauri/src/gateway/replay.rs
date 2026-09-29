@@ -31,8 +31,6 @@ pub struct RequestHints {
     pub previous_response_id: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
-    pub service_tier: Option<String>,
-    #[serde(default)]
     pub stream: bool,
 }
 pub struct Replay {
@@ -116,19 +114,6 @@ impl Replay {
             }
         };
         body
-    }
-    pub async fn observe_usage(&self, span: &mut crate::usage::Span) {
-        let mut body = self.body();
-        let mut count = 0usize;
-        while let Some(Ok(frame)) = body.frame().await {
-            if let Some(data) = frame.data_ref() {
-                span.feed(data);
-                count += data.len();
-                if count >= 8 * 1024 * 1024 {
-                    break;
-                }
-            }
-        }
     }
     pub async fn inspect(
         &self,

@@ -1,103 +1,11 @@
 use crate::{
-    power, pricing, process_control,
+    power, process_control,
     storage::{AppError, Result},
-    usage, Runtime,
+    Runtime,
 };
-use std::{
-    collections::BTreeSet,
-    sync::{atomic::Ordering, Arc},
-};
+use std::sync::{atomic::Ordering, Arc};
 use tauri::Emitter;
 type R<'a> = tauri::State<'a, Arc<Runtime>>;
-#[tauri::command]
-pub fn get_usage_state(r: R<'_>) -> usage::State {
-    r.gateway.usage().state()
-}
-#[tauri::command]
-pub fn set_usage_settings(
-    r: R<'_>,
-    settings: usage::Settings,
-    expected_revision: String,
-) -> Result<usage::State> {
-    r.gateway.usage().configure(settings, &expected_revision)
-}
-#[tauri::command]
-pub async fn get_usage_dashboard(r: R<'_>, filters: usage::Filters) -> Result<usage::Dashboard> {
-    let svc = r.gateway.usage();
-    tauri::async_runtime::spawn_blocking(move || svc.dashboard(filters))
-        .await
-        .map_err(|_| AppError::new("USAGE", "统计查询失败"))?
-}
-#[tauri::command]
-pub async fn get_usage_logs(
-    r: R<'_>,
-    filters: usage::Filters,
-    page: u32,
-) -> Result<usage::LogPage> {
-    let svc = r.gateway.usage();
-    tauri::async_runtime::spawn_blocking(move || svc.logs(filters, page))
-        .await
-        .map_err(|_| AppError::new("USAGE", "日志查询失败"))?
-}
-#[tauri::command]
-pub async fn get_usage_detail(r: R<'_>, id: String) -> Result<Option<usage::LogicalDetail>> {
-    let svc = r.gateway.usage();
-    tauri::async_runtime::spawn_blocking(move || svc.detail(&id))
-        .await
-        .map_err(|_| AppError::new("USAGE", "详情查询失败"))?
-}
-#[tauri::command]
-pub fn get_pricing(r: R<'_>) -> pricing::View {
-    r.gateway.usage().prices().view()
-}
-#[tauri::command]
-pub async fn update_pricing(
-    r: R<'_>,
-    edit: pricing::Edit,
-    expected_revision: String,
-) -> Result<pricing::View> {
-    let svc = r.gateway.usage();
-    tauri::async_runtime::spawn_blocking(move || {
-        let v = svc.prices().edit(edit, &expected_revision)?;
-        svc.backfill();
-        Ok(v)
-    })
-    .await
-    .map_err(|_| AppError::new("PRICING", "定价更新失败"))?
-}
-#[tauri::command]
-pub async fn sync_pricing(r: R<'_>) -> Result<pricing::View> {
-    let svc = r.gateway.usage();
-    let v = svc.prices().sync(true).await?;
-    svc.backfill();
-    Ok(v)
-}
-#[tauri::command]
-pub async fn list_models_dev(r: R<'_>, force: bool) -> Result<Vec<pricing::RemoteModel>> {
-    r.gateway.usage().prices().discover(force).await
-}
-#[tauri::command]
-pub async fn import_models_dev(
-    r: R<'_>,
-    keys: BTreeSet<String>,
-    expected_revision: String,
-) -> Result<pricing::View> {
-    let svc = r.gateway.usage();
-    let v = svc.prices().import(keys, &expected_revision).await?;
-    svc.backfill();
-    Ok(v)
-}
-#[tauri::command]
-pub fn reload_pricing(r: R<'_>) -> Result<pricing::View> {
-    let svc = r.gateway.usage();
-    let v = svc.prices().reload()?;
-    svc.backfill();
-    Ok(v)
-}
-#[tauri::command]
-pub fn open_pricing_folder(r: R<'_>) -> Result<()> {
-    r.gateway.usage().prices().open_folder()
-}
 #[tauri::command]
 pub async fn get_clamshell_state(r: R<'_>) -> Result<power::State> {
     let r = r.inner().clone();
@@ -163,5 +71,16 @@ pub async fn force_quit_codex_clients(r: R<'_>) -> Result<process_control::Outco
 }
 #[tauri::command]
 pub fn get_startup_error(r: R<'_>) -> Option<AppError> {
-    r.startup_error.lock().unwrap().clone()
+    r.cleanup_error
+        .lock()
+        .unwrap()
+        .clone()
+        .or_else(|| r.startup_error.lock().unwrap().clone())
+}
+
+#[tauri::command]
+pub fn cleanup_retired_data(r: R<'_>) -> Result<()> {
+    crate::cleanup::retired_statistics(&r.data)?;
+    *r.cleanup_error.lock().unwrap() = None;
+    Ok(())
 }

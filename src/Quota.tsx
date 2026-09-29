@@ -144,10 +144,14 @@ export function QuotaInfo({
   provider,
   quota,
   refresh,
+  compact = false,
+  details,
 }: {
   provider: Provider;
   quota?: ProviderQuota;
   refresh: () => void;
+  compact?: boolean;
+  details?: () => void;
 }) {
   const loading = quota?.state === "loading";
   const stale =
@@ -174,6 +178,37 @@ export function QuotaInfo({
     : quota?.expiresAt
       ? date(quota.expiresAt)
       : "";
+  if (compact)
+    return (
+      <div className="quota-compact" aria-label={`${provider.name} 额度`}>
+        {details ? (
+          <button className="quota-value" onClick={details}>
+            {headline}
+          </button>
+        ) : (
+          <span className="quota-value">{headline}</span>
+        )}
+        {stale && <span className="quota-warning">已过期</span>}
+        {quota?.error &&
+          quota.state !== "unsupported" &&
+          quota.plans.length > 0 && (
+            <button className="quota-warning text-button" onClick={details}>
+              查询失败
+            </button>
+          )}
+        <button
+          className="icon-button"
+          disabled={
+            loading ||
+            Boolean(quota?.retryAt && quota.retryAt > Date.now() / 1000)
+          }
+          onClick={refresh}
+          aria-label={`刷新 ${provider.name} 额度`}
+        >
+          <RefreshCw size={13} className={loading ? "quota-spin" : ""} />
+        </button>
+      </div>
+    );
   return (
     <div className="quota-area" aria-label={`${provider.name} 额度`}>
       <div className="quota-summary">

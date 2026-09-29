@@ -39,9 +39,11 @@ import App from "./App";
 import { gatewayDemo } from "./gateway-preview";
 let state: ViewState;
 let doc: ConfigDocument;
+let pendingImports: { id: string; name: string; baseUrl: string }[];
 beforeEach(() => {
   mocks.listeners.clear();
   mocks.command.mockReset();
+  pendingImports = [];
   state = {
     accounts: [
       {
@@ -84,6 +86,8 @@ beforeEach(() => {
   mocks.command.mockImplementation(
     async (name: string, args: Record<string, unknown>) => {
       switch (name) {
+        case "get_provider_imports":
+          return structuredClone(pendingImports);
         case "get_gateway":
           return structuredClone(gatewayDemo);
         case "get_state":
@@ -136,7 +140,7 @@ describe("user workflows", () => {
     render(<App />);
     await screen.findByRole("heading", { name: "账号", level: 1 });
     await u.click(screen.getByRole("button", { name: "网关" }));
-    await u.click(await screen.findByRole("button", { name: "添加供应商" }));
+    await u.click(await screen.findByRole("button", { name: "添加" }));
     await u.type(
       screen.getByLabelText("base_url"),
       "https://draft.example.invalid/v1",
@@ -169,9 +173,52 @@ describe("user workflows", () => {
       screen.queryByLabelText("experimental_bearer_token"),
     ).not.toBeInTheDocument();
     await u.click(screen.getByRole("button", { name: "网关" }));
-    await u.click(await screen.findByRole("button", { name: "添加供应商" }));
+    await u.click(await screen.findByRole("button", { name: "添加" }));
     expect(screen.getByLabelText("experimental_bearer_token")).toHaveValue("");
     confirm.mockRestore();
+  });
+  it("queues a provider import behind the active API draft without replacing it", async () => {
+    const u = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "账号", level: 1 });
+    await u.click(screen.getByRole("button", { name: "网关" }));
+    await u.click(await screen.findByRole("button", { name: "添加" }));
+    await u.type(
+      screen.getByLabelText("base_url"),
+      "https://draft.example.invalid/v1",
+    );
+    await u.type(
+      screen.getByLabelText("experimental_bearer_token"),
+      "draft-fixture-key",
+    );
+    pendingImports = [
+      {
+        id: "queued-import",
+        name: "链接供应商",
+        baseUrl: "https://import.example.invalid/v1",
+      },
+    ];
+    await act(async () => mocks.listeners.get("provider-imports")?.(null));
+    expect(screen.getByLabelText("base_url")).toHaveValue(
+      "https://draft.example.invalid/v1",
+    );
+    expect(screen.getByLabelText("experimental_bearer_token")).toHaveValue(
+      "draft-fixture-key",
+    );
+    expect(
+      screen.queryByRole("heading", { name: "导入供应商" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    await u.click(screen.getByRole("button", { name: "取消" }));
+    expect(
+      await screen.findByRole("heading", { name: "导入供应商" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("链接供应商")).toBeInTheDocument();
+    expect(
+      mocks.command.mock.calls.some(
+        ([name]) => name === "confirm_provider_import",
+      ),
+    ).toBe(false);
   });
   it("preserves Windows CRLF when the editor changes content", async () => {
     doc.text = '# keep\r\nmodel = "original"\r\n';
@@ -189,6 +236,39 @@ describe("user workflows", () => {
         expectedRevision: "cfg-1",
       }),
     );
+  });
+  it("defers queued imports until an unsaved configuration draft is saved", async () => {
+    const u = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "账号", level: 1 });
+    await u.click(screen.getByRole("button", { name: "配置" }));
+    const editor = await screen.findByLabelText("TOML 编辑器");
+    const draft = '# keep\nmodel = "unsaved-model"\n';
+    fireEvent.change(editor, { target: { value: draft } });
+    pendingImports = [
+      {
+        id: "config-import",
+        name: "等待草稿的供应商",
+        baseUrl: "https://queued.example.invalid/v1",
+      },
+    ];
+    await act(async () => mocks.listeners.get("provider-imports")?.(null));
+    expect(editor).toHaveValue(draft);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await u.click(screen.getByRole("button", { name: /保存/ }));
+    expect(
+      await screen.findByRole("heading", { name: "导入供应商" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("等待草稿的供应商")).toBeInTheDocument();
+    expect(mocks.command).toHaveBeenCalledWith("save_config", {
+      text: draft,
+      expectedRevision: "cfg-1",
+    });
+    expect(
+      mocks.command.mock.calls.some(
+        ([name]) => name === "confirm_provider_import",
+      ),
+    ).toBe(false);
   });
   it("switches through the native command without saving config", async () => {
     const u = userEvent.setup();

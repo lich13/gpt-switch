@@ -73,7 +73,6 @@ export const gatewayDemo: GatewayState = {
   ],
   activeConnections: 0,
   waitingRequests: 0,
-  recent: [],
   error: null,
   recoveryPending: false,
 };
@@ -134,6 +133,11 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
         s.configState = "provider";
         s.configProvider = id;
       }
+    }
+    if (e.op === "configureProvider" && p) {
+      p.maxConcurrency = Number(e.maxConcurrency);
+      p.proxyId = e.proxyId as string | null;
+      p.queued = !!e.queued;
     }
     if (e.op === "queueProvider" && p) p.queued = Boolean(e.queued);
     if (e.op === "concurrencyProvider" && p)

@@ -37,15 +37,9 @@ pub async fn serve(
         }
     }
 }
-#[derive(Clone)]
-struct LocalError(String);
-#[derive(Clone)]
-struct DeferredUsage;
 pub(super) fn error(status: StatusCode, code: &str, message: &str) -> Response<WireBody> {
-    let mut response=Response::builder().status(status).header(header::CONTENT_TYPE,"application/json")
-        .body(replay::full(serde_json::to_vec(&serde_json::json!({"error":{"type":"gpt_switch_gateway","code":code,"message":message}})).unwrap())).unwrap();
-    response.extensions_mut().insert(LocalError(code.into()));
-    response
+    Response::builder().status(status).header(header::CONTENT_TYPE,"application/json")
+        .body(replay::full(serde_json::to_vec(&serde_json::json!({"error":{"type":"gpt_switch_gateway","code":code,"message":message}})).unwrap())).unwrap()
 }
 pub(super) fn target(base: &str, incoming: &Uri) -> Result<Uri, BoxError> {
     let path = incoming.path();
@@ -127,104 +121,7 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
             .fold(0u8, |v, (a, b)| v | (a ^ b))
             == 0
 }
-struct Observe {
-    buffer: Vec<u8>,
-    stream: bool,
-    gateway: Gateway,
-    provider: String,
-    overflow: bool,
-    model: Option<String>,
-}
-impl Observe {
-    fn new(stream: bool, gateway: Gateway, provider: String, model: Option<String>) -> Self {
-        Self {
-            buffer: vec![],
-            stream,
-            gateway,
-            provider,
-            overflow: false,
-            model,
-        }
-    }
-    fn parse(&self, bytes: &[u8]) {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
-            for id in [v.get("id"), v.pointer("/response/id"), v.get("response_id")]
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.as_str())
-            {
-                if !id.is_empty() && id.len() <= 1024 {
-                    self.gateway
-                        .remember_model(id, &self.provider, self.model.as_deref());
-                }
-            }
-        }
-    }
-    fn feed(&mut self, bytes: &[u8]) {
-        if !self.stream {
-            if !self.overflow && self.buffer.len() + bytes.len() <= 2 * 1024 * 1024 {
-                self.buffer.extend_from_slice(bytes);
-            } else {
-                self.overflow = true;
-                self.buffer.clear();
-            }
-            return;
-        }
-        for segment in bytes.split_inclusive(|b| *b == b'\n') {
-            if self.buffer.len() + segment.len() <= 256 * 1024 && !self.overflow {
-                self.buffer.extend_from_slice(segment);
-            } else {
-                self.overflow = true;
-                self.buffer.clear();
-            }
-            if segment.ends_with(b"\n") {
-                if !self.overflow {
-                    if let Some(data) = self.buffer.strip_prefix(b"data:") {
-                        self.parse(data);
-                    }
-                }
-                self.buffer.clear();
-                self.overflow = false;
-            }
-        }
-    }
-    fn finish(&self) {
-        if !self.stream && !self.overflow {
-            self.parse(&self.buffer);
-        }
-    }
-}
-async fn forward(gateway: Gateway, request: Request<Incoming>) -> Response<WireBody> {
-    let logical_id = uuid::Uuid::new_v4().to_string();
-    let response_ws = request
-        .headers()
-        .get(header::UPGRADE)
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
-        && matches!(
-            request.uri().path().trim_end_matches('/'),
-            "/responses" | "/v1/responses"
-        );
-    let logical = gateway.0.usage.logical(&logical_id, !response_ws);
-    let response = forward_inner(gateway.clone(), request, logical.clone()).await;
-    if let Some(error) = response.extensions().get::<LocalError>() {
-        if response_ws {
-            gateway
-                .0
-                .usage
-                .rejected(&logical_id, response.status().as_u16(), &error.0, None);
-        }
-        logical.reject(response.status().as_u16(), &error.0);
-    } else if response.extensions().get::<DeferredUsage>().is_none() {
-        logical.finish_last(response.status().as_u16());
-    }
-    response
-}
-async fn forward_inner(
-    gateway: Gateway,
-    mut request: Request<Incoming>,
-    logical: crate::usage::LogicalSpan,
-) -> Response<WireBody> {
-    let logical_id = logical.id();
+async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<WireBody> {
     let began = Instant::now();
     let (settings, mode, mut ids, token, running) = {
         let s = gateway.0.inner.lock().unwrap();
@@ -333,7 +230,6 @@ async fn forward_inner(
             .get(header::ACCEPT)
             .is_some_and(|h| h.as_bytes().windows(17).any(|w| w == b"text/event-stream"));
     let mut model = hints.as_ref().ok().and_then(|h| h.model.clone());
-    let service_tier = hints.as_ref().ok().and_then(|h| h.service_tier.clone());
     let pinned = match hints {
         Ok(hints) if hints.previous_response_id.is_some() => {
             let previous = hints.previous_response_id.unwrap();
@@ -366,12 +262,10 @@ async fn forward_inner(
     } else {
         Requirement::model(model.as_deref())
     };
-    logical.model(model.as_deref());
     let mut last = None;
     let mut attempted = 0usize;
     let mut last_category = "NO_PROVIDER";
     let mut wait_budget = Budget::new(settings.queue_seconds);
-    wait_budget.trace = logical.trace();
     while !ids.is_empty() && attempted <= settings.max_retries && (!pinned || attempted == 0) {
         let candidates: Vec<_> = ids
             .iter()
@@ -459,19 +353,9 @@ async fn forward_inner(
         } else {
             upstream.headers_mut().remove(header::CONTENT_LENGTH);
         }
-        let attempt = attempted;
         attempted += 1;
         let started = Instant::now();
-        let mut usage = gateway.0.usage.begin(
-            &logical_id,
-            attempt,
-            &route.provider.id,
-            &route.provider.name,
-            model.as_deref(),
-            service_tier.as_deref(),
-            stream_hint,
-        );
-        usage.attach(&logical, &wait_budget.trace);
+        let mut protocol = super::protocol::Protocol::new(stream_hint);
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(if stream_hint {
                 settings.first_byte_seconds
@@ -486,15 +370,15 @@ async fn forward_inner(
                 let proxy_failure = category.is_some_and(|e| e.is_proxy());
                 last_category = if proxy_failure { "PROXY" } else { "NETWORK" };
                 permits.failure(&settings, proxy_failure, None);
-                gateway.record(&route, None, started, attempt, last_category);
-                usage.finish(None, last_category);
+
+                protocol.finish(None, last_category);
                 continue;
             }
             Err(_) => {
                 last_category = "FIRST_BYTE_TIMEOUT";
                 permits.failure(&settings, false, None);
-                gateway.record(&route, None, started, attempt, last_category);
-                usage.finish(None, last_category);
+
+                protocol.finish(None, last_category);
                 continue;
             }
         };
@@ -510,9 +394,8 @@ async fn forward_inner(
             .get(header::CONTENT_ENCODING)
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
-        usage.response(status.as_u16(), response_stream, encoding);
+        protocol.response(status.as_u16(), response_stream, encoding);
         if status == StatusCode::SWITCHING_PROTOCOLS && websocket {
-            usage.final_attempt();
             permits.success(&settings);
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             let (mut response_parts, _) = response.into_parts();
@@ -529,7 +412,7 @@ async fn forward_inner(
                     let result =
                         tokio::io::copy_bidirectional(&mut TokioIo::new(a), &mut TokioIo::new(b))
                             .await;
-                    usage.finish(
+                    protocol.finish(
                         Some(101),
                         if result.is_ok() {
                             "OK"
@@ -537,26 +420,13 @@ async fn forward_inner(
                             "STREAM_INTERRUPTED"
                         },
                     );
-                    if usage.outcome_class() == "success" {
+                    if protocol.succeeded() {
                         g.successful_response(&route.provider);
                     }
                     permits.neutral(&cfg);
-                    g.record(
-                        &route,
-                        Some(101),
-                        began,
-                        attempt,
-                        if result.is_ok() {
-                            "WEBSOCKET"
-                        } else {
-                            "CLOSED"
-                        },
-                    );
                 }
             });
-            let mut response = Response::from_parts(response_parts, replay::empty());
-            response.extensions_mut().insert(DeferredUsage);
-            return response;
+            return Response::from_parts(response_parts, replay::empty());
         }
         if circuit::retryable(status.as_u16()) {
             let cooldown = response
@@ -576,13 +446,12 @@ async fn forward_inner(
             } else {
                 permits.failure(&settings, false, cooldown);
             }
-            gateway.record(&route, Some(status.as_u16()), started, attempt, "HTTP");
+
             if let Ok(Ok(body)) = captured {
-                body.observe_usage(&mut usage).await;
-                usage.finish(Some(status.as_u16()), "HTTP");
+                protocol.finish(Some(status.as_u16()), "HTTP");
                 last = Some(Response::from_parts(response_parts, body.body()));
             } else {
-                usage.finish(Some(status.as_u16()), "STREAM_INTERRUPTED");
+                protocol.finish(Some(status.as_u16()), "STREAM_INTERRUPTED");
             }
             last_category = "HTTP";
             continue;
@@ -606,37 +475,24 @@ async fn forward_inner(
             Ok(None) => None,
             _ => {
                 permits.failure(&settings, false, None);
-                gateway.record(
-                    &route,
-                    Some(status.as_u16()),
-                    started,
-                    attempt,
-                    "FIRST_BYTE_TIMEOUT",
-                );
+
                 last_category = "FIRST_BYTE_TIMEOUT";
-                usage.finish(Some(status.as_u16()), last_category);
+                protocol.finish(Some(status.as_u16()), last_category);
                 continue;
             }
         };
         let total_deadline = tokio::time::Instant::now()
             + Duration::from_secs(settings.total_seconds).saturating_sub(began.elapsed());
-        let mut observe = Observe::new(
-            stream,
-            gateway.clone(),
-            route.provider.id.clone(),
-            model.clone(),
-        );
         let g = gateway.clone();
         let cfg = settings.clone();
         let neutral = status.as_u16() >= 400;
-        usage.final_attempt();
         let output = async_stream::try_stream! {
             let _active=active;
             let _slot=slot;
             if let Some(frame)=first {
-                if let Some(data)=frame.data_ref(){observe.feed(data);usage.feed(data);settle_usage(&mut usage,&mut permits,&cfg);}
+                if let Some(data)=frame.data_ref(){protocol.feed(data);remember(&protocol,&g,&route,model.as_deref());settle_protocol(&protocol,&mut permits,&cfg);}
                 let complete=body.is_end_stream();
-                if complete {observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});settle_usage(&mut usage,&mut permits,&cfg);if usage.outcome_class()=="success" { g.successful_response(&route.provider); } g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
+                if complete {protocol.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});remember(&protocol,&g,&route,model.as_deref());settle_protocol(&protocol,&mut permits,&cfg);if protocol.succeeded() { g.successful_response(&route.provider); } }
                 yield frame;
                 if complete {return;}
             }
@@ -644,27 +500,24 @@ async fn forward_inner(
                 let limit=if stream {tokio::time::Instant::now()+Duration::from_secs(cfg.idle_seconds)}else{total_deadline};
                 match tokio::time::timeout_at(limit,body.frame()).await {
                     Ok(Some(Ok(frame)))=>{
-                        if let Some(data)=frame.data_ref(){observe.feed(data);usage.feed(data);settle_usage(&mut usage,&mut permits,&cfg);}
+                        if let Some(data)=frame.data_ref(){protocol.feed(data);remember(&protocol,&g,&route,model.as_deref());settle_protocol(&protocol,&mut permits,&cfg);}
                         let complete=body.is_end_stream();
-                        if complete {observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});settle_usage(&mut usage,&mut permits,&cfg);if usage.outcome_class()=="success" { g.successful_response(&route.provider); } g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
+                        if complete {protocol.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});remember(&protocol,&g,&route,model.as_deref());settle_protocol(&protocol,&mut permits,&cfg);if protocol.succeeded() { g.successful_response(&route.provider); } }
                         yield frame;
                         if complete {break;}
                     }
-                    Ok(None)=>{observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});settle_usage(&mut usage,&mut permits,&cfg);if usage.outcome_class()=="success" { g.successful_response(&route.provider); }
-                        g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});break;}
+                    Ok(None)=>{protocol.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});remember(&protocol,&g,&route,model.as_deref());settle_protocol(&protocol,&mut permits,&cfg);if protocol.succeeded() { g.successful_response(&route.provider); }
+                        break;}
                     result=>{
                         let category=if result.is_err(){"STREAM_TIMEOUT"}else{"STREAM_INTERRUPTED"};
-                        usage.finish(Some(status.as_u16()),category);
-                        settle_usage(&mut usage,&mut permits,&cfg);g.record(&route,Some(status.as_u16()),began,attempt,category);
+                        protocol.finish(Some(status.as_u16()),category);
+                        settle_protocol(&protocol,&mut permits,&cfg);
                         Err::<(),BoxError>(std::io::Error::other("上游流中断").into())?;
                     }
                 }
             }
         };
-        let mut response =
-            Response::from_parts(response_parts, StreamBody::new(output).boxed_unsync());
-        response.extensions_mut().insert(DeferredUsage);
-        return response;
+        return Response::from_parts(response_parts, StreamBody::new(output).boxed_unsync());
     }
     last.unwrap_or_else(|| {
         error(
@@ -682,18 +535,26 @@ async fn forward_inner(
         )
     })
 }
-pub(super) fn settle_usage(usage: &mut crate::usage::Span, permits: &mut Permits, cfg: &Settings) {
-    use crate::usage::parser::Terminal;
-    match usage.terminal() {
+fn remember(protocol: &super::protocol::Protocol, g: &Gateway, route: &Route, model: Option<&str>) {
+    if let Some(id) = &protocol.observation.response_id {
+        g.remember_model(
+            id,
+            &route.provider.id,
+            protocol.observation.model.as_deref().or(model),
+        );
+    }
+}
+pub(super) fn settle_protocol(
+    protocol: &super::protocol::Protocol,
+    permits: &mut Permits,
+    cfg: &Settings,
+) {
+    use super::protocol::Terminal;
+    match protocol.terminal() {
         Some(Terminal::Success | Terminal::Limited) => permits.success(cfg),
         Some(Terminal::Failure) => permits.failure(cfg, false, None),
         Some(_) => permits.neutral(cfg),
-        None if usage.finished() => match usage.outcome_class() {
-            "success" => permits.success(cfg),
-            "failure" => permits.failure(cfg, false, None),
-            _ => permits.neutral(cfg),
-        },
-        _ => (),
+        None => (),
     }
 }
 pub(super) struct Permits {

@@ -119,15 +119,6 @@ export type GatewayState = {
   settings: GatewaySettings;
   activeConnections: number;
   waitingRequests: number;
-  recent: {
-    provider: string;
-    proxy: string | null;
-    status: number | null;
-    elapsedMs: number;
-    retries: number;
-    category: string;
-    at: number;
-  }[];
   error: string | null;
   recoveryPending: boolean;
 };

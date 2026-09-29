@@ -337,7 +337,7 @@ async fn completed_http_response_keeps_model_affinity_and_health() {
     .await;
     body(first).await;
     assert_eq!(g.view().providers[0].health.requests, 1);
-    assert_eq!(g.view().recent[0].category, "OK");
+    assert_eq!(g.view().providers[0].health.failures, 0);
     let inherited = request(
         &g,
         "/v1/responses",

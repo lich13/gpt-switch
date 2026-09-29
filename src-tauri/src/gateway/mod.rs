@@ -4,6 +4,9 @@ mod circuit;
 mod connector;
 mod forward;
 mod model;
+mod protocol;
+#[cfg(test)]
+mod protocol_tests;
 mod quota;
 mod replay;
 mod routing;
@@ -21,7 +24,7 @@ use model::{Provider, Proxy, Store};
 use replay::WireBody;
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -59,17 +62,6 @@ pub struct ProxyView {
 }
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Recent {
-    pub provider: String,
-    pub proxy: Option<String>,
-    pub status: Option<u16>,
-    pub elapsed_ms: u64,
-    pub retries: usize,
-    pub category: String,
-    pub at: u64,
-}
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct View {
     pub revision: String,
     pub running: bool,
@@ -86,7 +78,6 @@ pub struct View {
     pub settings: Settings,
     pub active_connections: usize,
     pub waiting_requests: usize,
-    pub recent: Vec<Recent>,
     pub error: Option<String>,
     pub recovery_pending: bool,
 }
@@ -98,7 +89,6 @@ struct Inner {
     listener_task: Option<tokio::task::JoinHandle<()>>,
     error: Option<String>,
     circuits: HashMap<String, Circuit>,
-    recent: VecDeque<Recent>,
     affinity: HashMap<String, (String, Option<String>, Instant)>,
     last_successful: Option<String>,
     home: Option<PathBuf>,
@@ -114,14 +104,12 @@ struct Shared {
     quota: quota::Service,
     catalog: catalog::Service,
     admission: admission::Scheduler,
-    usage: crate::usage::Service,
 }
 #[derive(Clone)]
 pub struct Gateway(Arc<Shared>);
 #[derive(Clone)]
 struct Route {
     provider: Provider,
-    proxy: Option<Proxy>,
     client: HttpClient,
     provider_circuit: Circuit,
     proxy_circuit: Option<Circuit>,
@@ -145,8 +133,6 @@ impl Gateway {
         let (events, _) = broadcast::channel(32);
         let admission = admission::Scheduler::new(events.clone());
         admission.configure(&store.providers, false);
-        let prices = crate::pricing::Service::new(&data)?;
-        let usage = crate::usage::Service::new(&data, prices);
         Ok(Self(Arc::new(Shared {
             inner: Mutex::new(Inner {
                 store,
@@ -156,7 +142,6 @@ impl Gateway {
                 listener_task: None,
                 error,
                 circuits: HashMap::new(),
-                recent: VecDeque::new(),
                 affinity: HashMap::new(),
                 last_successful: None,
                 home: None,
@@ -170,14 +155,10 @@ impl Gateway {
             quota: quota::Service::new(),
             catalog: catalog::Service::new(),
             admission,
-            usage,
         })))
     }
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.0.events.subscribe()
-    }
-    pub fn usage(&self) -> crate::usage::Service {
-        self.0.usage.clone()
     }
     fn changed(&self) {
         let _ = self.0.events.send(());
@@ -261,7 +242,6 @@ impl Gateway {
                 .collect(),
             active_connections: self.0.active.load(Ordering::Relaxed),
             waiting_requests: waiting,
-            recent: s.recent.iter().cloned().collect(),
             error: s.error.clone(),
             recovery_pending: self.0.data.join("gateway-recovery.json").exists(),
         }
@@ -799,7 +779,6 @@ impl Gateway {
             .clone();
         Some(Route {
             provider,
-            proxy,
             client,
             provider_circuit,
             proxy_circuit,
@@ -830,31 +809,6 @@ impl Gateway {
             id.into(),
             (provider.into(), model.map(str::to_owned), Instant::now()),
         );
-    }
-    fn record(
-        &self,
-        route: &Route,
-        status: Option<u16>,
-        began: Instant,
-        retries: usize,
-        category: &str,
-    ) {
-        let mut s = self.0.inner.lock().unwrap();
-        s.recent.push_front(Recent {
-            provider: route.provider.name.clone(),
-            proxy: route.proxy.as_ref().map(|p| p.name.clone()),
-            status,
-            elapsed_ms: began.elapsed().as_millis() as u64,
-            retries,
-            category: category.into(),
-            at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        });
-        s.recent.truncate(40);
-        drop(s);
-        self.changed();
     }
 }
 struct Active(Gateway);

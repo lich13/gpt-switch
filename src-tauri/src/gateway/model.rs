@@ -146,6 +146,18 @@ impl Default for Store {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Edit {
+    #[serde(skip)]
+    ImportLink {
+        base_url: String,
+        token: String,
+        display_name: String,
+    },
+    ConfigureProvider {
+        id: String,
+        max_concurrency: u32,
+        proxy_id: Option<String>,
+        queued: bool,
+    },
     SaveProvider {
         id: Option<String>,
         base_url: String,
@@ -265,6 +277,56 @@ impl Store {
     }
     pub fn edit(&mut self, edit: Edit, running: bool) -> Result<()> {
         match edit {
+            Edit::ImportLink {
+                base_url: raw,
+                token,
+                display_name,
+            } => {
+                let url = base_url(&raw, self.settings.port)?;
+                if self.providers.iter().any(|p| {
+                    p.token == token
+                        && base_url(&p.base_url, self.settings.port).is_ok_and(|u| {
+                            u.as_str().trim_end_matches('/') == url.as_str().trim_end_matches('/')
+                        })
+                }) {
+                    return Err(AppError::new("DUPLICATE", "该供应商已存在"));
+                }
+                let label = name(&display_name)?;
+                let selected = self.selected.clone();
+                self.edit(
+                    Edit::SaveProvider {
+                        id: None,
+                        base_url: raw,
+                        token,
+                    },
+                    running,
+                )?;
+                self.selected = selected;
+                self.providers.last_mut().expect("provider added").name = label;
+            }
+            Edit::ConfigureProvider {
+                id,
+                max_concurrency,
+                proxy_id,
+                queued,
+            } => {
+                if max_concurrency > 100000 {
+                    return Err(AppError::new("CONCURRENCY", "并发上限应为 0–100000"));
+                }
+                if proxy_id
+                    .as_ref()
+                    .is_some_and(|id| !self.proxies.iter().any(|p| &p.id == id))
+                {
+                    return Err(AppError::new("PROXY", "代理不存在"));
+                }
+                let p = self.provider_mut(&id)?;
+                if p.proxy_id != proxy_id {
+                    p.version = uuid::Uuid::new_v4().to_string();
+                }
+                p.proxy_id = proxy_id;
+                p.queued = queued;
+                p.max_concurrency = max_concurrency;
+            }
             Edit::SaveProvider {
                 id,
                 base_url: raw,

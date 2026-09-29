@@ -812,7 +812,12 @@ async fn real_provider_direct_proxy_stream_and_failover() {
         );
         println!("real route={route} SSE=completed bytes={}", bytes.len());
         if route == "failover" {
-            assert_eq!(g.view().recent[0].retries, 1);
+            let view = g.view();
+            let failed = view.providers.iter().find(|p| p.id != provider).unwrap();
+            assert_eq!(failed.health.requests, 1);
+            assert_eq!(failed.health.failures, 1);
+            assert_eq!(view.last_successful.as_deref(), Some(provider.as_str()));
+            assert!(view.providers.iter().all(|p| p.active_requests == 0));
         }
     }
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -1074,7 +1079,12 @@ async fn real_codex_cli_with_isolated_home() {
         String::from_utf8_lossy(&result.stdout).contains("gateway-cli-ok"),
         "CLI completion missing"
     );
-    assert!(g.view().recent.iter().any(|r| r.category == "OK"));
+    let view = g.view();
+    assert!(view.providers[0].health.requests > 0);
+    assert_eq!(
+        view.last_successful.as_deref(),
+        Some(view.providers[0].id.as_str())
+    );
     g.stop().await.unwrap();
     assert_eq!(
         storage::read_optional(&t.path().join("auth.json"))
@@ -1269,7 +1279,9 @@ async fn quota_sub2_priority_singleflight_cache_and_health_isolation() {
     assert_eq!(hits.load(Ordering::Relaxed), 1);
     g.query_quota(&p, false).await.unwrap();
     assert_eq!(hits.load(Ordering::Relaxed), 1);
-    assert!(g.view().recent.is_empty());
+    assert_eq!(g.view().providers[0].health.failures, 0);
+    assert_eq!(g.view().providers[0].active_requests, 0);
+    assert_eq!(g.view().last_successful, None);
     assert_eq!(g.view().providers[0].health.requests, 0);
     assert_eq!(std::fs::read(t.path().join("config.toml")).unwrap(), config);
 }
@@ -1420,7 +1432,11 @@ async fn quota_proxy_dns_auth_and_no_direct_fallback() {
     let result = g.query_quota(&id, true).await.unwrap();
     assert_eq!(result.state, "error");
     assert_eq!(hits.load(Ordering::Relaxed), 1);
-    assert!(g.view().recent.is_empty());
+    let view = g.view();
+    assert_eq!(view.providers[0].health.requests, 0);
+    assert_eq!(view.providers[0].health.failures, 0);
+    assert_eq!(view.proxies[0].health.requests, 0);
+    assert_eq!(view.providers[0].active_requests, 0);
     assert_eq!(g.view().proxies[0].health.failures, 0);
 }
 #[tokio::test]
@@ -1525,7 +1541,11 @@ async fn quota_timeout_does_not_probe_another_protocol() {
     assert_eq!(result.error.as_deref(), Some("额度查询超时"));
     assert!(start.elapsed() < Duration::from_secs(12));
     assert_eq!(hits.load(Ordering::Relaxed), 1);
-    assert!(g.view().recent.is_empty());
+    let view = g.view();
+    assert_eq!(view.providers[0].health.requests, 0);
+    assert_eq!(view.providers[0].health.failures, 0);
+    assert_eq!(view.providers[0].active_requests, 0);
+    assert_eq!(view.waiting_requests, 0);
 }
 
 #[tokio::test]
@@ -1588,7 +1608,13 @@ async fn real_provider_quota_direct_and_tencent_proxy() {
             );
             assert!(!result.plans.is_empty());
             assert_eq!(g.view().providers[0].health.requests, 0);
-            assert!(g.view().recent.is_empty());
+            let view = g.view();
+            assert_eq!(view.providers[0].health.failures, 0);
+            assert_eq!(view.providers[0].active_requests, 0);
+            assert!(view
+                .proxies
+                .iter()
+                .all(|p| p.health.requests == 0 && p.health.failures == 0));
         }
         assert_eq!(std::fs::read(t.path().join("auth.json")).unwrap(), auth);
         assert_eq!(std::fs::read(t.path().join("config.toml")).unwrap(), config);
@@ -1628,3 +1654,6 @@ mod models;
 
 #[path = "v061_tests.rs"]
 mod v061;
+
+#[path = "import_tests.rs"]
+mod imports;

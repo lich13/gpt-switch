@@ -1,4 +1,4 @@
-import {usageCommands,usagePreview} from "./usage-preview";
+import { powerCommands, powerPreview } from "./power-preview";
 import { gatewayPreview } from "./gateway-preview";
 import type { ViewState, ConfigDocument, LoginState } from "./types";
 const callbacks = new Map<string, Set<(p: never) => void>>();
@@ -72,11 +72,32 @@ let startup = {
   revision: "preview-startup",
 };
 let quick = { pinned: false, tab: "providers", visible: true };
+let linkHandler = "com.lich13.studio";
+const linkApps = [
+  {
+    id: "com.lich13.gpt-switch",
+    name: "gpt-Switch",
+    path: "/Applications/gpt-Switch.app",
+  },
+  {
+    id: "com.lich13.studio",
+    name: "lich13studio",
+    path: "/Applications/lich13studio.app",
+  },
+];
 export async function run(
   name: string,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  if (usageCommands.includes(name)) return usagePreview(name,args,emit);
+  if (name === "get_link_handler_state")
+    return { current: linkHandler, apps: linkApps, systemPicker: false };
+  if (name === "set_link_handler") {
+    linkHandler = String(args.appId);
+    return { current: linkHandler, apps: linkApps, systemPicker: false };
+  }
+  if (name === "get_provider_imports") return [];
+  if (name === "cleanup_retired_data") return;
+  if (powerCommands.includes(name)) return powerPreview(name, args, emit);
   if (name === "get_quick") return { ...quick };
   if (name === "set_quick") {
     quick = { ...quick, ...args };
@@ -103,7 +124,7 @@ export async function run(
     startup = {
       ...startup,
       ...(args.preferences as {
-              restoreGateway: boolean;
+        restoreGateway: boolean;
       }),
       launchOnBoot: Boolean(args.enabled),
       revision: crypto.randomUUID(),

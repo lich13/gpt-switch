@@ -1,11 +1,12 @@
+mod cleanup;
 mod commands;
 mod core;
 mod gateway;
+mod links;
 mod login;
 mod power;
 #[cfg(target_os = "macos")]
 mod power_macos;
-mod pricing;
 mod process_control;
 mod quick;
 mod startup;
@@ -14,7 +15,6 @@ mod startup_macos;
 mod storage;
 #[cfg(target_os = "macos")]
 mod tray_macos;
-mod usage;
 use core::{ConfigDocument, Core, Preferences, ViewState};
 use std::{
     path::PathBuf,
@@ -33,6 +33,8 @@ use tauri_plugin_dialog::DialogExt;
 
 struct Runtime {
     core: Mutex<Core>,
+    data: PathBuf,
+    imports: Mutex<links::Imports>,
     gateway: gateway::Gateway,
     login: Mutex<login::Session>,
     quitting: AtomicBool,
@@ -46,6 +48,7 @@ struct Runtime {
     force_quitting: AtomicBool,
     power: power::Service,
     startup_error: Mutex<Option<AppError>>,
+    cleanup_error: Mutex<Option<AppError>>,
 }
 struct SmokeSnapshot {
     home: PathBuf,
@@ -123,14 +126,26 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     Ok(menu)
 }
 #[tauri::command]
-fn open_main(app: tauri::AppHandle, page: Option<String>) -> Result<()> {
+fn open_main(
+    app: tauri::AppHandle,
+    page: Option<String>,
+    provider_id: Option<String>,
+) -> Result<()> {
     if page.as_ref().is_some_and(|p| {
         !["accounts", "config", "gateway", "proxies", "settings"].contains(&p.as_str())
     }) {
         return Err(AppError::new("WINDOW", "无效页面"));
     }
     quick::hide_quick(app.clone())?;
-    show(&app, page.as_deref())
+    if let Some(id) = provider_id {
+        show(&app, None)?;
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.emit("provider-settings", id);
+        }
+        Ok(())
+    } else {
+        show(&app, page.as_deref())
+    }
 }
 fn publish(app: &tauri::AppHandle, state: ViewState) {
     if let Some(tray) = app.tray_by_id("switch") {
@@ -709,18 +724,6 @@ async fn gateway_smoke(r: &Runtime) -> Result<()> {
     .map_err(|_| AppError::new("SMOKE", "网关响应超时"))?
     .map_err(storage::io_error)?;
     r.gateway.stop().await?;
-    let usage = r.gateway.usage();
-    usage.flush();
-    let summary = usage.dashboard(usage::Filters::default())?.summary;
-    if (
-        summary.requests,
-        summary.rejected,
-        summary.failures,
-        summary.attempts,
-    ) != (1, 1, 0, 0)
-    {
-        return Err(AppError::new("SMOKE", "逻辑请求统计或拒绝分类校验失败"));
-    }
     if !response.starts_with(b"HTTP/1.1 401")
         || auth != storage::read_optional(&home.join("auth.json"))?
         || config != storage::read_optional(&home.join("config.toml"))?
@@ -747,6 +750,7 @@ pub fn run() {
         .map(PathBuf::from);
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            links::receive(app, args.iter().cloned());
             if !args.iter().any(|a| a == startup::LOGIN_ARG) {
                 let _ = show(app, None);
             }
@@ -774,14 +778,17 @@ pub fn run() {
                         .map(PathBuf::from)
                         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
                 });
+            let cleanup_error = cleanup::retired_statistics(&data).err();
             let gateway = gateway::Gateway::new(data.clone())?;
             let startup = startup::Service::new(&data);
             let start_silently = smoke.is_none() && startup::silent(&args, &startup.preferences()?);
             app.manage(quick::Panel::new(&data)?);
             let power = power::Service::new(&data);
-            let core = Core::new(data, home)?;
+            let core = Core::new(data.clone(), home)?;
             let runtime = Arc::new(Runtime {
                 core: Mutex::new(core),
+                data,
+                imports: Mutex::new(links::Imports::default()),
                 gateway,
                 login: Mutex::new(Default::default()),
                 quitting: AtomicBool::new(false),
@@ -795,10 +802,12 @@ pub fn run() {
                 frontend_started: AtomicBool::new(false),
                 force_quitting: AtomicBool::new(false),
                 startup_error: Mutex::new(None),
+                cleanup_error: Mutex::new(cleanup_error),
             });
             runtime.gateway.observe_home(&lock(&runtime.core)?.home());
             let state = lock(&runtime.core)?.state()?;
             app.manage(runtime.clone());
+            links::receive(app.handle(), args.iter().cloned());
             quick::Panel::create(app.handle())?;
             #[cfg(target_os = "macos")]
             if start_silently {
@@ -813,33 +822,7 @@ pub fn run() {
                         *r.startup_error.lock().unwrap() = Some(e);
                     }
                 });
-                let svc = runtime.gateway.usage();
-                tauri::async_runtime::spawn(async move {
-                    let mut timer = tokio::time::interval(std::time::Duration::from_secs(60));
-                    loop {
-                        timer.tick().await;
-                        let old = svc.prices().snapshot().version.clone();
-                        let _ = svc.prices().sync(false).await;
-                        if old != svc.prices().snapshot().version {
-                            svc.backfill();
-                        }
-                    }
-                });
             }
-            let mut usage_events = runtime.gateway.usage().subscribe();
-            let usage_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                while usage_events.recv().await.is_ok() {
-                    let _ = usage_app.emit("usage-state", ());
-                }
-            });
-            let mut pricing_events = runtime.gateway.usage().prices().subscribe();
-            let pricing_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                while pricing_events.recv().await.is_ok() {
-                    let _ = pricing_app.emit("pricing-state", ());
-                }
-            });
             let mut quota_events = runtime.gateway.quota_events();
             let quota_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -927,10 +910,10 @@ pub fn run() {
                 .on_menu_event(|app, e| match e.id().as_ref() {
                     "quit" => quit(app, &app.state::<Arc<Runtime>>()),
                     "open" => {
-                        let _ = open_main(app.clone(), None);
+                        let _ = open_main(app.clone(), None, None);
                     }
                     "config" | "gateway" | "settings" => {
-                        let _ = open_main(app.clone(), Some(e.id().as_ref().into()));
+                        let _ = open_main(app.clone(), Some(e.id().as_ref().into()), None);
                     }
                     _ => (),
                 })
@@ -1018,18 +1001,12 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::get_usage_state,
-            commands::set_usage_settings,
-            commands::get_usage_dashboard,
-            commands::get_usage_logs,
-            commands::get_usage_detail,
-            commands::get_pricing,
-            commands::update_pricing,
-            commands::sync_pricing,
-            commands::list_models_dev,
-            commands::import_models_dev,
-            commands::reload_pricing,
-            commands::open_pricing_folder,
+            links::get_link_handler_state,
+            links::set_link_handler,
+            links::get_provider_imports,
+            links::confirm_provider_import,
+            links::cancel_provider_import,
+            commands::cleanup_retired_data,
             commands::get_clamshell_state,
             commands::set_clamshell_awake,
             commands::install_power_helper,
@@ -1072,6 +1049,10 @@ pub fn run() {
         .expect("gpt-Switch initialization failed")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = &event {
+                links::receive(app, urls.iter().map(|url| url.as_str().to_owned()));
+            }
+            #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = &event {
                 if !startup::macos_login_event() {
                     let _ = show(app, None);
@@ -1090,7 +1071,6 @@ pub fn run() {
                 // Serialize restoration with any in-flight takeover before returning to the OS.
                 let restored =
                     tauri::async_runtime::block_on(r.gateway.stop_for_exit()).map(|_| ());
-                r.gateway.usage().flush();
                 if r.smoke.is_some() {
                     let _ = report_exit_smoke(app, &r, restored);
                 }

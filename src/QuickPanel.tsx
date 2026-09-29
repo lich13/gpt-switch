@@ -1,8 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ArrowUpRight, Check, Pin, Power, Search, X } from "lucide-react";
+import {
+  ArrowUpRight,
+  Check,
+  Pin,
+  Power,
+  Search,
+  X,
+  Settings2,
+} from "lucide-react";
 import { command, preview, subscribe } from "./bridge";
 import { errorOf, type GatewayState, type ViewState } from "./types";
 import { QuotaInfo, useProviderQuota } from "./Quota";
+import { providerStatus } from "./provider-status";
 import QuickControls from "./QuickControls";
 import AuthSyncNotice from "./AuthSyncNotice";
 type Preferences = {
@@ -61,7 +70,11 @@ export default function QuickPanel() {
       .catch((e) => {
         if (!disposed) setError(errorOf(e).message);
       });
-    void command<{message:string}|null>("get_startup_error").then(e=>{if(e&&!disposed)setError(e.message);}).catch(()=>{});
+    void command<{ message: string } | null>("get_startup_error")
+      .then((e) => {
+        if (e && !disposed) setError(e.message);
+      })
+      .catch(() => {});
     const media = matchMedia("(prefers-color-scheme: dark)");
     const change = () => setSystemDark(media.matches);
     media.addEventListener("change", change);
@@ -306,40 +319,35 @@ export default function QuickPanel() {
                       </span>
                       <span className="quick-name">
                         <strong title={p.name}>{p.name}</strong>
-                        <span>
-                          {p.health.probeInFlight ? "恢复探测中" : p.health.cooldownReason === "rate_limit" ? `限流冷却 ${p.health.retryIn}s` : p.health.cooldownReason === "retry_after" ? `上游冷却 ${p.health.retryIn}s` : p.health.state === "open"
-                            ? "熔断"
-                            : p.health.state === "half_open"
-                              ? "恢复探测"
-                              : p.health.requests
-                                ? "可用"
-                                : "待请求"}{" "}
-                          · 并发 {p.activeRequests}/{p.maxConcurrency || "不限"}
-                          {p.maxConcurrency > 0 &&
-                          p.activeRequests >= p.maxConcurrency
-                            ? " · 满载"
-                            : ""}
-                        </span>
                       </span>
                       {gateway.mode === "manual" &&
                         gateway.selected === p.id && <Check size={15} />}
                     </button>
-                    <div className="quick-provider-meta">
-                      <span
-                        title={p.allowedModels?.join("\n") ?? "允许所有模型"}
-                      >
-                        {p.allowedModels
-                          ? `模型 ${p.allowedModels.length}${gateway.running ? "" : " · 未生效"}`
-                          : "不限模型"}
+                    <button
+                      className="icon-button quick-provider-settings"
+                      aria-label={`${p.name} 设置`}
+                      onClick={() =>
+                        void command("open_main", {
+                          page: "gateway",
+                          providerId: p.id,
+                        })
+                      }
+                    >
+                      <Settings2 size={14} />
+                    </button>
+                    {providerStatus(
+                      p,
+                      gateway.proxies.find((x) => x.id === p.proxyId),
+                    ) && (
+                      <span className="quick-provider-alert">
+                        {providerStatus(
+                          p,
+                          gateway.proxies.find((x) => x.id === p.proxyId),
+                        )}
                       </span>
-                      <span>
-                        {gateway.proxies.find((x) => x.id === p.proxyId)
-                          ?.name ?? "直连"}
-                      </span>
-                      {gateway.lastSuccessful === p.id &&
-                        gateway.mode === "auto" && <span>最近成功</span>}
-                    </div>
+                    )}
                     <QuotaInfo
+                      compact
                       provider={p}
                       quota={quota.quotaFor(p)}
                       refresh={() => void quota.refresh(p.id)}
@@ -365,14 +373,6 @@ export default function QuickPanel() {
                   busy={busy}
                   apply={(id) => run(() => account(id))}
                 />
-              )}
-              {accounts?.authSource.warning && (
-                <div
-                  className="quick-auth-source"
-                  title={accounts.authSource.warning}
-                >
-                  当前配置使用独立认证
-                </div>
               )}
               {accounts?.accounts
                 .filter((a) =>
@@ -413,7 +413,7 @@ export default function QuickPanel() {
           )}
         </div>
       </div>
-      <QuickControls visible={visible} notify={setNotice} error={setError}/>
+      <QuickControls visible={visible} notify={setNotice} error={setError} />
       <footer className="quick-footer">
         <button onClick={() => open()}>
           打开 gpt-Switch <ArrowUpRight size={12} />
