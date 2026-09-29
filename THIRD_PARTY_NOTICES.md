@@ -49,6 +49,8 @@ https://github.com/lich13/sub2api-ops-companion/tree/4d0eafc1e64385d1cdb6f6bd92e
 
 The compact provider controls and ccswitch://v1/import provider format follow cc-switch at `846de29c13ac4d65f164db8c15dd5fd58e29f972` (MIT). The notice above applies. The native default-handler integration and in-memory import queue are original implementations; no external application is modified.
 
+Provider drag sorting follows cc-switch's `src/hooks/useDragSort.ts` at `a1216b7e359466be98f3c783cc290e7040de26d4` (MIT): @dnd-kit pointer activation at 8px, keyboard sorting and insertion order. The implementation adds shared panel controls, revision checks and cancellation on visibility/configuration changes. The cc-switch notice above applies. @dnd-kit is MIT licensed; its copyright and license are included in `licenses/dnd-kit-MIT.txt` in the repository and application resources.
+
 https://github.com/farion1231/cc-switch/tree/846de29c13ac4d65f164db8c15dd5fd58e29f972
 
 Independent 429 cooldown behavior references Wei-Shaw/sub2api at `9a62841fd124d026cf3694fcf9b79e98addcdbdc`, `backend/internal/service/rate_limit_429_cooldown_test.go` (LGPL-3.0). No Go implementation or tests are copied.

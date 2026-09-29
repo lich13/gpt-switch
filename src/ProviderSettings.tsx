@@ -20,15 +20,10 @@ export default function ProviderSettings({
   onDirtyChange?: (dirty: boolean) => void;
 }) {
   const initialSave = useRef(save);
-  const [limit, setLimit] = useState(provider.maxConcurrency),
-    [proxy, setProxy] = useState(provider.proxyId ?? ""),
-    [queued, setQueued] = useState(provider.queued),
+  const [proxy, setProxy] = useState(provider.proxyId ?? ""),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
-  const dirty =
-    limit !== provider.maxConcurrency ||
-    proxy !== (provider.proxyId ?? "") ||
-    queued !== provider.queued;
+  const dirty = proxy !== (provider.proxyId ?? "");
   useEffect(() => {
     onDirtyChange?.(dirty);
     return () => onDirtyChange?.(false);
@@ -43,28 +38,14 @@ export default function ProviderSettings({
           setError("");
           void initialSave
             .current({
-              op: "configureProvider",
+              op: "routeProvider",
               id: provider.id,
-              maxConcurrency: limit,
               proxyId: proxy || null,
-              queued,
             })
             .catch((e) => setError(errorOf(e).message))
             .finally(() => setBusy(false));
         }}
       >
-        <label>
-          并发上限
-          <input
-            type="number"
-            min={0}
-            max={100000}
-            required
-            value={limit}
-            onChange={(e) => setLimit(Number(e.target.value))}
-          />
-          <span className="input-constraint">0 表示不限</span>
-        </label>
         <label>
           连接方式
           <select value={proxy} onChange={(e) => setProxy(e.target.value)}>
@@ -75,14 +56,6 @@ export default function ProviderSettings({
               </option>
             ))}
           </select>
-        </label>
-        <label className="check-label">
-          <input
-            type="checkbox"
-            checked={queued}
-            onChange={(e) => setQueued(e.target.checked)}
-          />
-          故障转移队列
         </label>
         <button
           type="button"

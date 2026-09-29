@@ -106,3 +106,32 @@ it("can restore a newer saved credential without auto-writing the auth file", as
     expectedRevision: demo.authRevision,
   });
 });
+it("quick concurrency editing keeps drafts during events and consumes Escape before the panel", async () => {
+  const user = userEvent.setup();
+  render(<QuickPanel />);
+  await user.click(
+    await screen.findByRole("button", { name: "api.example.com 并发上限" }),
+  );
+  const input = screen.getByRole("spinbutton");
+  await user.clear(input);
+  await user.type(input, "12");
+  act(() =>
+    mock.listeners.get("gateway-state")!({
+      ...gatewayDemo,
+      activeConnections: 2,
+    }),
+  );
+  expect(input).toHaveValue(12);
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(mock.command.mock.calls.some(([name]) => name === "hide_quick")).toBe(
+    false,
+  );
+  await user.keyboard("{Escape}");
+  expect(mock.command).toHaveBeenCalledWith("hide_quick");
+  expect(
+    mock.command.mock.calls.some(
+      ([name]) => name === "update_gateway" || name === "switch_account",
+    ),
+  ).toBe(false);
+});

@@ -86,11 +86,9 @@ describe("gateway controls", () => {
     await user.click(screen.getByRole("button", { name: "保存" }));
     expect(mock.command).toHaveBeenCalledWith("update_gateway", {
       edit: {
-        op: "configureProvider",
+        op: "routeProvider",
         id: "primary",
         proxyId: "cloud",
-        maxConcurrency: state.providers[0].maxConcurrency,
-        queued: state.providers[0].queued,
       },
       expectedRevision: "new-from-tray",
     });
@@ -134,9 +132,6 @@ describe("gateway controls", () => {
         name: "供应商设置",
       }),
     );
-    const concurrency = screen.getByLabelText(/^并发上限/);
-    await user.clear(concurrency);
-    await user.type(concurrency, "7");
     await user.selectOptions(screen.getByLabelText("连接方式"), "cloud");
     act(() =>
       mock.listeners.get("gateway-state")!({
@@ -148,15 +143,12 @@ describe("gateway controls", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "供应商设置已变化",
     );
-    expect(concurrency).toHaveValue(7);
     expect(screen.getByLabelText("连接方式")).toHaveValue("cloud");
     expect(mock.command).toHaveBeenCalledWith("update_gateway", {
       edit: {
-        op: "configureProvider",
+        op: "routeProvider",
         id: "primary",
-        maxConcurrency: 7,
         proxyId: "cloud",
-        queued: state.providers[0].queued,
       },
       expectedRevision: state.revision,
     });
@@ -252,4 +244,54 @@ it("keeps model choices and manual entries when discovery fails and events refre
     },
     expectedRevision: state.revision,
   });
+});
+
+it("refreshes authoritative configuration after a cap conflict, preserves input and permits explicit retry", async () => {
+  const user = userEvent.setup();
+  let attempts = 0;
+  mock.command.mockImplementation(
+    async (
+      name: string,
+      args?: { edit: { maxConcurrency: number }; expectedRevision: string },
+    ) => {
+      if (name === "get_gateway") return structuredClone(state);
+      if (name === "update_gateway") {
+        if (++attempts === 1) {
+          state.revision = "other-window";
+          state.providers[0].queued = false;
+          throw { code: "CONFLICT", message: "网关设置已变化" };
+        }
+        expect(args!.expectedRevision).toBe("other-window");
+        state.providers[0].maxConcurrency = args!.edit.maxConcurrency;
+        state.revision = "saved";
+        return structuredClone(state);
+      }
+    },
+  );
+  render(<Gateway section="gateway" notify={() => {}} />);
+  await user.click(
+    await screen.findByRole("button", { name: "api.example.com 并发上限" }),
+  );
+  const input = screen.getByRole("spinbutton", { name: "上限（0 不限）" });
+  await user.clear(input);
+  await user.type(input, "12");
+  await user.click(screen.getByRole("button", { name: "保存" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("网关设置已变化");
+  expect(input).toHaveValue(12);
+  expect(
+    screen.getByRole("button", { name: "api.example.com 加入队列" }),
+  ).toHaveAttribute("aria-pressed", "false");
+  await user.click(screen.getByRole("button", { name: "保存" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+  );
+  expect(
+    screen.getByRole("button", { name: "api.example.com 并发上限" }),
+  ).toHaveTextContent("并发 0/12");
+  expect(
+    mock.command.mock.calls
+      .filter(([name]) => name === "update_gateway")
+      .map(([, args]) => args.edit.op),
+  ).toEqual(["concurrencyProvider", "concurrencyProvider"]);
+  expect(state.providers[0].queued).toBe(false);
 });

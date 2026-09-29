@@ -1880,6 +1880,172 @@ select:focus-visible {
   font-size: 12px;
   color: var(--muted);
 }
+
+.sortable-providers {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+}
+.provider-row,
+.quick-provider {
+  position: relative;
+  min-width: 0;
+}
+.is-dragging {
+  z-index: 4;
+  background: var(--elevated);
+  outline: 1px solid var(--accent);
+  box-shadow: 0 6px 18px #0002;
+}
+.provider-drag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
+  width: 20px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: grab;
+  touch-action: none;
+}
+.provider-drag:active {
+  cursor: grabbing;
+}
+.provider-controls {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+}
+.provider-concurrency,
+.provider-queue {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 27px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.provider-concurrency[aria-expanded="true"],
+.provider-queue[aria-pressed="true"] {
+  color: var(--ink);
+  background: var(--elevated);
+}
+.provider-queue[aria-pressed="true"] svg {
+  color: var(--accent);
+}
+.concurrency-popover {
+  position: fixed;
+  z-index: 100;
+  width: 218px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 6px 22px #0003;
+}
+.concurrency-popover label {
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+}
+.concurrency-popover input {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+}
+.concurrency-popover .form-error {
+  margin-top: 8px;
+}
+.concurrency-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.concurrency-actions button {
+  min-height: 28px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.provider-secondary {
+  gap: 12px;
+}
+.provider-secondary .quota-compact {
+  flex-shrink: 0;
+}
+.quick-provider-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.quick-provider-main .quick-select {
+  flex: 1;
+  min-width: 0;
+  width: auto;
+  padding: 0;
+  gap: 6px;
+}
+.quick-provider-main .quick-provider-settings {
+  position: static;
+  flex-shrink: 0;
+}
+.quick-provider-secondary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 5px;
+}
+.quick-provider-secondary .quota-compact {
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+  gap: 4px;
+}
+.quick-provider-secondary .quota-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quick-provider-secondary .quota-compact .icon-button {
+  flex-shrink: 0;
+}
+.quick-provider-secondary .provider-controls {
+  gap: 5px;
+}
+.quick-provider-secondary .provider-concurrency,
+.quick-provider-secondary .provider-queue {
+  padding: 0 5px;
+  font-size: 12px;
+}
+.quick-scroll .sortable-providers {
+  gap: 4px;
+}
+.quick-provider.selected {
+  background: var(--elevated);
+}
+.quick-provider .quick-provider-alert {
+  margin-left: 26px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sortable-providers > article {
+    transition: none !important;
+  }
+}
 .runtime-status summary {
   cursor: pointer;
 }

@@ -207,6 +207,126 @@ async fn dynamic_limits_keep_slots_across_route_edits_and_do_not_oversubscribe()
     g.stop().await.unwrap();
 }
 #[tokio::test]
+async fn panel_edits_preserve_live_slots_files_and_persist_queue_priority() {
+    let a = server(|_| async { Response::new(full("a")) }).await;
+    let b = server(|_| async { Response::new(full("b")) }).await;
+    let c = server(|_| async { Response::new(full("c")) }).await;
+    let (t, g) = fixture(vec![
+        format!("http://127.0.0.1:{a}"),
+        format!("http://127.0.0.1:{b}"),
+        format!("http://127.0.0.1:{c}"),
+    ])
+    .await;
+    let ids: Vec<_> = g.view().providers.iter().map(|p| p.id.clone()).collect();
+    update(
+        &g,
+        &t,
+        Edit::Mode {
+            mode: "auto".into(),
+        },
+    );
+    update(
+        &g,
+        &t,
+        Edit::ModelsProvider {
+            id: ids[2].clone(),
+            allowed_models: Some(vec!["model-c".into()]),
+        },
+    );
+    start(&g, &t).await;
+    let config = std::fs::read(t.path().join("config.toml")).unwrap();
+    let auth = std::fs::read(t.path().join("auth.json")).unwrap();
+    let r = routes(&g);
+    let held1 = slot(&g, &r[..1]).await;
+    let held2 = slot(&g, &r[..1]).await;
+    let stale = g.view().revision;
+    limit(&g, &t, 0, 1);
+    let order = vec![ids[2].clone(), ids[0].clone(), ids[1].clone()];
+    assert_eq!(
+        g.edit(Edit::Reorder { ids: order.clone() }, &stale, t.path())
+            .err()
+            .unwrap()
+            .code,
+        "CONFLICT"
+    );
+    update(&g, &t, Edit::Reorder { ids: order.clone() });
+    update(
+        &g,
+        &t,
+        Edit::RouteProvider {
+            id: ids[0].clone(),
+            proxy_id: None,
+        },
+    );
+    assert_eq!(g.view().providers[1].active_requests, 2);
+    assert_eq!(g.view().providers[1].max_concurrency, 1);
+    assert_eq!(g.view().selected.as_ref(), Some(&ids[0]));
+    assert_eq!(g.view().mode, "auto");
+    drop((held1, held2));
+    for (model, expected) in [("model-a", "a"), ("model-c", "c")] {
+        let response = request(
+            &g,
+            "/v1/responses",
+            format!("{{\"model\":\"{model}\"}}").into_bytes(),
+            vec![("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            expected
+        );
+    }
+    update(
+        &g,
+        &t,
+        Edit::QueueProvider {
+            id: ids[0].clone(),
+            queued: false,
+        },
+    );
+    let response = request(
+        &g,
+        "/v1/responses",
+        br#"{"model":"model-a"}"#.to_vec(),
+        vec![("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "b"
+    );
+    assert_eq!(std::fs::read(t.path().join("config.toml")).unwrap(), config);
+    assert_eq!(std::fs::read(t.path().join("auth.json")).unwrap(), auth);
+    g.stop().await.unwrap();
+    let stopped_config = std::fs::read(t.path().join("config.toml")).unwrap();
+    update(
+        &g,
+        &t,
+        Edit::ConcurrencyProvider {
+            id: ids[0].clone(),
+            max_concurrency: 100000,
+        },
+    );
+    assert_eq!(
+        std::fs::read(t.path().join("config.toml")).unwrap(),
+        stopped_config
+    );
+    drop(g);
+    let restored = Gateway::new(t.path().to_path_buf()).unwrap().view();
+    assert_eq!(
+        restored
+            .providers
+            .iter()
+            .map(|p| p.id.clone())
+            .collect::<Vec<_>>(),
+        order
+    );
+    assert!(!restored.providers[1].queued);
+    assert_eq!(restored.providers[1].max_concurrency, 100000);
+    assert_eq!(restored.selected.as_ref(), Some(&ids[0]));
+    assert_eq!(std::fs::read(t.path().join("auth.json")).unwrap(), auth);
+}
+#[tokio::test]
 async fn capacity_timeout_and_stop_release_waiters_and_never_poison_health() {
     let (t, g) = fixture(vec!["https://a.invalid".into()]).await;
     limit(&g, &t, 0, 1);

@@ -1,4 +1,6 @@
 import ProviderSettings from "./ProviderSettings";
+import ProviderControls from "./ProviderControls";
+import SortableProviders, { type ProviderCommit } from "./SortableProviders";
 import Modal from "./Modal";
 import { providerStatus } from "./provider-status";
 import ModelPolicyDialog from "./ModelPolicyDialog";
@@ -8,8 +10,6 @@ import {
   Plus,
   Power,
   Download,
-  ArrowUp,
-  ArrowDown,
   Pencil,
   Trash2,
   Network,
@@ -105,13 +105,13 @@ export default function Gateway({
       }
     }
   }, [focusProvider, state]);
-  const action = async (fn: () => Promise<void>) => {
+  const action = async (fn: () => Promise<void>, surfaceError = true) => {
     setBusy(true);
     setError("");
     try {
       await fn();
     } catch (e) {
-      setError(errorOf(e).message);
+      if (surfaceError) setError(errorOf(e).message);
       throw e;
     } finally {
       setBusy(false);
@@ -125,21 +125,19 @@ export default function Gateway({
       ...(payload.op === "select" && !state.running
         ? { expectedConfigRevision: state.configRevision }
         : {}),
+    }).catch(async (error) => {
+      await command<GatewayState>("get_gateway")
+        .then(setState)
+        .catch(() => {});
+      throw error;
     });
     setState(next);
   };
   const run = (fn: () => Promise<void>) => {
     void action(fn).catch(() => {});
   };
-  const move = (id: string, direction: number) => {
-    if (!state) return;
-    const ids = state.providers.map((p) => p.id),
-      i = ids.indexOf(id),
-      j = i + direction;
-    if (j < 0 || j >= ids.length) return;
-    [ids[i], ids[j]] = [ids[j], ids[i]];
-    run(() => edit({ op: "reorder", ids }));
-  };
+  const providerEdit: ProviderCommit = (payload, expected) =>
+    action(() => edit(payload, expected), false);
   if (!state)
     return (
       <div className="empty" role="status">
@@ -273,154 +271,160 @@ export default function Gateway({
                 <strong>尚未添加供应商</strong>
               </div>
             )}
-            {state.providers.map((p, i) => {
-              const selected =
-                state.mode === "manual" && state.selected === p.id;
-              const status = providerStatus(
-                p,
-                state.proxies.find((x) => x.id === p.proxyId),
-              );
-              return (
-                <article
-                  key={p.id}
-                  className={`provider-row ${selected ? "selected" : ""}`}
-                >
-                  <div className="provider-main">
-                    {p.queued && (
-                      <span className="priority">
-                        P
-                        {
-                          state.providers
-                            .slice(0, i + 1)
-                            .filter((p) => p.queued).length
-                        }
-                      </span>
-                    )}
-                    <strong className="provider-title" title={p.name}>
-                      {p.name}
-                    </strong>
-                    {status && (
-                      <button
-                        className="provider-alert"
-                        onClick={() => setDialog({ kind: "settings", item: p })}
-                      >
-                        {status}
-                      </button>
-                    )}
-                    {state.configProvider === p.id && !selected && (
-                      <span className="provider-binding">配置使用</span>
-                    )}
-                    {state.mode === "auto" && state.lastSuccessful === p.id && (
-                      <span className="provider-binding">最近使用</span>
-                    )}
-                    <button
-                      className="secondary compact"
-                      disabled={busy}
-                      onClick={() => choose(p)}
-                    >
-                      {selected ? (
-                        <>
-                          <Check size={14} />
-                          已选择
-                        </>
-                      ) : (
-                        "选择"
+            <SortableProviders
+              providers={state.providers}
+              revision={state.revision}
+              disabled={busy}
+              commit={providerEdit}
+              report={setError}
+              rowClass={(p) =>
+                `provider-row ${state.mode === "manual" && state.selected === p.id ? "selected" : ""}`
+              }
+            >
+              {(p, priority, handle, rowBusy) => {
+                const selected =
+                  state.mode === "manual" && state.selected === p.id;
+                const status = providerStatus(
+                  p,
+                  state.proxies.find((x) => x.id === p.proxyId),
+                );
+                return (
+                  <>
+                    <div className="provider-main">
+                      {handle}
+                      {priority && (
+                        <span className="priority">P{priority}</span>
                       )}
-                    </button>
-                    <details className="row-menu">
-                      <summary aria-label={`${p.name} 操作`}>
-                        <MoreHorizontal size={17} />
-                      </summary>
-                      <div className="menu-popover" onClick={menuClose}>
+                      <strong className="provider-title" title={p.name}>
+                        {p.name}
+                      </strong>
+                      {status && (
                         <button
+                          className="provider-alert"
                           onClick={() =>
                             setDialog({ kind: "settings", item: p })
                           }
                         >
-                          <Settings2 size={14} />
-                          供应商设置
+                          {status}
                         </button>
-                        <button
-                          onClick={() =>
-                            setDialog({ kind: "provider", item: p })
-                          }
-                        >
-                          <Pencil size={14} />
-                          编辑 API
-                        </button>
-                        <button
-                          onClick={() => setDialog({ kind: "rename", item: p })}
-                        >
-                          重命名
-                        </button>
-                        <button
-                          disabled={busy}
-                          onClick={() =>
-                            run(async () =>
-                              notify(
-                                `TCP / TLS 连接正常 · ${await command<number>("test_provider", { id: p.id })} ms`,
-                              ),
-                            )
-                          }
-                        >
-                          测试连接
-                        </button>
-                        <button
-                          disabled={busy}
-                          onClick={() =>
-                            run(() =>
-                              edit({ op: "reset", id: p.id, proxy: false }),
-                            )
-                          }
-                        >
-                          <RotateCcw size={14} />
-                          重置熔断
-                        </button>
-                        <button
-                          disabled={busy || i === 0}
-                          onClick={() => move(p.id, -1)}
-                        >
-                          <ArrowUp size={14} />
-                          上移
-                        </button>
-                        <button
-                          disabled={busy || i === state.providers.length - 1}
-                          onClick={() => move(p.id, 1)}
-                        >
-                          <ArrowDown size={14} />
-                          下移
-                        </button>
-                        <button
-                          className="danger"
-                          disabled={busy}
-                          onClick={() => {
-                            if (confirm(`删除供应商“${p.name}”？`))
-                              run(() =>
-                                edit({ op: "deleteProvider", id: p.id }),
-                              );
+                      )}
+                      {state.configProvider === p.id && !selected && (
+                        <span className="provider-binding">配置使用</span>
+                      )}
+                      {state.mode === "auto" &&
+                        state.lastSuccessful === p.id && (
+                          <span className="provider-binding">最近使用</span>
+                        )}
+                      <button
+                        className="secondary compact"
+                        disabled={rowBusy}
+                        onClick={() => choose(p)}
+                      >
+                        {selected ? (
+                          <>
+                            <Check size={14} />
+                            已选择
+                          </>
+                        ) : (
+                          "选择"
+                        )}
+                      </button>
+                      <details className="row-menu">
+                        <summary
+                          aria-label={`${p.name} 操作`}
+                          aria-disabled={rowBusy}
+                          onClick={(e) => {
+                            if (rowBusy) e.preventDefault();
                           }}
                         >
-                          <Trash2 size={14} />
-                          删除
-                        </button>
-                      </div>
-                    </details>
-                  </div>
-                  <div className="provider-secondary">
-                    <span className="provider-domain" title={p.baseUrl}>
-                      {new URL(p.baseUrl).host}
-                    </span>
-                    <QuotaInfo
-                      compact
-                      provider={p}
-                      quota={quota.quotaFor(p)}
-                      refresh={() => void quota.refresh(p.id)}
-                      details={() => setDialog({ kind: "quota", item: p })}
-                    />
-                  </div>
-                </article>
-              );
-            })}
+                          <MoreHorizontal size={17} />
+                        </summary>
+                        <div className="menu-popover" onClick={menuClose}>
+                          <button
+                            onClick={() =>
+                              setDialog({ kind: "settings", item: p })
+                            }
+                          >
+                            <Settings2 size={14} />
+                            供应商设置
+                          </button>
+                          <button
+                            onClick={() =>
+                              setDialog({ kind: "provider", item: p })
+                            }
+                          >
+                            <Pencil size={14} />
+                            编辑 API
+                          </button>
+                          <button
+                            onClick={() =>
+                              setDialog({ kind: "rename", item: p })
+                            }
+                          >
+                            重命名
+                          </button>
+                          <button
+                            disabled={busy}
+                            onClick={() =>
+                              run(async () =>
+                                notify(
+                                  `TCP / TLS 连接正常 · ${await command<number>("test_provider", { id: p.id })} ms`,
+                                ),
+                              )
+                            }
+                          >
+                            测试连接
+                          </button>
+                          <button
+                            disabled={busy}
+                            onClick={() =>
+                              run(() =>
+                                edit({ op: "reset", id: p.id, proxy: false }),
+                              )
+                            }
+                          >
+                            <RotateCcw size={14} />
+                            重置熔断
+                          </button>
+                          <button
+                            className="danger"
+                            disabled={busy}
+                            onClick={() => {
+                              if (confirm(`删除供应商“${p.name}”？`))
+                                run(() =>
+                                  edit({ op: "deleteProvider", id: p.id }),
+                                );
+                            }}
+                          >
+                            <Trash2 size={14} />
+                            删除
+                          </button>
+                        </div>
+                      </details>
+                    </div>
+                    <div className="provider-secondary">
+                      <span className="provider-domain" title={p.baseUrl}>
+                        {new URL(p.baseUrl).host}
+                      </span>
+                      <QuotaInfo
+                        compact
+                        provider={p}
+                        quota={quota.quotaFor(p)}
+                        refresh={() => void quota.refresh(p.id)}
+                        details={() => setDialog({ kind: "quota", item: p })}
+                      />
+                      <ProviderControls
+                        provider={p}
+                        revision={state.revision}
+                        disabled={rowBusy}
+                        commit={providerEdit}
+                        report={setError}
+                      />
+                    </div>
+                  </>
+                );
+              }}
+            </SortableProviders>
           </div>
           <details className="advanced">
             <summary>高级设置</summary>

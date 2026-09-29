@@ -14,6 +14,8 @@ import { QuotaInfo, useProviderQuota } from "./Quota";
 import { providerStatus } from "./provider-status";
 import QuickControls from "./QuickControls";
 import AuthSyncNotice from "./AuthSyncNotice";
+import ProviderControls from "./ProviderControls";
+import SortableProviders, { type ProviderCommit } from "./SortableProviders";
 type Preferences = {
   pinned: boolean;
   tab: "providers" | "accounts";
@@ -99,7 +101,11 @@ export default function QuickPanel() {
   }, [notice]);
   useEffect(() => {
     const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.isComposing)
+      if (
+        event.key === "Escape" &&
+        !event.isComposing &&
+        !event.defaultPrevented
+      )
         void command("hide_quick");
     };
     document.addEventListener("keydown", escape);
@@ -134,27 +140,33 @@ export default function QuickPanel() {
     resize();
     return () => observer.disconnect();
   }, []);
-  const action = async (fn: () => Promise<void>) => {
+  const action = async (fn: () => Promise<void>, surfaceError = true) => {
     setBusy(true);
     setError("");
     try {
       await fn();
     } catch (e) {
-      setError(errorOf(e).message);
+      if (surfaceError) setError(errorOf(e).message);
+      throw e;
     } finally {
       setBusy(false);
     }
   };
-  const run = (fn: () => Promise<void>) => void action(fn);
-  const edit = async (edit: Record<string, unknown>) => {
+  const run = (fn: () => Promise<void>) => void action(fn).catch(() => {});
+  const edit = async (edit: Record<string, unknown>, expected?: string) => {
     if (!gateway) return;
     setGateway(
-      await command("update_gateway", {
+      await command<GatewayState>("update_gateway", {
         edit,
-        expectedRevision: gateway.revision,
+        expectedRevision: expected ?? gateway.revision,
         ...(edit.op === "select" && !gateway.running
           ? { expectedConfigRevision: gateway.configRevision }
           : {}),
+      }).catch(async (error) => {
+        await command<GatewayState>("get_gateway")
+          .then(setGateway)
+          .catch(() => {});
+        throw error;
       }),
     );
     if (edit.op === "select")
@@ -164,6 +176,8 @@ export default function QuickPanel() {
           : "配置已切换，请重新打开 Codex",
       );
   };
+  const providerEdit: ProviderCommit = (payload, expected) =>
+    action(() => edit(payload, expected), false);
   const account = async (id: string) => {
     if (!accounts) return;
     setAccounts(
@@ -302,58 +316,82 @@ export default function QuickPanel() {
                   </button>
                 </div>
               ) : (
-                gateway.providers.map((p, i) => (
-                  <article className="quick-provider" key={p.id}>
-                    <button
-                      className="quick-select"
-                      disabled={busy}
-                      onClick={() =>
-                        run(() => edit({ op: "select", id: p.id }))
-                      }
-                      aria-label={`选择 ${p.name}`}
-                    >
-                      <span className="quick-priority">
-                        {p.queued
-                          ? `P${gateway.providers.slice(0, i + 1).filter((p) => p.queued).length}`
-                          : "—"}
-                      </span>
-                      <span className="quick-name">
-                        <strong title={p.name}>{p.name}</strong>
-                      </span>
-                      {gateway.mode === "manual" &&
-                        gateway.selected === p.id && <Check size={15} />}
-                    </button>
-                    <button
-                      className="icon-button quick-provider-settings"
-                      aria-label={`${p.name} 设置`}
-                      onClick={() =>
-                        void command("open_main", {
-                          page: "gateway",
-                          providerId: p.id,
-                        })
-                      }
-                    >
-                      <Settings2 size={14} />
-                    </button>
-                    {providerStatus(
-                      p,
-                      gateway.proxies.find((x) => x.id === p.proxyId),
-                    ) && (
-                      <span className="quick-provider-alert">
-                        {providerStatus(
-                          p,
-                          gateway.proxies.find((x) => x.id === p.proxyId),
-                        )}
-                      </span>
-                    )}
-                    <QuotaInfo
-                      compact
-                      provider={p}
-                      quota={quota.quotaFor(p)}
-                      refresh={() => void quota.refresh(p.id)}
-                    />
-                  </article>
-                ))
+                <SortableProviders
+                  providers={gateway.providers}
+                  revision={gateway.revision}
+                  disabled={busy}
+                  visible={visible && prefs.tab === "providers"}
+                  commit={providerEdit}
+                  report={setError}
+                  rowClass={(p) =>
+                    `quick-provider ${gateway.mode === "manual" && gateway.selected === p.id ? "selected" : ""}`
+                  }
+                >
+                  {(p, priority, handle, rowBusy) => (
+                    <>
+                      <div className="quick-provider-main">
+                        {handle}
+                        <button
+                          className="quick-select"
+                          disabled={rowBusy}
+                          onClick={() =>
+                            run(() => edit({ op: "select", id: p.id }))
+                          }
+                          aria-label={`选择 ${p.name}`}
+                        >
+                          {priority && (
+                            <span className="quick-priority">P{priority}</span>
+                          )}
+                          <span className="quick-name">
+                            <strong title={p.name}>{p.name}</strong>
+                          </span>
+                          {gateway.mode === "manual" &&
+                            gateway.selected === p.id && <Check size={15} />}
+                        </button>
+                        <button
+                          className="icon-button quick-provider-settings"
+                          disabled={rowBusy}
+                          aria-label={`${p.name} 设置`}
+                          onClick={() =>
+                            void command("open_main", {
+                              page: "gateway",
+                              providerId: p.id,
+                            })
+                          }
+                        >
+                          <Settings2 size={14} />
+                        </button>
+                      </div>
+                      {providerStatus(
+                        p,
+                        gateway.proxies.find((x) => x.id === p.proxyId),
+                      ) && (
+                        <span className="quick-provider-alert">
+                          {providerStatus(
+                            p,
+                            gateway.proxies.find((x) => x.id === p.proxyId),
+                          )}
+                        </span>
+                      )}
+                      <div className="quick-provider-secondary">
+                        <QuotaInfo
+                          compact
+                          provider={p}
+                          quota={quota.quotaFor(p)}
+                          refresh={() => void quota.refresh(p.id)}
+                        />
+                        <ProviderControls
+                          provider={p}
+                          revision={gateway.revision}
+                          disabled={rowBusy}
+                          visible={visible && prefs.tab === "providers"}
+                          commit={providerEdit}
+                          report={setError}
+                        />
+                      </div>
+                    </>
+                  )}
+                </SortableProviders>
               )}
             </>
           ) : (
