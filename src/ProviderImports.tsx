@@ -81,18 +81,18 @@ export default function ProviderImports({
       </div>
     ) : null;
   return (
-    <Modal title="导入供应商" close={cancel} busy={busy}>
+    <Modal title="导入供应商" close={cancel} busy={busy} compact>
       <dl className="import-preview">
         <div>
           <dt>名称</dt>
           <dd>{active.name}</dd>
         </div>
         <div>
-          <dt>base_url</dt>
+          <dt>地址</dt>
           <dd>{active.baseUrl}</dd>
         </div>
         <div>
-          <dt>experimental_bearer_token</dt>
+          <dt>API Key</dt>
           <dd>••••••••</dd>
         </div>
       </dl>
@@ -130,7 +130,7 @@ export default function ProviderImports({
               .finally(() => setBusy(false));
           }}
         >
-          导入
+          {busy ? "正在处理…" : "导入"}
         </button>
       </div>
     </Modal>

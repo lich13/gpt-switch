@@ -1141,11 +1141,48 @@ select:focus-visible {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 22px;
 }
 .gateway-modal h2 {
   font-size: 18px;
   margin: 0;
+}
+.gateway-modal > .gateway-form {
+  padding: 20px;
+}
+.shared-modal .modal-heading {
+  padding: 16px 20px;
+  gap: 16px;
+}
+.shared-modal .modal-heading h2 {
+  min-width: 0;
+  font-size: 16px;
+  line-height: 24px;
+  overflow-wrap: anywhere;
+  outline: none;
+}
+.shared-modal .modal-heading .icon-button {
+  width: 28px;
+  height: 28px;
+}
+.compact-modal {
+  width: 440px;
+}
+.modal-body {
+  padding: 20px;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding-top: 20px;
+}
+.modal-actions button {
+  min-width: 72px;
+  min-height: 34px;
+}
+.modal-body > .form-error {
+  margin: 16px 0 0;
 }
 .proxy-address {
   display: grid;
@@ -1751,20 +1788,37 @@ select:focus-visible {
 }
 .import-preview {
   display: grid;
-  gap: 18px;
+  gap: 0;
+  margin: 0;
 }
 .import-preview div {
   min-width: 0;
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 16px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+.import-preview div:first-child {
+  padding-top: 0;
+}
+.import-preview div:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
 }
 .import-preview dt {
   font-size: 12px;
   color: var(--muted);
-  margin-bottom: 6px;
 }
 .import-preview dd {
   margin: 0;
   font-size: 14px;
   overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+.import-preview div:first-child dd {
+  font-weight: 600;
 }
 .modal .quota-area {
   margin: 0;

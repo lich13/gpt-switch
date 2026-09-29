@@ -114,4 +114,6 @@ MIT License。独立项目，与 OpenAI 无隶属关系。
 
 macOS 首次操作需系统管理员授权安装助手；日常开关走 XPC，不重复请求密码。设置页可安装、修复或移除助手。助手由系统 launchd 管理，仅接受状态读取、合盖切换与恢复；验证获授权用户、正式应用路径和实际进程的代码签名，升级导致代码身份变化时需重新授权。安装程序不保存密码、不配置免密 sudo。应用须位于 `/Applications/gpt-Switch.app`；开发和隔离运行不会调用或安装正式助手。
 
+v0.7.1 修复系统助手目录为 `1755` 时安装失败的问题，保留原目录权限。安装在新服务通过应用的 XPC 校验后完成；失败显示具体阶段及实际回滚结果，设置页刷新助手真实状态。
+
 助手位于 `/Library/PrivilegedHelperTools/com.lich13.gpt-switch.power-helper`，系统服务为同名 LaunchDaemon，恢复记录位于 root 私有目录 `/Library/Application Support/gpt-Switch Power`。移除前恢复本工具接管的电源设置，状态冲突时保留现场及恢复记录；退出应用不改变电源状态。

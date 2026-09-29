@@ -12,7 +12,6 @@ import {
   ArrowDown,
   Pencil,
   Trash2,
-  X,
   Network,
   Shield,
   Settings2,
@@ -660,8 +659,7 @@ function GatewayDialog({
   onDirtyChange?: (dirty: boolean) => void;
 }) {
   const initialSave = useRef(save);
-  const ref = useRef<HTMLDialogElement>(null),
-    [busy, setBusy] = useState(false),
+  const [busy, setBusy] = useState(false),
     [error, setError] = useState("");
   const [baseUrl, setBaseUrl] = useState(
       dialog.kind === "provider" ? (dialog.item?.baseUrl ?? "") : "",
@@ -683,33 +681,12 @@ function GatewayDialog({
     );
   }, [baseUrl, token, name, host, port, username, password, onDirtyChange]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
-  useEffect(() => {
-    ref.current?.showModal();
-  }, []);
   const title =
     dialog.kind === "rename"
       ? "重命名供应商"
       : `${dialog.item ? "编辑" : "添加"}${dialog.kind === "provider" ? "供应商" : "代理"}`;
   return (
-    <dialog
-      ref={ref}
-      className="modal gateway-modal"
-      onCancel={(e) => {
-        if (busy) e.preventDefault();
-        else close();
-      }}
-    >
-      <div className="modal-heading">
-        <h2>{title}</h2>
-        <button
-          className="icon-button"
-          aria-label="关闭"
-          disabled={busy}
-          onClick={close}
-        >
-          <X size={18} />
-        </button>
-      </div>
+    <Modal title={title} close={close} busy={busy}>
       <form
         className="gateway-form"
         onSubmit={(e) => {
@@ -844,6 +821,6 @@ function GatewayDialog({
           </button>
         </div>
       </form>
-    </dialog>
+    </Modal>
   );
 }

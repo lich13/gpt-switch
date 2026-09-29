@@ -44,6 +44,9 @@ export default function PowerSettings() {
       setState(await command<PowerState>(op));
     } catch (e) {
       setError(errorOf(e).message);
+      await command<PowerState>("get_clamshell_state")
+        .then(setState)
+        .catch(() => {});
     } finally {
       setBusy(false);
     }

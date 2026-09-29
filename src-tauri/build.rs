@@ -21,6 +21,7 @@ fn main() {
 fn build_power() {
     println!("cargo:rerun-if-changed=native/power_client.m");
     println!("cargo:rerun-if-changed=native/power_helper.m");
+    println!("cargo:rerun-if-changed=native/power_install.h");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }

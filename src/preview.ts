@@ -73,6 +73,22 @@ let startup = {
 };
 let quick = { pinned: false, tab: "providers", visible: true };
 let linkHandler = "com.lich13.studio";
+const importPreview = new URLSearchParams(location.search).get("importPreview");
+let imports = importPreview
+  ? [
+      {
+        id: "preview-import",
+        name:
+          importPreview === "long"
+            ? "研发团队使用的跨区域供应商与长名称展示验证".repeat(3)
+            : "sub2api",
+        baseUrl:
+          importPreview === "long"
+            ? `https://api.example.invalid/${"deployment/".repeat(12)}v1`
+            : "https://api.example.invalid/team/v1",
+      },
+    ]
+  : [];
 const linkApps = [
   {
     id: "com.lich13.gpt-switch",
@@ -95,7 +111,14 @@ export async function run(
     linkHandler = String(args.appId);
     return { current: linkHandler, apps: linkApps, systemPicker: false };
   }
-  if (name === "get_provider_imports") return [];
+  if (name === "get_provider_imports") return structuredClone(imports);
+  if (name === "confirm_provider_import" || name === "cancel_provider_import") {
+    if (name === "confirm_provider_import" && importPreview === "error")
+      throw { code: "CONFLICT", message: "供应商列表已更新，请重新导入" };
+    imports = imports.filter((item) => item.id !== args.id);
+    emit("provider-imports", null);
+    return;
+  }
   if (name === "cleanup_retired_data") return;
   if (powerCommands.includes(name)) return powerPreview(name, args, emit);
   if (name === "get_quick") return { ...quick };

@@ -50,9 +50,23 @@ it("keeps state and controls after authorization is cancelled, then accepts help
     code: "CONFLICT",
     message: "电源状态已被外部修改",
   });
+  mock.command.mockResolvedValueOnce({ ...initial, helper: "needsRepair" });
   fireEvent.click(screen.getByRole("button", { name: "移除" }));
   await screen.findByText("电源状态已被外部修改");
   expect(screen.getByText("需要修复")).toBeInTheDocument();
+});
+it("refreshes actual helper status after a failed installation", async () => {
+  render(<PowerSettings />);
+  await screen.findByText("未安装");
+  mock.command.mockRejectedValueOnce({
+    code: "POWER_INSTALL_REGISTER",
+    message: "服务注册失败；原注册状态恢复失败，请重新修复助手",
+  });
+  mock.command.mockResolvedValueOnce({ ...initial, helper: "needsRepair" });
+  fireEvent.click(screen.getByRole("button", { name: "安装" }));
+  await screen.findByText("需要修复");
+  expect(screen.getByRole("alert")).toHaveTextContent("服务注册失败");
+  expect(screen.getByRole("button", { name: "修复" })).toBeEnabled();
 });
 it("disables management for an isolated native app and hides unsupported devices", async () => {
   mock.command.mockResolvedValueOnce({ ...initial, helper: "isolated" });

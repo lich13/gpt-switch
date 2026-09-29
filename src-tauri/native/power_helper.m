@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/file.h>
 
 static NSString *const Label = @"com.lich13.gpt-switch.power-helper";
 static NSString *const Binary = @"/Library/PrivilegedHelperTools/com.lich13.gpt-switch.power-helper";
@@ -14,6 +15,7 @@ static NSString *const Plist = @"/Library/LaunchDaemons/com.lich13.gpt-switch.po
 static NSString *const Root = @"/Library/Application Support/gpt-Switch Power";
 static NSString *const Manifest = @"/Library/Application Support/gpt-Switch Power/client.json";
 static NSString *const Restore = @"/Library/Application Support/gpt-Switch Power/restore.json";
+static NSString *const InstallReady = @"/Library/Application Support/gpt-Switch Power/install-ready.json";
 static NSString *const AppBinary = @"/Applications/gpt-Switch.app/Contents/MacOS/gpt-switch";
 static NSDictionary *Approved;
 #ifdef POWER_TEST
@@ -35,10 +37,12 @@ static NSDictionary *readJSON(NSString *path) {
     return [value isKindOfClass:NSDictionary.class] ? value : nil;
 #endif
 }
+static BOOL safeRootMetadata(uid_t uid, mode_t mode, BOOL directory) {
+    return uid==0 && !(mode&0022) && (directory ? S_ISDIR(mode) : S_ISREG(mode));
+}
 static BOOL safeRootPath(NSString *path, BOOL directory) {
     struct stat st;
-    return lstat(path.fileSystemRepresentation,&st)==0 && st.st_uid==0 && !(st.st_mode&0022) &&
-        (directory ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode));
+    return lstat(path.fileSystemRepresentation,&st)==0 && safeRootMetadata(st.st_uid,st.st_mode,directory);
 }
 static BOOL atomicData(NSString *path, NSData *data, mode_t mode) {
     NSString *tmp = [path stringByAppendingFormat:@".%@", NSUUID.UUID.UUIDString];
@@ -123,6 +127,14 @@ static NSDictionary *handle(NSDictionary *request) {
     NSDictionary *before=powerState();
     if(!before)return failure(@"POWER",@"无法读取系统电源状态");
     if([op isEqual:@"state"])return @{@"state":before,@"version":@1};
+    if([op isEqual:@"verifyInstall"]){
+        NSString *transaction=readJSON(Manifest)[@"transaction"];
+        if(![transaction isKindOfClass:NSString.class]||![request[@"transaction"] isEqual:transaction])
+            return failure(@"POWER_INSTALL_VERIFY",@"没有匹配的助手安装事务");
+        if(!writeJSON(InstallReady,@{@"transaction":transaction}))
+            return failure(@"POWER_INSTALL_VERIFY",@"无法确认助手连接");
+        return @{@"state":before,@"version":@1};
+    }
     if(![op isEqual:@"set"]&&![op isEqual:@"prepareRemove"])return failure(@"POWER_PROTOCOL",@"不支持的电源操作");
     NSDictionary *record=readJSON(Restore);
 #ifndef POWER_TEST
@@ -193,37 +205,15 @@ static BOOL safeDirectory(NSString *path) {
 static BOOL restoreFile(NSString *path, NSData *data, mode_t mode) {
     return data ? atomicData(path,data,mode) : unlink(path.fileSystemRepresentation)==0||errno==ENOENT;
 }
-static int install(uid_t uid, NSString *path, NSString *hash) {
-    if(geteuid()!=0||uid<501||![path isEqual:AppBinary]||hash.length!=40||[hash rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet]].location!=NSNotFound)return 1;
-    if(!safeRootPath(@"/Library/PrivilegedHelperTools",YES)||!safeRootPath(@"/Library/LaunchDaemons",YES)||!safeRootPath(@"/Library/Application Support",YES)||!safeDirectory(Root))return 1;
-    NSString *requirement=[NSString stringWithFormat:@"identifier \"com.lich13.gpt-switch\" and cdhash H\"%@\"",hash];
-    SecStaticCodeRef code=NULL;SecRequirementRef req=NULL;
-    if(SecStaticCodeCreateWithPath((__bridge CFURLRef)[NSURL fileURLWithPath:path],kSecCSDefaultFlags,&code)!=errSecSuccess)return 1;
-    SecRequirementCreateWithString((__bridge CFStringRef)requirement,kSecCSDefaultFlags,&req);
-    BOOL valid=req&&SecStaticCodeCheckValidity(code,kSecCSStrictValidate,req)==errSecSuccess;
-    if(req)CFRelease(req);CFRelease(code);if(!valid)return 1;
-    NSFileManager *fm=NSFileManager.defaultManager;
-    for(NSString *file in @[Binary,Plist,Manifest,Restore])if([fm fileExistsAtPath:file]&&!safeRootPath(file,NO))return 1;
-    NSDictionary *oldClient=readJSON(Manifest);if(oldClient&&[oldClient[@"uid"] unsignedIntValue]!=uid)return 1;
-    NSData *oldBinary=[NSData dataWithContentsOfFile:Binary],*oldPlist=[NSData dataWithContentsOfFile:Plist],*oldManifest=[NSData dataWithContentsOfFile:Manifest];
-    NSData *binary=[NSData dataWithContentsOfFile:NSProcessInfo.processInfo.arguments[0]];
-    NSDictionary *plist=@{@"Label":Label,@"ProgramArguments":@[Binary],@"MachServices":@{Label:@YES},@"ProcessType":@"Interactive",@"Umask":@077};
-    NSData *plistData=[NSPropertyListSerialization dataWithPropertyList:plist format:NSPropertyListXMLFormat_v1_0 options:0 error:nil];
-    if(!binary||!plistData)return 1;
-    run(@"/bin/launchctl",@[@"bootout",[@"system/" stringByAppendingString:Label]],NULL);
-    BOOL ok=atomicData(Binary,binary,0755)&&atomicData(Plist,plistData,0644)&&writeJSON(Manifest,@{@"uid":@(uid),@"path":path,@"requirement":requirement,@"version":@1});
-    if(ok)ok=run(@"/bin/launchctl",@[@"bootstrap",@"system",Plist],NULL);
-    if(ok)return 0;
-    restoreFile(Binary,oldBinary,0755);restoreFile(Plist,oldPlist,0644);restoreFile(Manifest,oldManifest,0600);
-    if(oldPlist)run(@"/bin/launchctl",@[@"bootstrap",@"system",Plist],NULL);
-    return 1;
-}
+#include "power_install.h"
 #ifndef POWER_TEST
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
-        if(argc==5&&strcmp(argv[1],"--install")==0){
+        if(argc==6&&strcmp(argv[1],"--install")==0){
             char *end=NULL;unsigned long uid=strtoul(argv[2],&end,10);
-            return end&&!*end&&uid<=UINT32_MAX ? install((uid_t)uid,@(argv[3]),@(argv[4])) : 1;
+            NSDictionary *result=end&&!*end&&uid<=UINT32_MAX ? install((uid_t)uid,@(argv[3]),@(argv[4]),@(argv[5])) : installFailure(@"SIGNATURE",@"安装参数无效",@"unchanged");
+            puts([[NSString alloc] initWithData:jsonData(result) encoding:NSUTF8StringEncoding].UTF8String);
+            return 0;
         }
         if(argc!=1||geteuid()!=0||!safeRootPath(Root,YES)||!safeRootPath(Manifest,NO))return 1;
         Approved=readJSON(Manifest);
@@ -258,7 +248,12 @@ int main(int argc, const char *argv[]) {
                     else {
                         BOOL ok=unlink(Plist.fileSystemRepresentation)==0&&unlink(Binary.fileSystemRepresentation)==0&&unlink(Manifest.fileSystemRepresentation)==0;
                         if(!ok){restoreFile(Manifest,manifest,0600);restoreFile(Plist,plist,0644);restoreFile(Binary,binary,0755);result=failure(@"POWER",@"电源助手移除失败，原注册文件已尝试恢复");}
-                        else {rmdir(Root.fileSystemRepresentation);dispatch_after(dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),queue,^{run(@"/bin/launchctl",@[@"bootout",[@"system/" stringByAppendingString:Label]],NULL);});}
+                        else {
+                            unlink([[Root stringByAppendingPathComponent:@"install.lock"] fileSystemRepresentation]);
+                            unlink(InstallReady.fileSystemRepresentation);
+                            rmdir(Root.fileSystemRepresentation);
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC),queue,^{run(@"/bin/launchctl",@[@"bootout",[@"system/" stringByAppendingString:Label]],NULL);});
+                        }
                     }
                 }
                 xpc_dictionary_set_string(reply,"json",[[[NSString alloc] initWithData:jsonData(result) encoding:NSUTF8StringEncoding] UTF8String]);
@@ -273,12 +268,21 @@ int main(int argc, const char *argv[]) {
 #define CHECK(v) do { if(!(v)){fprintf(stderr,"power test failed at %d\n",__LINE__);return 1;} } while(0)
 int main(void) {
     @autoreleasepool {
+        CHECK(testInstallTransactions());
         NSDictionary *approved=@{@"uid":@501,@"path":AppBinary};
         CHECK(identityMatches(501,AppBinary,YES,approved));
         CHECK(!identityMatches(502,AppBinary,YES,approved));
         CHECK(!identityMatches(501,@"/tmp/gpt-switch",YES,approved));
         CHECK(!identityMatches(501,AppBinary,NO,approved));
         TestFiles=[NSMutableDictionary dictionary];TestState=@{@"supported":@YES,@"enabled":@NO,@"batterySleep":@0};
+        TestFiles[Manifest]=@{@"transaction":@"fresh-install"};
+        CHECK(handle(@{@"op":@"verifyInstall",@"transaction":@"old-install"})[@"error"]);
+        CHECK(!readJSON(InstallReady));
+        CHECK(!handle(@{@"op":@"verifyInstall",@"transaction":@"fresh-install"})[@"error"]);
+        CHECK([readJSON(InstallReady)[@"transaction"] isEqual:@"fresh-install"]);
+        CHECK([TestState[@"enabled"] isEqual:@NO]);
+        [TestFiles removeObjectForKey:Manifest];[TestFiles removeObjectForKey:InstallReady];
+        CHECK(handle(@{@"op":@"verifyInstall",@"transaction":@"fresh-install"})[@"error"]);
         CHECK(!handle(@{@"op":@"set",@"enabled":@YES,@"minutes":@0,@"beforeEnabled":@NO,@"beforeSleep":@0})[@"error"]);
         CHECK([readJSON(Restore)[@"minutes"] isEqual:@0]);
         CHECK(!handle(@{@"op":@"set",@"enabled":@NO,@"minutes":@1,@"beforeEnabled":@YES,@"beforeSleep":@0})[@"error"]);

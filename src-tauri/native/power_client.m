@@ -3,7 +3,7 @@
 #import <xpc/xpc.h>
 
 // Public XPC peer requirements (macOS 12+) bind both ends to approved code.
-char *gs_power_request(const char *json, const char *requirement) {
+char *gs_power_request(const char *json, const char *requirement, uint64_t timeout_ms) {
     @autoreleasepool {
         dispatch_queue_t queue = dispatch_queue_create("com.lich13.gpt-switch.power-client", DISPATCH_QUEUE_SERIAL);
         xpc_connection_t connection = xpc_connection_create_mach_service("com.lich13.gpt-switch.power-helper", queue, XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
@@ -21,7 +21,7 @@ char *gs_power_request(const char *json, const char *requirement) {
             }
             dispatch_semaphore_signal(done);
         });
-        BOOL completed = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC)) == 0;
+        BOOL completed = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeout_ms * NSEC_PER_MSEC)) == 0;
         __block char *answer = NULL;
         // Serialize with the callback; never let a late reply access freed storage.
         dispatch_sync(queue, ^{ if (completed && result) answer = strdup(result.UTF8String); });
