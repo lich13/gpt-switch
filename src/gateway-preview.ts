@@ -38,7 +38,6 @@ export const gatewayDemo: GatewayState = {
       id: "primary",
       name: "api.example.com",
       baseUrl: "https://api.example.com/v1",
-      proxyId: null,
       queued: true,
       health: { ...healthy },
       quotaVersion: "preview-quota",
@@ -51,7 +50,6 @@ export const gatewayDemo: GatewayState = {
       id: "backup",
       name: "备用工作空间 · 长名称供应商的列表与键盘操作验证",
       baseUrl: "https://backup.example.com/api/v1",
-      proxyId: "cloud",
       queued: true,
       health: { ...healthy },
       quotaVersion: "preview-quota",
@@ -59,17 +57,6 @@ export const gatewayDemo: GatewayState = {
       maxConcurrency: 0,
       activeRequests: 0,
       allowedModels: null,
-    },
-  ],
-  proxies: [
-    {
-      id: "cloud",
-      name: "腾讯云 SOCKS5",
-      host: "203.0.113.1",
-      port: 10808,
-      username: "preview",
-      hasPassword: true,
-      health: { ...healthy },
     },
   ],
   activeConnections: 0,
@@ -92,7 +79,6 @@ export const claudeGatewayDemo: GatewayState = {
     baseUrl: "https://claude.example.com",
     allowedModels: null,
   })),
-  proxies: gatewayDemo.proxies,
 };
 export function gatewayPreview(name: string, args: Record<string, unknown>) {
   const s = args.clientId === "claude" ? claudeGatewayDemo : gatewayDemo;
@@ -152,15 +138,9 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
         s.configProvider = id;
       }
     }
-    if (e.op === "configureProvider" && p) {
-      p.maxConcurrency = Number(e.maxConcurrency);
-      p.proxyId = e.proxyId as string | null;
-      p.queued = !!e.queued;
-    }
     if (e.op === "queueProvider" && p) p.queued = Boolean(e.queued);
     if (e.op === "concurrencyProvider" && p)
       p.maxConcurrency = Number(e.maxConcurrency);
-    if (e.op === "routeProvider" && p) p.proxyId = e.proxyId as string | null;
     if (e.op === "renameProvider" && p) p.name = String(e.name);
     if (e.op === "deleteProvider")
       s.providers = s.providers.filter((p) => p.id !== id);
@@ -176,7 +156,6 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
           id: crypto.randomUUID(),
           name: new URL(String(e.baseUrl)).hostname,
           baseUrl: String(e.baseUrl),
-          proxyId: null,
           queued: true,
           health: { ...healthy },
           quotaVersion: crypto.randomUUID(),
@@ -185,36 +164,6 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
           activeRequests: 0,
           allowedModels: null,
         });
-    }
-    if (e.op === "saveProxy") {
-      const x = s.proxies.find((x) => x.id === id),
-        values = {
-          name: String(e.name),
-          host: String(e.host),
-          port: Number(e.port),
-          username: String(e.username),
-        };
-      if (x) Object.assign(x, values);
-      else
-        s.proxies.push({
-          id: crypto.randomUUID(),
-          ...values,
-          hasPassword: Boolean(e.password),
-          health: { ...healthy },
-        });
-    }
-    if (e.op === "deleteProxy") {
-      if (
-        [...gatewayDemo.providers, ...claudeGatewayDemo.providers].some(
-          (p) => p.proxyId === id,
-        )
-      )
-        throw new Error("请先解绑或替换引用此代理的供应商");
-      s.proxies.splice(
-        0,
-        s.proxies.length,
-        ...s.proxies.filter((x) => x.id !== id),
-      );
     }
     if (e.op === "modelsProvider" && p)
       p.allowedModels = e.allowedModels as string[] | null;

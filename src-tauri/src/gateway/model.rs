@@ -9,24 +9,12 @@ pub struct Provider {
     pub name: String,
     pub base_url: String,
     pub token: String,
-    pub proxy_id: Option<String>,
     pub queued: bool,
     pub version: String,
     #[serde(default)]
     pub max_concurrency: u32,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Proxy {
-    pub id: String,
-    pub name: String,
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    pub password: String,
-    pub version: String,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,7 +100,6 @@ pub struct Store {
     #[serde(default)]
     pub initialized: bool,
     pub providers: Vec<Provider>,
-    pub proxies: Vec<Proxy>,
     pub settings: Settings,
     pub mode: String,
     pub selected: Option<String>,
@@ -130,10 +117,9 @@ pub struct Resume {
 impl Default for Store {
     fn default() -> Self {
         Self {
-            schema: 1,
+            schema: 2,
             initialized: false,
             providers: vec![],
-            proxies: vec![],
             settings: Settings::default(),
             mode: "manual".into(),
             selected: None,
@@ -155,12 +141,6 @@ pub enum Edit {
         token: String,
         display_name: String,
     },
-    ConfigureProvider {
-        id: String,
-        max_concurrency: u32,
-        proxy_id: Option<String>,
-        queued: bool,
-    },
     SaveProvider {
         id: Option<String>,
         base_url: String,
@@ -172,10 +152,6 @@ pub enum Edit {
     },
     DeleteProvider {
         id: String,
-    },
-    RouteProvider {
-        id: String,
-        proxy_id: Option<String>,
     },
     QueueProvider {
         id: String,
@@ -192,17 +168,6 @@ pub enum Edit {
     Reorder {
         ids: Vec<String>,
     },
-    SaveProxy {
-        id: Option<String>,
-        name: String,
-        host: String,
-        port: u16,
-        username: String,
-        password: String,
-    },
-    DeleteProxy {
-        id: String,
-    },
     Select {
         id: String,
     },
@@ -214,7 +179,6 @@ pub enum Edit {
     },
     Reset {
         id: String,
-        proxy: bool,
     },
     Import,
 }
@@ -260,7 +224,7 @@ impl Store {
                 .map_err(|_| AppError::new("STORE", "网关存储无法读取，请保留原文件"))?,
             None => Self::default(),
         };
-        if store.schema != 1 {
+        if !matches!(store.schema, 1 | 2) {
             return Err(AppError::new("STORE", "网关存储版本不受支持"));
         }
         store.settings.validate()?;
@@ -307,29 +271,6 @@ impl Store {
                 self.selected = selected;
                 self.providers.last_mut().expect("provider added").name = label;
             }
-            Edit::ConfigureProvider {
-                id,
-                max_concurrency,
-                proxy_id,
-                queued,
-            } => {
-                if max_concurrency > 100000 {
-                    return Err(AppError::new("CONCURRENCY", "并发上限应为 0–100000"));
-                }
-                if proxy_id
-                    .as_ref()
-                    .is_some_and(|id| !self.proxies.iter().any(|p| &p.id == id))
-                {
-                    return Err(AppError::new("PROXY", "代理不存在"));
-                }
-                let p = self.provider_mut(&id)?;
-                if p.proxy_id != proxy_id {
-                    p.version = uuid::Uuid::new_v4().to_string();
-                }
-                p.proxy_id = proxy_id;
-                p.queued = queued;
-                p.max_concurrency = max_concurrency;
-            }
             Edit::SaveProvider {
                 id,
                 base_url: raw,
@@ -356,7 +297,6 @@ impl Store {
                         name: u.host_str().unwrap_or("Provider").into(),
                         base_url: raw.trim().into(),
                         token,
-                        proxy_id: None,
                         queued: true,
                         version: uuid::Uuid::new_v4().to_string(),
                         max_concurrency: 0,
@@ -375,17 +315,6 @@ impl Store {
                 if self.selected.as_deref() == Some(&id) {
                     self.selected = self.providers.first().map(|p| p.id.clone());
                 }
-            }
-            Edit::RouteProvider { id, proxy_id } => {
-                if proxy_id
-                    .as_ref()
-                    .is_some_and(|id| !self.proxies.iter().any(|p| &p.id == id))
-                {
-                    return Err(AppError::new("PROXY", "代理不存在"));
-                }
-                let p = self.provider_mut(&id)?;
-                p.proxy_id = proxy_id;
-                p.version = uuid::Uuid::new_v4().to_string();
             }
             Edit::QueueProvider { id, queued } => self.provider_mut(&id)?.queued = queued,
             Edit::ConcurrencyProvider {
@@ -442,71 +371,6 @@ impl Store {
                 }
                 self.providers
                     .sort_by_key(|p| ids.iter().position(|id| id == &p.id).unwrap_or(usize::MAX));
-            }
-            Edit::SaveProxy {
-                id,
-                name: raw_name,
-                host,
-                port,
-                username,
-                password,
-            } => {
-                let label = name(&raw_name)?;
-                let host = host.trim().trim_matches(['[', ']']).to_owned();
-                if host.is_empty()
-                    || host.contains(['/', '@', ' ', '\r', '\n'])
-                    || port == 0
-                    || username.len() > 255
-                    || password.len() > 255
-                {
-                    return Err(AppError::new("PROXY", "请检查代理地址、端口及认证字段"));
-                }
-                if let Some(id) = id {
-                    let p = self
-                        .proxies
-                        .iter_mut()
-                        .find(|p| p.id == id)
-                        .ok_or_else(|| AppError::new("PROXY", "代理不存在"))?;
-                    p.name = label;
-                    p.host = host;
-                    p.port = port;
-                    p.username = username;
-                    if p.username.is_empty() {
-                        p.password.clear();
-                    } else if !password.is_empty() {
-                        p.password = password;
-                    }
-                    if !p.username.is_empty() && p.password.is_empty() {
-                        return Err(AppError::new("PROXY", "请输入代理密码"));
-                    }
-                    p.version = uuid::Uuid::new_v4().to_string();
-                } else {
-                    if username.is_empty() != password.is_empty() {
-                        return Err(AppError::new("PROXY", "用户名和密码须同时填写或同时留空"));
-                    }
-                    self.proxies.push(Proxy {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        name: label,
-                        host,
-                        port,
-                        username,
-                        password,
-                        version: uuid::Uuid::new_v4().to_string(),
-                    });
-                }
-            }
-            Edit::DeleteProxy { id } => {
-                if self
-                    .providers
-                    .iter()
-                    .any(|p| p.proxy_id.as_deref() == Some(&id))
-                {
-                    return Err(AppError::new(
-                        "PROXY_USED",
-                        "请先解绑或替换引用此代理的供应商",
-                    ));
-                }
-                self.proxies.retain(|p| p.id != id);
             }
             Edit::Select { id } => {
                 self.provider_mut(&id)?;

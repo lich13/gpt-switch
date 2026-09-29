@@ -921,8 +921,7 @@ select:focus-visible {
 }
 .gateway-toolbar,
 .inline-actions,
-.provider-main,
-.proxy-row {
+.provider-main {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -971,8 +970,7 @@ select:focus-visible {
 .inline-actions {
   gap: 8px;
 }
-.provider-list,
-.proxy-list {
+.provider-list {
   display: grid;
   gap: 10px;
 }
@@ -1114,22 +1112,7 @@ select:focus-visible {
   font-size: 13px;
   min-width: 0;
 }
-.proxy-row {
-  padding: 18px 14px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--surface);
-  gap: 10px;
-  min-width: 0;
-}
-.proxy-row > svg {
-  color: var(--accent);
-}
-.proxy-auth {
-  color: var(--muted);
-  font-size: 12px;
-  white-space: nowrap;
-}
+
 .gateway-form {
   display: grid;
   gap: 18px;
@@ -1184,11 +1167,6 @@ select:focus-visible {
 .modal-body > .form-error {
   margin: 16px 0 0;
 }
-.proxy-address {
-  display: grid;
-  grid-template-columns: 1fr 100px;
-  gap: 12px;
-}
 .gateway-form .form-actions {
   margin-top: 6px;
 }
@@ -1196,12 +1174,7 @@ select:focus-visible {
   .gateway-page {
     padding: 22px;
   }
-  .proxy-row {
-    flex-wrap: wrap;
-  }
-  .proxy-row .provider-name {
-    min-width: 180px;
-  }
+
   .settings-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -2076,5 +2049,236 @@ select:focus-visible {
   }
   .gateway-toolbar {
     flex-wrap: wrap;
+  }
+}
+
+/* Claude configuration: one group at a time, shared source draft. */
+.config-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 24px 28px 16px;
+  flex-wrap: wrap;
+}
+.config-heading .inline {
+  gap: 12px;
+}
+.config-page .editor-toolbar {
+  flex-shrink: 0;
+  min-height: 44px;
+}
+.claude-settings {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.settings-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  padding: 0 24px;
+  flex-shrink: 0;
+}
+.settings-tabs button {
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  padding: 10px 14px;
+  min-height: 42px;
+}
+.settings-tabs button[aria-pressed="true"] {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+.settings-content {
+  overflow: auto;
+  padding: 12px 28px 28px;
+  flex: 1;
+  min-width: 0;
+}
+.setting-row {
+  display: grid;
+  grid-template-columns: minmax(115px, 0.7fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--line);
+  min-width: 0;
+}
+.setting-row > label,
+.setting-row > span {
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.setting-value {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+.setting-value > input,
+.setting-value > select {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+}
+.settings-content input,
+.settings-content select {
+  height: 36px;
+  padding: 7px 10px;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  min-width: 0;
+}
+.settings-content input:disabled {
+  opacity: 0.55;
+}
+.config-group-action {
+  display: flex;
+  justify-content: flex-end;
+  min-height: 30px;
+}
+.config-group-action .text-button,
+.add-setting {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.settings-list-group {
+  margin: 20px 0;
+}
+.settings-list-group h3 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 10px;
+}
+.settings-list-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 8px 0;
+  min-width: 0;
+}
+.settings-list-row input {
+  flex: 1;
+  min-width: 0;
+}
+.rule-builder {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.rule-builder input {
+  flex: 1;
+  width: 100px;
+}
+.config-search {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.config-search input {
+  flex: 1;
+}
+.environment-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 1fr) 32px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.environment-row label {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.environment-row input {
+  width: 100%;
+}
+.json-node {
+  border-bottom: 1px solid var(--line);
+}
+.json-node summary {
+  padding: 8px 0;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.json-node summary > button {
+  float: right;
+}
+.node-count {
+  font-size: 12px;
+  color: var(--muted);
+  margin-left: 10px;
+}
+.json-children {
+  margin-left: 12px;
+  padding-left: 10px;
+  border-left: 1px solid var(--line);
+}
+.json-children .setting-row {
+  gap: 8px;
+  grid-template-columns: minmax(70px, 0.65fr) minmax(120px, 1fr);
+}
+.add-setting {
+  margin: 12px 0;
+}
+.masked-secret {
+  color: var(--muted);
+  letter-spacing: 1px;
+}
+.config-diff {
+  display: grid;
+  gap: 16px;
+  max-height: 55vh;
+  overflow: auto;
+}
+.config-diff strong {
+  display: block;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.config-diff del,
+.config-diff ins {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 6px 10px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  text-decoration: none;
+}
+.config-diff del {
+  background: color-mix(in srgb, #d85168 12%, transparent);
+}
+.config-diff ins {
+  background: color-mix(in srgb, #41b88d 12%, transparent);
+}
+@media (max-width: 840px) {
+  .config-heading {
+    padding: 18px 20px 12px;
+    gap: 10px;
+  }
+  .settings-tabs {
+    padding: 0 12px;
+  }
+  .settings-tabs button {
+    padding: 8px 10px;
+  }
+  .settings-content {
+    padding: 12px 20px 24px;
   }
 }

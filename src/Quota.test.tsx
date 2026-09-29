@@ -145,13 +145,13 @@ describe("quota display and refresh", () => {
           ...result(),
           state: "error",
           stale: true,
-          error: "SOCKS5 认证失败",
+          error: "上游连接超时",
         },
       }),
     );
     expect(screen.getByText("剩余 8.5 USD")).toBeInTheDocument();
     expect(screen.getByText("已过期")).toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent("SOCKS5 认证失败");
+    expect(screen.getByRole("status")).toHaveTextContent("上游连接超时");
   });
   it("discards late responses and events from a replaced credential version", async () => {
     let resolveOld!: (q: ProviderQuota) => void;

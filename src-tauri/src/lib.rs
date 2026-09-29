@@ -1,5 +1,6 @@
 mod cleanup;
 mod commands;
+mod configuration;
 mod core;
 mod gateway;
 mod links;
@@ -15,7 +16,7 @@ mod startup_macos;
 mod storage;
 #[cfg(target_os = "macos")]
 mod tray_macos;
-use core::{ConfigDocument, Core, Preferences, ViewState};
+use core::{Core, Preferences, ViewState};
 use std::{
     path::PathBuf,
     sync::{
@@ -155,9 +156,10 @@ fn open_main(
     provider_id: Option<String>,
     client_id: Option<gateway::ClientId>,
 ) -> Result<()> {
-    if page.as_ref().is_some_and(|p| {
-        !["accounts", "config", "gateway", "proxies", "settings"].contains(&p.as_str())
-    }) {
+    if page
+        .as_ref()
+        .is_some_and(|p| !["accounts", "config", "gateway", "settings"].contains(&p.as_str()))
+    {
         return Err(AppError::new("WINDOW", "无效页面"));
     }
     quick::hide_quick(app.clone())?;
@@ -284,12 +286,23 @@ fn delete_account(
     refresh(&app, &r)
 }
 #[tauri::command]
-fn read_config(r: tauri::State<'_, Arc<Runtime>>) -> Result<ConfigDocument> {
-    lock(&r.core)?.read_config()
+fn read_config(
+    client_id: Option<gateway::ClientId>,
+    r: tauri::State<'_, Arc<Runtime>>,
+) -> Result<configuration::Document> {
+    let client = client_id.unwrap_or_default();
+    r.gateway(client).read_config(&r.home(client)?)
 }
 #[tauri::command]
-fn validate_config(text: String) -> Result<()> {
-    core::validate_config(&text)
+fn read_previous_config(
+    client_id: gateway::ClientId,
+    r: tauri::State<'_, Arc<Runtime>>,
+) -> Result<String> {
+    r.gateway(client_id).previous_config()
+}
+#[tauri::command]
+fn validate_config(client_id: Option<gateway::ClientId>, text: String) -> Result<()> {
+    configuration::validate(client_id.unwrap_or_default(), &text)
 }
 #[tauri::command]
 fn save_config(
@@ -297,8 +310,16 @@ fn save_config(
     r: tauri::State<'_, Arc<Runtime>>,
     text: String,
     expected_revision: String,
-) -> Result<ConfigDocument> {
-    let doc = lock(&r.core)?.save_config(&text, &expected_revision)?;
+    client_id: Option<gateway::ClientId>,
+) -> Result<configuration::Document> {
+    let client = client_id.unwrap_or_default();
+    let doc = r
+        .gateway(client)
+        .save_config(&r.home(client)?, &text, &expected_revision)?;
+    let _ = app.emit(
+        "config-state",
+        serde_json::json!({"clientId":client,"revision":doc.revision,"guarded":doc.guarded}),
+    );
     refresh(&app, &r)?;
     Ok(doc)
 }
@@ -1033,6 +1054,7 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut last = Some(state);
+                let mut config_versions = std::collections::HashMap::new();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     if runtime.quitting.load(Ordering::Relaxed) {
@@ -1056,6 +1078,18 @@ pub fn run() {
                                     s.error = Some(e.message);
                                     last = Some(s.clone());
                                     publish(&handle, s);
+                                }
+                            }
+                        }
+                    }
+                    for client in [gateway::ClientId::Codex, gateway::ClientId::Claude] {
+                        if let Ok(doc) = runtime.home(client).and_then(|home| runtime.gateway(client).read_config(&home)) {
+                            let stamp = (doc.path.clone(), doc.revision.clone(), doc.guarded);
+                            if config_versions.get(&client) != Some(&stamp) {
+                                config_versions.insert(client, stamp);
+                                let _ = handle.emit("config-state", serde_json::json!({"clientId":client,"revision":doc.revision,"guarded":doc.guarded}));
+                                if client == gateway::ClientId::Claude {
+                                    let _ = handle.emit("gateway-state", runtime.claude.view());
                                 }
                             }
                         }
@@ -1141,6 +1175,7 @@ pub fn run() {
             rename_account,
             delete_account,
             read_config,
+            read_previous_config,
             validate_config,
             save_config,
             set_preferences,

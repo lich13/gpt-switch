@@ -96,7 +96,7 @@ pub fn read_for(client: ClientId, home: &Path) -> Result<(String, Pair)> {
         .map_err(|_| AppError::new("CONFIG", "配置不是 UTF-8"))?;
     Ok((storage::revision(raw.as_deref()), pair_for(client, text)?))
 }
-fn pair_for(client: ClientId, text: &str) -> Result<Pair> {
+pub(super) fn pair_for(client: ClientId, text: &str) -> Result<Pair> {
     match client {
         ClientId::Codex => pair(&parse(text)?),
         ClientId::Claude => super::claude_config::pair(text),

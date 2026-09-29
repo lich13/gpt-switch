@@ -156,25 +156,8 @@ impl Scheduler {
                         let limit = s.limits[id];
                         let active = s.active.get(id).copied().unwrap_or(0);
                         let health = route.provider_circuit.health();
-                        let proxy_health = route.proxy_circuit.as_ref().map(|c| c.health());
-                        let blocked = proxy_health
-                            .as_ref()
-                            .filter(|h| !h.available)
-                            .map(|h| ("proxy_cooldown", h))
-                            .or_else(|| {
-                                (!health.available).then(|| {
-                                    (
-                                        health
-                                            .cooldown_reason
-                                            .as_deref()
-                                            .unwrap_or("half_open_probe"),
-                                        &health,
-                                    )
-                                })
-                            });
-                        if let Some((_, health)) = blocked {
+                        if !health.available {
                             retry_in = retry_in.min(health.retry_in.max(1));
-
                             continue;
                         }
                         any_ready = true;
@@ -198,10 +181,6 @@ impl Scheduler {
                                 (limit == 0
                                     || s.active.get(id).copied().unwrap_or(0) < limit as usize)
                                     && earlier.provider_circuit.health().available
-                                    && earlier
-                                        .proxy_circuit
-                                        .as_ref()
-                                        .is_none_or(|c| c.health().available)
                                     && !s
                                         .waiting
                                         .iter()

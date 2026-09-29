@@ -384,22 +384,23 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
                 let category = connector::classify(&e);
-                let proxy_failure = category.is_some_and(|e| e.is_proxy());
-                last_category = if proxy_failure { "PROXY" } else { "NETWORK" };
-                permits.failure(&settings, proxy_failure, None);
+                last_category = match category {
+                    Some(connector::ConnectError::Tls) => "TLS",
+                    _ => "NETWORK",
+                };
+                permits.failure(&settings, None);
 
                 protocol.finish(None, last_category);
                 continue;
             }
             Err(_) => {
                 last_category = "FIRST_BYTE_TIMEOUT";
-                permits.failure(&settings, false, None);
+                permits.failure(&settings, None);
 
                 protocol.finish(None, last_category);
                 continue;
             }
         };
-        permits.proxy_success(&settings);
         let status = response.status();
         let response_stream = response
             .headers()
@@ -461,7 +462,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             if status == StatusCode::TOO_MANY_REQUESTS {
                 permits.rate_limited(&settings, cooldown);
             } else {
-                permits.failure(&settings, false, cooldown);
+                permits.failure(&settings, cooldown);
             }
 
             if let Ok(Ok(body)) = captured {
@@ -491,7 +492,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             Ok(Some(Ok(frame))) => Some(frame),
             Ok(None) => None,
             _ => {
-                permits.failure(&settings, false, None);
+                permits.failure(&settings, None);
 
                 last_category = "FIRST_BYTE_TIMEOUT";
                 protocol.finish(Some(status.as_u16()), last_category);
@@ -545,7 +546,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             },
             last_category,
             if attempted == 0 {
-                "没有可用供应商，请检查队列、代理和熔断状态"
+                "没有可用供应商，请检查队列和熔断状态"
             } else {
                 "所有可用供应商均请求失败"
             },
@@ -569,36 +570,24 @@ pub(super) fn settle_protocol(
     use super::protocol::Terminal;
     match protocol.terminal() {
         Some(Terminal::Success | Terminal::Limited) => permits.success(cfg),
-        Some(Terminal::Failure) => permits.failure(cfg, false, None),
+        Some(Terminal::Failure) => permits.failure(cfg, None),
         Some(_) => permits.neutral(cfg),
         None => (),
     }
 }
 pub(super) struct Permits {
     provider: Option<Permit>,
-    proxy: Option<Permit>,
 }
 impl Permits {
     pub(super) fn rate_limited(&mut self, cfg: &Settings, retry: Option<Duration>) {
-        self.proxy_success(cfg);
         if let Some(p) = self.provider.take() {
             p.finish(Outcome::RateLimited(retry), cfg);
         }
     }
     pub(super) fn acquire(route: &Route, manual: bool) -> Option<Self> {
-        let proxy = match &route.proxy_circuit {
-            Some(c) => Some(c.acquire(manual)?),
-            None => None,
-        };
         Some(Self {
             provider: Some(route.provider_circuit.acquire(manual)?),
-            proxy,
         })
-    }
-    pub(super) fn proxy_success(&mut self, cfg: &Settings) {
-        if let Some(p) = self.proxy.take() {
-            p.finish(Outcome::Success, cfg);
-        }
     }
     pub(super) fn success(&mut self, cfg: &Settings) {
         if let Some(p) = self.provider.take() {
@@ -610,21 +599,9 @@ impl Permits {
             p.finish(Outcome::Neutral, cfg);
         }
     }
-    pub(super) fn failure(&mut self, cfg: &Settings, proxy: bool, retry: Option<Duration>) {
-        if proxy {
-            // A failed shared proxy is unavailable immediately; it must not poison each provider.
-            if let Some(p) = self.proxy.take() {
-                p.finish(
-                    Outcome::Failure(Some(Duration::from_secs(cfg.cooldown_seconds))),
-                    cfg,
-                );
-            }
-            self.neutral(cfg);
-        } else {
-            self.proxy_success(cfg);
-            if let Some(p) = self.provider.take() {
-                p.finish(Outcome::Failure(retry), cfg);
-            }
+    pub(super) fn failure(&mut self, cfg: &Settings, retry: Option<Duration>) {
+        if let Some(p) = self.provider.take() {
+            p.finish(Outcome::Failure(retry), cfg);
         }
     }
 }

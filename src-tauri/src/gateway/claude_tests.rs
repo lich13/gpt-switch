@@ -113,6 +113,132 @@ async fn claude_missing_settings_are_created_without_other_fields() {
 }
 
 #[tokio::test]
+async fn visual_config_save_keeps_gateway_fields_and_conflicts_do_not_lose_drafts() {
+    let (_temp, codex, claude, home) =
+        claude_fixture("https://fixture.invalid/sub", "fixture-token").await;
+    let original = claude.read_config(&home).unwrap();
+    claude.start(&claude.view().revision, &home).await.unwrap();
+    let managed = claude.read_config(&home).unwrap();
+    assert!(managed.guarded);
+    let text = managed
+        .text
+        .replacen('{', "{\n  \"language\": \"中文\",", 1);
+    let saved = claude.save_config(&home, &text, &managed.revision).unwrap();
+    assert_eq!(saved.text, text);
+    assert!(
+        takeover::pair_for(ClientId::Claude, &managed.text).unwrap()
+            == takeover::pair_for(ClientId::Claude, &saved.text).unwrap()
+    );
+    let bad = text.replace("127.0.0.1", "other.invalid");
+    assert_eq!(
+        claude
+            .save_config(&home, &bad, &saved.revision)
+            .err()
+            .unwrap()
+            .code,
+        "GATEWAY_ACTIVE"
+    );
+    let outside = text.replacen("中文", "English", 1);
+    std::fs::write(home.join("settings.json"), &outside).unwrap();
+    assert_eq!(
+        claude
+            .save_config(&home, &text, &saved.revision)
+            .err()
+            .unwrap()
+            .code,
+        "CONFLICT"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("settings.json")).unwrap(),
+        outside
+    );
+    claude.stop().await.unwrap();
+    let stopped = claude.read_config(&home).unwrap();
+    assert!(!stopped.guarded);
+    assert!(stopped.text.contains("English"));
+    assert!(
+        takeover::pair_for(ClientId::Claude, &stopped.text).unwrap()
+            == takeover::pair_for(ClientId::Claude, &original.text).unwrap()
+    );
+    assert!(!codex.view().running);
+    assert!(!home.join("auth.json").exists());
+}
+
+#[tokio::test]
+async fn editor_and_gateway_start_are_serial_and_use_revision_checks() {
+    let (_temp, _codex, claude, home) =
+        claude_fixture("https://fixture.invalid/sub", "fixture-token").await;
+    let before = claude.read_config(&home).unwrap();
+    let gateway = claude.clone();
+    let target = home.clone();
+    let revision = claude.view().revision;
+    let start = tokio::spawn(async move { gateway.start(&revision, &target).await });
+    let text = before
+        .text
+        .replacen('{', "{\n  \"showTurnDuration\": false,", 1);
+    let result = claude.save_config(&home, &text, &before.revision);
+    start.await.unwrap().unwrap();
+    if let Err(e) = result {
+        assert!(matches!(e.code.as_str(), "GATEWAY_ACTIVE" | "CONFLICT"));
+    }
+    let current = claude.read_config(&home).unwrap();
+    assert!(current.guarded);
+    assert!(takeover::pair_for(ClientId::Claude, &current.text)
+        .unwrap()
+        .base_url
+        .unwrap()
+        .contains("127.0.0.1"));
+    claude.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn retired_credentials_migrate_once_without_changing_provider_or_other_files() {
+    let (temp, codex, claude, home) =
+        claude_fixture("https://fixture.invalid/sub", "fixture-token").await;
+    let before_config = std::fs::read(home.join("settings.json")).unwrap();
+    let data = temp.path().join("data/claude");
+    let path = data.join("gateway.json");
+    let original = std::fs::read(&path).unwrap();
+    let mut old: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    old["schema"] = 1.into();
+    old["proxies"] = serde_json::json!([{"id":"retired","password":"obsolete-fixture"}]);
+    old["providers"][0]["proxyId"] = "retired".into();
+    std::fs::write(&path, old.to_string()).unwrap();
+    std::fs::write(data.join("proxy-profiles.json"), "obsolete-fixture").unwrap();
+    let upgraded = codex.companion(data.clone()).unwrap();
+    assert!(!upgraded.view().recovery_pending);
+    assert_eq!(
+        upgraded.view().providers[0].id,
+        claude.view().providers[0].id
+    );
+    assert_eq!(upgraded.view().selected, claude.view().selected);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("obsolete-fixture"));
+    assert!(!String::from_utf8_lossy(&bytes).contains("proxyId"));
+    assert!(!data.join("proxy-profiles.json").exists());
+    drop(upgraded);
+    let reopened = codex.companion(data.clone()).unwrap();
+    assert_eq!(bytes, std::fs::read(&path).unwrap());
+    assert_eq!(
+        before_config,
+        std::fs::read(home.join("settings.json")).unwrap()
+    );
+    // Cleanup failures stop import and automatic start until retry succeeds.
+    drop(reopened);
+    std::fs::create_dir(data.join("proxy-profiles.json")).unwrap();
+    let blocked = codex.companion(data.clone()).unwrap();
+    assert!(blocked.view().recovery_pending);
+    assert!(blocked.import_initial(&home).is_err());
+    assert!(blocked
+        .start(&blocked.view().revision, &home)
+        .await
+        .is_err());
+    std::fs::remove_dir(data.join("proxy-profiles.json")).unwrap();
+    blocked.stop().await.unwrap();
+    assert!(!blocked.view().recovery_pending);
+}
+
+#[tokio::test]
 #[ignore = "Explicit real Claude CLI and provider acceptance; reads a supplied private settings file and uses an isolated home"]
 async fn real_claude_http_and_cli_stream_isolated() {
     let settings =
@@ -148,6 +274,17 @@ async fn real_claude_http_and_cli_stream_isolated() {
             .expect("provider must expose a Claude model")
             .clone()
     };
+    let doc = claude.read_config(&home).unwrap();
+    let mut edited: serde_json::Value = serde_json::from_str(&doc.text).unwrap();
+    edited["model"] = model.clone().into();
+    edited["language"] = "English".into();
+    claude
+        .save_config(
+            &home,
+            &serde_json::to_string_pretty(&edited).unwrap(),
+            &doc.revision,
+        )
+        .unwrap();
     let before = std::fs::read(home.join("settings.json")).unwrap();
     claude.start(&claude.view().revision, &home).await.unwrap();
     let body=serde_json::to_vec(&serde_json::json!({"model":model,"max_tokens":64,"messages":[{"role":"user","content":"Reply exactly gateway-claude-ok"}]})).unwrap();
@@ -166,6 +303,7 @@ async fn real_claude_http_and_cli_stream_isolated() {
     let http_ok = serde_json::from_slice::<serde_json::Value>(&response)
         .ok()
         .is_some_and(|v| v["type"] == "message" && v["stop_reason"].is_string());
+    claude.0.inner.lock().unwrap().last_successful = None;
     let mut command = tokio::process::Command::new(cli);
     command.args([
         "-p",
@@ -182,11 +320,10 @@ async fn real_claude_http_and_cli_stream_isolated() {
         r#"{"mcpServers":{}}"#,
         "--setting-sources",
         "user",
-        "--model",
-        &model,
     ]);
     for key in [
         "ANTHROPIC_API_KEY",
+        "ANTHROPIC_MODEL",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
         "CLAUDE_CODE_OAUTH_TOKEN",

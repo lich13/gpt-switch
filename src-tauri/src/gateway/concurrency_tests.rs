@@ -253,9 +253,10 @@ async fn panel_edits_preserve_live_slots_files_and_persist_queue_priority() {
     update(
         &g,
         &t,
-        Edit::RouteProvider {
-            id: ids[0].clone(),
-            proxy_id: None,
+        Edit::SaveProvider {
+            id: Some(ids[0].clone()),
+            base_url: g.view().providers[1].base_url.clone(),
+            token: String::new(),
         },
     );
     assert_eq!(g.view().providers[1].active_requests, 2);
@@ -718,75 +719,6 @@ async fn websocket_waiting_disconnect_and_timeout_release_capacity() {
     g.stop().await.unwrap();
 }
 
-#[tokio::test]
-async fn response_websocket_uses_bound_socks_remote_dns_and_has_no_direct_fallback() {
-    let (target, release, _) = response_ws_server().await;
-    let (proxy, names, _) = socks(true).await;
-    let (t, g) = fixture(vec![format!("http://remote-only.invalid:{target}/sub/v1")]).await;
-    update(
-        &g,
-        &t,
-        Edit::SaveProxy {
-            id: None,
-            name: "fixture".into(),
-            host: "127.0.0.1".into(),
-            port: proxy,
-            username: "fixture-user".into(),
-            password: "fixture-password".into(),
-        },
-    );
-    update(
-        &g,
-        &t,
-        Edit::RouteProvider {
-            id: g.view().providers[0].id.clone(),
-            proxy_id: Some(g.view().proxies[0].id.clone()),
-        },
-    );
-    limit(&g, &t, 0, 1);
-    start(&g, &t).await;
-    let mut ws = responses_client(&g).await;
-    ws.send(yawc::Frame::text(
-        "{\"type\":\"response.create\"}".to_string(),
-    ))
-    .await
-    .unwrap();
-    ws_next(&mut ws).await;
-    release.add_permits(1);
-    ws_next(&mut ws).await;
-    ws_next(&mut ws).await;
-    assert!(names
-        .lock()
-        .unwrap()
-        .contains(&"remote-only.invalid".to_string()));
-    drop(ws);
-    until(|| g.view().providers[0].active_requests == 0).await;
-    update(
-        &g,
-        &t,
-        Edit::SaveProxy {
-            id: Some(g.view().proxies[0].id.clone()),
-            name: "fixture".into(),
-            host: "127.0.0.1".into(),
-            port: proxy,
-            username: "fixture-user".into(),
-            password: "wrong-password".into(),
-        },
-    );
-    let mut ws = responses_client(&g).await;
-    ws.send(yawc::Frame::text(
-        "{\"type\":\"response.create\"}".to_string(),
-    ))
-    .await
-    .unwrap();
-    assert_eq!(
-        ws_next(&mut ws).await.close_code().map(u16::from),
-        Some(1013)
-    );
-    assert_eq!(g.view().providers[0].health.failures, 0);
-    assert!(g.view().proxies[0].health.failures > 0);
-    g.stop().await.unwrap();
-}
 #[tokio::test]
 async fn context_affinity_waits_for_owner_even_with_idle_backup() {
     let (target, release) = held_stream().await;

@@ -65,9 +65,7 @@ const emptyLogin: LoginState = {
 };
 export default function App() {
   const [state, setState] = useState<ViewState | null>(null),
-    [page, setPage] = useState<"accounts" | "config" | "gateway" | "proxies">(
-      "accounts",
-    ),
+    [page, setPage] = useState<"accounts" | "config" | "gateway">("accounts"),
     [search, setSearch] = useState(""),
     [dialog, setDialog] = useState<Dialog>(null),
     [error, setError] = useState(""),
@@ -92,26 +90,23 @@ export default function App() {
   dirtyRef.current = dirty;
   pageRef.current = page;
   const notify = useCallback((s: string) => setMessage(s), []);
-  const navigate = useCallback(
-    (next: "accounts" | "config" | "gateway" | "proxies") => {
-      if (next === pageRef.current) return;
-      if (
-        gatewayDirty.current &&
-        !window.confirm("离开当前页面会丢弃未保存的表单，是否继续？")
-      )
-        return;
-      if (
-        pageRef.current === "config" &&
-        next !== "config" &&
-        dirtyRef.current &&
-        !window.confirm("离开配置页会丢弃未保存的草稿，是否继续？")
-      )
-        return;
-      setPage(next);
-      if (next !== "config") setDirty(false);
-    },
-    [],
-  );
+  const navigate = useCallback((next: "accounts" | "config" | "gateway") => {
+    if (next === pageRef.current) return;
+    if (
+      gatewayDirty.current &&
+      !window.confirm("离开当前页面会丢弃未保存的表单，是否继续？")
+    )
+      return;
+    if (
+      pageRef.current === "config" &&
+      next !== "config" &&
+      dirtyRef.current &&
+      !window.confirm("离开配置页会丢弃未保存的草稿，是否继续？")
+    )
+      return;
+    setPage(next);
+    if (next !== "config") setDirty(false);
+  }, []);
   useEffect(() => {
     const menus = () =>
       document.querySelectorAll<HTMLDetailsElement>(
@@ -171,11 +166,7 @@ export default function App() {
                 setDirty(false);
                 setDialog("settings");
               })()
-            : navigate(
-                p === "config" || p === "gateway" || p === "proxies"
-                  ? p
-                  : "accounts",
-              ),
+            : navigate(p === "config" || p === "gateway" ? p : "accounts"),
       ],
       [
         "provider-settings",
@@ -283,13 +274,6 @@ export default function App() {
           >
             <Network size={17} />
             网关
-          </button>
-          <button
-            className={page === "proxies" ? "nav-item active" : "nav-item"}
-            onClick={() => navigate("proxies")}
-          >
-            <Shield size={17} />
-            代理设置
           </button>
         </nav>
         <div className="sidebar-bottom">
@@ -496,11 +480,10 @@ export default function App() {
               )}
             </div>
           </section>
-        ) : page === "gateway" || page === "proxies" ? (
+        ) : page === "gateway" ? (
           <Suspense fallback={<div className="empty">正在打开网关…</div>}>
             <Gateway
               focusProvider={focusProvider}
-              section={page}
               notify={notify}
               onDirtyChange={gatewayDraftChanged}
             />
@@ -511,6 +494,7 @@ export default function App() {
               <ConfigEditor
                 revision={state.configRevision}
                 home={state.preferences.codexHome}
+                claudeHome={state.preferences.claudeHome ?? "~/.claude"}
                 theme={theme}
                 onDirty={setDirty}
                 onMessage={notify}
@@ -873,8 +857,12 @@ function SettingsForm({
       className="modal-content"
       onSubmit={(e) => {
         e.preventDefault();
-        if (dirty && prefs.codexHome !== preferences.codexHome) {
-          setError("请先保存配置草稿，再切换 Codex 目录");
+        if (
+          dirty &&
+          (prefs.codexHome !== preferences.codexHome ||
+            prefs.claudeHome !== preferences.claudeHome)
+        ) {
+          setError("请先保存或撤销配置草稿，再切换目录");
           return;
         }
         setBusy(true);

@@ -394,15 +394,9 @@ function QuickContent({
                           <Settings2 size={14} />
                         </button>
                       </div>
-                      {providerStatus(
-                        p,
-                        gateway.proxies.find((x) => x.id === p.proxyId),
-                      ) && (
+                      {providerStatus(p) && (
                         <span className="quick-provider-alert">
-                          {providerStatus(
-                            p,
-                            gateway.proxies.find((x) => x.id === p.proxyId),
-                          )}
+                          {providerStatus(p)}
                         </span>
                       )}
                       <div className="quick-provider-secondary">

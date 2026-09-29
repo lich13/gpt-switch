@@ -1,12 +1,5 @@
-import type { Provider, ProxyProfile } from "./types";
-export function providerStatus(p: Provider, proxy?: ProxyProfile): string {
-  if (
-    proxy &&
-    (proxy.health.state !== "closed" || proxy.health.available === false)
-  )
-    return proxy.health.probeInFlight
-      ? "代理恢复探测"
-      : `代理不可用 ${proxy.health.retryIn}s`;
+import type { Provider } from "./types";
+export function providerStatus(p: Provider): string {
   const h = p.health;
   if (h.probeInFlight) return "恢复探测中";
   if (h.cooldownReason === "rate_limit") return `限流 ${h.retryIn}s`;

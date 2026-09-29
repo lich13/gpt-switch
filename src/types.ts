@@ -36,7 +36,14 @@ export type ViewState = {
   };
   error: string | null;
 };
-export type ConfigDocument = { text: string; revision: string; path: string };
+export type ConfigDocument = {
+  clientId: ClientId;
+  text: string;
+  revision: string;
+  path: string;
+  guarded: boolean;
+  canRestore: boolean;
+};
 export type LoginState = {
   phase: string;
   mode: string;
@@ -87,7 +94,6 @@ export type Provider = {
   id: string;
   name: string;
   baseUrl: string;
-  proxyId: string | null;
   queued: boolean;
   health: Health;
   quotaVersion: string;
@@ -95,15 +101,6 @@ export type Provider = {
   maxConcurrency: number;
   activeRequests: number;
   allowedModels: string[] | null;
-};
-export type ProxyProfile = {
-  id: string;
-  name: string;
-  host: string;
-  port: number;
-  username: string;
-  hasPassword: boolean;
-  health: Health;
 };
 export type GatewayState = {
   clientId: ClientId;
@@ -119,7 +116,6 @@ export type GatewayState = {
   configError: string | null;
   configWarning?: string | null;
   providers: Provider[];
-  proxies: ProxyProfile[];
   settings: GatewaySettings;
   activeConnections: number;
   waitingRequests: number;

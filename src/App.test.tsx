@@ -79,6 +79,9 @@ beforeEach(() => {
     error: null,
   };
   doc = {
+    clientId: "codex",
+    guarded: false,
+    canRestore: false,
     text: '# keep\nmodel = "original"\n',
     revision: "cfg-1",
     path: "/test/.codex/config.toml",
@@ -232,6 +235,7 @@ describe("user workflows", () => {
     await u.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() =>
       expect(mocks.command).toHaveBeenCalledWith("save_config", {
+        clientId: "codex",
         text: '# keep\r\nmodel = "updated"\r\n',
         expectedRevision: "cfg-1",
       }),
@@ -261,6 +265,7 @@ describe("user workflows", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("等待草稿的供应商")).toBeInTheDocument();
     expect(mocks.command).toHaveBeenCalledWith("save_config", {
+      clientId: "codex",
       text: draft,
       expectedRevision: "cfg-1",
     });

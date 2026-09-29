@@ -60,10 +60,38 @@ export const demo: ViewState = {
   error: null,
 };
 let doc: ConfigDocument = {
+  clientId: "codex",
+  guarded: false,
+  canRestore: false,
   text: '# Codex 全局配置\nmodel = "gpt-example"\nmodel_reasoning_effort = "high"\n\n# 保留你的注释与其他设置\n[features]\nweb_search_request = true\n',
   revision: "preview",
   path: "~/.codex/config.toml",
 };
+let claudeDoc: ConfigDocument = {
+  clientId: "claude",
+  guarded: false,
+  canRestore: false,
+  path: "~/.claude/settings.json",
+  revision: "preview-claude-config",
+  text:
+    JSON.stringify(
+      {
+        model: "sonnet",
+        env: {
+          ANTHROPIC_BASE_URL: "https://claude.example.com",
+          ANTHROPIC_AUTH_TOKEN: "fixture-only-token",
+          CLAUDE_CODE_EFFORT_LEVEL: "high",
+        },
+        permissions: { defaultMode: "default", allow: ["Read"] },
+        language: "简体中文",
+        autoMemoryEnabled: true,
+        enabledPlugins: { "example@official": true },
+      },
+      null,
+      2,
+    ) + "\n",
+};
+const previousConfig: Record<string, string> = {};
 let login: LoginState = {
   phase: "idle",
   mode: "",
@@ -204,17 +232,44 @@ export async function run(
       });
       break;
     case "read_config":
-      return { ...doc };
+      return { ...(args.clientId === "claude" ? claudeDoc : doc) };
+    case "read_previous_config":
+      if (!previousConfig[String(args.clientId)])
+        throw new Error("没有可恢复的配置");
+      return previousConfig[String(args.clientId)];
     case "validate_config":
+      if (args.clientId === "claude") {
+        (await import("./claude-settings")).tree(String(args.text));
+        return;
+      }
       if (String(args.text).includes("INVALID"))
         throw { code: "TOML", message: "TOML 语法错误", line: 1, column: 1 };
       return;
-    case "save_config":
+    case "save_config": {
       await run("validate_config", args);
-      doc = { ...doc, text: String(args.text), revision: crypto.randomUUID() };
-      demo.configRevision = doc.revision;
-      emit("switch-state", structuredClone(demo));
-      return { ...doc };
+      const current = args.clientId === "claude" ? claudeDoc : doc;
+      if (args.expectedRevision !== current.revision)
+        throw { code: "CONFLICT", message: "配置已被外部修改，草稿已保留" };
+      previousConfig[current.clientId] = current.text;
+      const next = {
+        ...current,
+        text: String(args.text),
+        revision: crypto.randomUUID(),
+        canRestore: true,
+      };
+      if (args.clientId === "claude") claudeDoc = next;
+      else {
+        doc = next;
+        demo.configRevision = doc.revision;
+        emit("switch-state", structuredClone(demo));
+      }
+      emit("config-state", {
+        clientId: next.clientId,
+        revision: next.revision,
+        guarded: next.guarded,
+      });
+      return { ...next };
+    }
     case "set_preferences":
       demo.preferences = args.preferences as ViewState["preferences"];
       break;

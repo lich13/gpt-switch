@@ -3,7 +3,7 @@ import type { ClientId } from "./types";
 
 export const clientName = (client: ClientId) =>
   client === "claude" ? "Claude Code" : "Codex";
-export function useClientSelection(surface: "main" | "quick") {
+export function useClientSelection(surface: "main" | "quick" | "config") {
   const key = `lich13-switch.${surface}.client`;
   const [client, setClient] = useState<ClientId>(() => {
     try {

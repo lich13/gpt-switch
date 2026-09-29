@@ -193,11 +193,11 @@ async fn upstream(
     uri: &Uri,
     original: &HeaderMap,
     settings: &Settings,
-) -> Result<Peer, (Option<u16>, bool, Option<Duration>)> {
+) -> Result<Peer, (Option<u16>, Option<Duration>)> {
     let mut request = Request::new(replay::empty());
     *request.method_mut() = hyper::Method::GET;
     *request.uri_mut() = forward::target_for(route.client_id, &route.provider.base_url, uri)
-        .map_err(|_| (None, false, None))?;
+        .map_err(|_| (None, None))?;
     *request.headers_mut() = original.clone();
     let headers = request.headers_mut();
     forward::clean_headers(headers, true);
@@ -208,7 +208,7 @@ async fn upstream(
         header::AUTHORIZATION,
         format!("Bearer {}", route.provider.token)
             .parse()
-            .map_err(|_| (None, false, None))?,
+            .map_err(|_| (None, None))?,
     );
     let key = STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
     headers.insert(header::SEC_WEBSOCKET_KEY, key.parse().unwrap());
@@ -225,14 +225,8 @@ async fn upstream(
     .await
     {
         Ok(Ok(response)) => response,
-        Ok(Err(e)) => {
-            return Err((
-                None,
-                super::connector::classify(&e).is_some_and(|e| e.is_proxy()),
-                None,
-            ))
-        }
-        Err(_) => return Err((None, false, None)),
+        Ok(Err(_)) => return Err((None, None)),
+        Err(_) => return Err((None, None)),
     };
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
         let retry = response
@@ -240,7 +234,7 @@ async fn upstream(
             .get(header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(circuit::retry_after);
-        return Err((Some(response.status().as_u16()), false, retry));
+        return Err((Some(response.status().as_u16()), retry));
     }
     let expected = STANDARD.encode(Sha1::digest(
         format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
@@ -251,7 +245,7 @@ async fn upstream(
         .and_then(|v| v.to_str().ok())
         != Some(&expected)
     {
-        return Err((Some(502), false, None));
+        return Err((Some(502), None));
     }
     let extensions = response
         .headers()
@@ -260,14 +254,14 @@ async fn upstream(
         .map(str::to_owned);
     let io = hyper::upgrade::on(&mut response)
         .await
-        .map_err(|_| (None, false, None))?;
+        .map_err(|_| (None, None))?;
     let socket = WebSocket::from_stream_with_extensions(
         TokioIo::new(io),
         yawc::Role::Client,
         extensions.as_deref(),
         options(),
     )
-    .map_err(|_| (None, false, None))?;
+    .map_err(|_| (None, None))?;
     Ok(Peer::new(socket))
 }
 fn turn_model(
@@ -377,15 +371,14 @@ async fn session(
         };
         match result {
             Ok(peer) => {
-                admission.permits.proxy_success(cfg);
                 break (peer, admission, super::protocol::Protocol::new(true));
             }
-            Err((status, proxy, retry)) => {
+            Err((status, retry)) => {
                 let retryable = status.is_none_or(circuit::retryable);
                 if status == Some(429) {
                     admission.permits.rate_limited(cfg, retry);
                 } else if retryable {
-                    admission.permits.failure(cfg, proxy, retry);
+                    admission.permits.failure(cfg, retry);
                 } else {
                     admission.permits.neutral(cfg);
                 }
@@ -408,7 +401,7 @@ async fn session(
             u.finish(Some(101), "NETWORK");
         }
         if let Some(mut admission) = turn.take() {
-            admission.permits.failure(cfg, false, None);
+            admission.permits.failure(cfg, None);
         }
         return Err(e);
     }
@@ -445,7 +438,7 @@ async fn session(
                         u.finish(Some(101), "NETWORK");
                     }
                     if let Some(mut admission) = turn.take() {
-                        admission.permits.failure(cfg, false, None);
+                        admission.permits.failure(cfg, None);
                     }
                     return Err(e);
                 }
@@ -456,13 +449,13 @@ async fn session(
             frame = upstream_peer.incoming.recv() => {
                 let Some(frame) = frame else {
                     if let Some(mut u)=protocol.take(){u.finish(Some(101),"STREAM_INTERRUPTED");}
-                    if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, false, None);  }
+                    if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None);  }
                     return Err((1011, "upstream disconnected"));
                 };
                 let closing = frame.opcode() == OpCode::Close;
                 if closing {
                     if let Some(mut u)=protocol.take(){u.finish(Some(101),"STREAM_INTERRUPTED");}
-                    if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, false, None);  }
+                    if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None);  }
                 }
                 if !frame.opcode().is_control() {
                     received = true;
@@ -495,14 +488,14 @@ async fn session(
                     pending = Some(frame);
                 } else if let Err(e) = upstream_peer.send(frame).await {
                     if let Some(mut u) = protocol.take() { u.finish(Some(101), "NETWORK"); }
-                    if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, false, None); }
+                    if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None); }
                     return Err(e);
                 }
                 if closing { return Ok(()); }
             },
             _ = tokio::time::sleep_until(deadline), if turn.is_some() => {
                 if let Some(mut u)=protocol.take(){u.finish(Some(101),if received {"STREAM_TIMEOUT"}else{"FIRST_BYTE_TIMEOUT"});}
-                if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, false, None); }
+                if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None); }
 
                 upstream_peer.close(1011, "upstream timeout").await;
                 return Err((1011, "upstream timeout"));

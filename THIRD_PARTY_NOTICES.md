@@ -4,7 +4,7 @@ The circuit breaker defaults, state machine, queue policy, HTTP error classifica
 
 Source: https://github.com/farion1231/cc-switch/tree/1ee2fdc3a791f1e73476c631c7ab7ce8fac0638f/src-tauri/src/proxy
 
-Changes: single-lock state transitions with generation-tagged RAII permits; Retry-After; separate proxy circuits; strict per-request queue priority; raw-byte transport without cc-switch payload adapters.
+Changes: single-lock state transitions with generation-tagged RAII permits; Retry-After; strict per-request queue priority; raw-byte transport without cc-switch payload adapters.
 
 MIT License
 
@@ -60,3 +60,11 @@ The native power helper is an original implementation using public macOS XPC and
 ## Tauri NSIS template
 
 `src-tauri/installer.nsi` derives from Tauri CLI v2.11.4, [upstream installer.nsi](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi). Upgrade registry identities and an in-place rename migration preserve data and protocol choices. MIT license: `licenses/tauri-MIT.txt`.
+
+## Claude configuration editing
+
+The field catalog follows Anthropic's official Claude Code settings and model configuration documentation. JSON tree parsing uses jsonc-parser (MIT); edits preserve unrelated source bytes. Unknown fields are not removed.
+
+https://code.claude.com/docs/en/settings
+https://code.claude.com/docs/en/model-config
+https://github.com/microsoft/node-jsonc-parser

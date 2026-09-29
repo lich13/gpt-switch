@@ -1,6 +1,7 @@
 mod claude_config;
 mod client;
-mod network;
+mod registry;
+mod retired;
 pub use client::{claude_home, ClientId};
 mod admission;
 pub mod catalog;
@@ -24,7 +25,7 @@ use circuit::{Circuit, Health};
 use connector::Connector;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 pub use model::{Edit, Settings};
-use model::{Provider, Proxy, Store};
+use model::{Provider, Store};
 use replay::WireBody;
 use serde::Serialize;
 use std::{
@@ -44,7 +45,6 @@ pub struct ProviderView {
     pub id: String,
     pub name: String,
     base_url: String,
-    proxy_id: Option<String>,
     queued: bool,
     health: Health,
     quota_version: String,
@@ -52,17 +52,6 @@ pub struct ProviderView {
     pub max_concurrency: u32,
     pub active_requests: usize,
     pub allowed_models: Option<Vec<String>>,
-}
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct ProxyView {
-    id: String,
-    name: String,
-    host: String,
-    port: u16,
-    username: String,
-    has_password: bool,
-    health: Health,
 }
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -80,7 +69,6 @@ pub struct View {
     pub config_error: Option<String>,
     pub config_warning: Option<String>,
     pub providers: Vec<ProviderView>,
-    pub proxies: Vec<ProxyView>,
     pub settings: Settings,
     pub active_connections: usize,
     pub waiting_requests: usize,
@@ -91,6 +79,7 @@ struct Inner {
     store: Store,
     revision: String,
     running: bool,
+    upgrade_pending: bool,
     shutdown: Option<watch::Sender<bool>>,
     listener_task: Option<tokio::task::JoinHandle<()>>,
     error: Option<String>,
@@ -101,7 +90,7 @@ struct Inner {
 }
 struct Shared {
     client: ClientId,
-    network: Arc<network::Network>,
+    registry: Arc<registry::Registry>,
     inner: Mutex<Inner>,
     lifecycle: tokio::sync::Mutex<()>,
     clients: Mutex<HashMap<String, HttpClient>>,
@@ -121,37 +110,36 @@ struct Route {
     provider: Provider,
     client: HttpClient,
     provider_circuit: Circuit,
-    proxy_circuit: Option<Circuit>,
 }
 fn pkey(p: &Provider) -> String {
     format!("provider:{}:{}", p.id, p.version)
-}
-fn xkey(p: &Proxy) -> String {
-    format!("proxy:{}:{}", p.id, p.version)
 }
 impl Gateway {
     pub fn new(data: PathBuf) -> Result<Self> {
         Self::new_client(data, ClientId::Codex, None)
     }
     pub fn companion(&self, data: PathBuf) -> Result<Self> {
-        Self::new_client(data, ClientId::Claude, Some(self.0.network.clone()))
+        Self::new_client(data, ClientId::Claude, Some(self.0.registry.clone()))
     }
     fn new_client(
         data: PathBuf,
         client: ClientId,
-        shared: Option<Arc<network::Network>>,
+        shared: Option<Arc<registry::Registry>>,
     ) -> Result<Self> {
         storage::private_dir(&data)?;
-        let error = takeover::recover(&data).err().map(|e| e.message);
+        let error = takeover::recover(&data)
+            .and_then(|()| retired::migrate(&data))
+            .err()
+            .map(|e| e.message);
+        let upgrade_pending = error.is_some();
         let (mut store, revision) = Store::load(&data.join("gateway.json"))?;
         if revision == "missing" {
             store.settings.port = client.port();
         }
-        let network = match shared {
+        let registry = match shared {
             Some(n) => n,
-            None => network::Network::new(&data, &store.proxies)?,
+            None => Arc::new(registry::Registry::default()),
         };
-        store.proxies = network.snapshot().0;
         let spool = tempfile::Builder::new()
             .prefix("gateway-spool-")
             .tempdir_in(&data)
@@ -162,11 +150,12 @@ impl Gateway {
         admission.configure(&store.providers, false);
         let gateway = Self(Arc::new(Shared {
             client,
-            network: network.clone(),
+            registry: registry.clone(),
             inner: Mutex::new(Inner {
                 store,
                 revision,
                 running: false,
+                upgrade_pending,
                 shutdown: None,
                 listener_task: None,
                 error,
@@ -185,16 +174,19 @@ impl Gateway {
             catalog: catalog::Service::new(),
             admission,
         }));
-        network.register(&gateway.0);
+        registry.register(&gateway.0);
         Ok(gateway)
     }
     pub fn import_initial(&self, home: &Path) -> Result<()> {
         if self.0.client != ClientId::Claude {
             return Ok(());
         }
-        let _guard = self.0.network.mutation.lock().unwrap();
+        let _guard = self.0.registry.mutation.lock().unwrap();
         let mut s = self.0.inner.lock().unwrap();
         s.home = Some(home.to_owned());
+        if s.upgrade_pending {
+            return Err(AppError::new("CLEANUP", "请先处理未完成的升级清理"));
+        }
         if s.store.initialized {
             return Ok(());
         }
@@ -210,7 +202,7 @@ impl Gateway {
                 return Ok(());
             }
             let (base_url, token) = takeover::import_for(self.0.client, home)?;
-            for port in self.0.network.ports.lock().unwrap().iter() {
+            for port in self.0.registry.ports.lock().unwrap().iter() {
                 model::base_url(&base_url, *port)?;
             }
             next.edit(
@@ -232,7 +224,7 @@ impl Gateway {
         self.0.client
     }
     fn view_revision(&self, s: &Inner) -> String {
-        storage::digest(format!("{}:{}", s.revision, self.0.network.snapshot().1).as_bytes())
+        s.revision.clone()
     }
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.0.events.subscribe()
@@ -299,7 +291,6 @@ impl Gateway {
                     id: p.id.clone(),
                     name: p.name.clone(),
                     base_url: p.base_url.clone(),
-                    proxy_id: p.proxy_id.clone(),
                     queued: p.queued,
                     health: health(pkey(p)),
                     quota_version: Self::quota_version(&s.store, p),
@@ -312,28 +303,53 @@ impl Gateway {
                         .cached(&p.id, &Self::quota_version(&s.store, p)),
                 })
                 .collect(),
-            proxies: s
-                .store
-                .proxies
-                .iter()
-                .map(|p| ProxyView {
-                    id: p.id.clone(),
-                    name: p.name.clone(),
-                    host: p.host.clone(),
-                    port: p.port,
-                    username: p.username.clone(),
-                    has_password: !p.password.is_empty(),
-                    health: health(xkey(p)),
-                })
-                .collect(),
             active_connections: self.0.active.load(Ordering::Relaxed),
             waiting_requests: waiting,
             error: s.error.clone(),
-            recovery_pending: self.0.data.join("gateway-recovery.json").exists(),
+            recovery_pending: s.upgrade_pending
+                || self.0.data.join("gateway-recovery.json").exists(),
         }
     }
     pub fn observe_home(&self, home: &Path) {
         self.0.inner.lock().unwrap().home = Some(home.to_owned());
+    }
+    pub fn read_config(&self, home: &Path) -> Result<crate::configuration::Document> {
+        let s = self.0.inner.lock().unwrap();
+        crate::configuration::read(
+            self.0.client,
+            home,
+            &self.0.data,
+            s.running || self.0.data.join("gateway-recovery.json").exists(),
+        )
+    }
+    pub fn previous_config(&self) -> Result<String> {
+        crate::configuration::previous(self.0.client, &self.0.data)
+    }
+    pub fn save_config(
+        &self,
+        home: &Path,
+        text: &str,
+        expected: &str,
+    ) -> Result<crate::configuration::Document> {
+        let s = self.0.inner.lock().unwrap();
+        crate::configuration::validate(self.0.client, text)?;
+        let guarded = s.running || self.0.data.join("gateway-recovery.json").exists();
+        if guarded {
+            let current = takeover::read_for(self.0.client, home)?.1;
+            let next = takeover::pair_for(self.0.client, text)?;
+            if current != next {
+                return Err(AppError::new(
+                    "GATEWAY_ACTIVE",
+                    "请先停用网关并处理恢复事务，再修改连接地址或 Token",
+                ));
+            }
+        }
+        let result =
+            crate::configuration::save(self.0.client, home, &self.0.data, text, expected, guarded)?;
+        drop(s);
+        self.observe_home(home);
+        self.changed();
+        Ok(result)
     }
     fn exit_provider<'a>(store: &'a Store, last: Option<&str>) -> Result<&'a Provider> {
         let p = if store.mode == "manual" {
@@ -365,14 +381,7 @@ impl Gateway {
         home: &Path,
         config_revision: Option<&str>,
     ) -> Result<View> {
-        let _network_guard = self.0.network.mutation.lock().unwrap();
-        if matches!(&edit, Edit::SaveProxy { .. } | Edit::DeleteProxy { .. }) {
-            if expected != self.view_revision(&self.0.inner.lock().unwrap()) {
-                return Err(AppError::new("CONFLICT", "网关设置已变化，请刷新后重试"));
-            }
-            self.0.network.edit(edit)?;
-            return Ok(self.view());
-        }
+        let _network_guard = self.0.registry.mutation.lock().unwrap();
         let mut s = self.0.inner.lock().unwrap();
         s.home = Some(home.to_owned());
         if expected != self.view_revision(&s) {
@@ -384,11 +393,14 @@ impl Gateway {
         if !s.running && self.0.data.join("gateway-recovery.json").exists() {
             return Err(AppError::new("RECOVERY", "请先处理未完成的配置事务"));
         }
+        if s.upgrade_pending {
+            return Err(AppError::new("CLEANUP", "请先处理未完成的升级清理"));
+        }
         let direct_select = !s.running && matches!(&edit, Edit::Select { .. });
         let mut next = s.store.clone();
         match edit {
-            Edit::Reset { id, proxy } => {
-                let prefix = format!("{}:{id}:", if proxy { "proxy" } else { "provider" });
+            Edit::Reset { id } => {
+                let prefix = format!("provider:{id}:");
                 for (k, c) in &s.circuits {
                     if k.starts_with(&prefix) {
                         c.reset();
@@ -408,7 +420,7 @@ impl Gateway {
             }
             edit => next.edit(edit, s.running)?,
         }
-        let mut ports = self.0.network.ports.lock().unwrap().clone();
+        let mut ports = self.0.registry.ports.lock().unwrap().clone();
         ports.push(next.settings.port);
         for provider in &next.providers {
             for port in &ports {
@@ -419,7 +431,7 @@ impl Gateway {
         if next.settings.port != s.store.settings.port {
             for peer in self
                 .0
-                .network
+                .registry
                 .gateways
                 .lock()
                 .unwrap()
@@ -479,7 +491,7 @@ impl Gateway {
                 .collect(),
         );
         drop(s);
-        self.0.network.update_ports();
+        self.0.registry.update_ports();
         self.0.clients.lock().unwrap().clear();
         self.changed();
         Ok(self.view())
@@ -502,6 +514,9 @@ impl Gateway {
             if s.running {
                 drop(s);
                 return Ok(self.view());
+            }
+            if s.upgrade_pending {
+                return Err(AppError::new("CLEANUP", "请先处理未完成的升级清理"));
             }
             if s.store.providers.is_empty() {
                 return Err(AppError::new("PROVIDER", "请先添加供应商"));
@@ -679,7 +694,9 @@ impl Gateway {
                     s.store = next;
                 }
             }
-            if let Err(e) = takeover::recover(&self.0.data) {
+            if let Err(e) =
+                takeover::recover(&self.0.data).and_then(|()| retired::migrate(&self.0.data))
+            {
                 s.error = Some(e.message.clone());
                 drop(s);
                 self.changed();
@@ -690,13 +707,13 @@ impl Gateway {
             if revision == "missing" {
                 store.settings.port = self.0.client.port();
             }
-            store.proxies = self.0.network.snapshot().0;
             s.store = store;
             s.revision = revision;
             if let Some(tx) = s.shutdown.take() {
                 let _ = tx.send(true);
             }
             s.running = false;
+            s.upgrade_pending = false;
             self.0.admission.configure(&s.store.providers, false);
             s.error = None;
             s.listener_task.take()
@@ -770,16 +787,8 @@ impl Gateway {
         drop(s);
         self.changed();
     }
-    fn quota_version(store: &Store, p: &Provider) -> String {
-        format!(
-            "{}:{}",
-            p.version,
-            p.proxy_id
-                .as_ref()
-                .and_then(|id| store.proxies.iter().find(|x| &x.id == id))
-                .map(|x| x.version.as_str())
-                .unwrap_or("direct")
-        )
+    fn quota_version(_store: &Store, p: &Provider) -> String {
+        p.version.clone()
     }
     pub fn quota_events(&self) -> broadcast::Receiver<QuotaView> {
         self.0.quota.subscribe()
@@ -808,11 +817,6 @@ impl Gateway {
                 .iter()
                 .find(|p| p.id == id)
                 .ok_or_else(|| AppError::new("PROVIDER", "供应商不存在"))?;
-            let proxy = p
-                .proxy_id
-                .as_ref()
-                .and_then(|id| s.store.proxies.iter().find(|x| &x.id == id))
-                .cloned();
             quota::Query {
                 client_id: self.0.client,
                 id: p.id.clone(),
@@ -822,8 +826,8 @@ impl Gateway {
                 client: Client::builder(TokioExecutor::new())
                     .retry_canceled_requests(false)
                     .build(
-                        Connector::new(proxy, Duration::from_secs(10), s.store.settings.port)
-                            .with_ports(self.0.network.ports.clone()),
+                        Connector::new(Duration::from_secs(10), s.store.settings.port)
+                            .with_ports(self.0.registry.ports.clone()),
                     ),
             }
         })
@@ -844,7 +848,7 @@ impl Gateway {
         Ok(result)
     }
     pub async fn test_connection(&self, id: &str) -> Result<u64> {
-        let (p, proxy, cfg) = {
+        let (p, cfg) = {
             let s = self.0.inner.lock().unwrap();
             let p = s
                 .store
@@ -853,15 +857,10 @@ impl Gateway {
                 .find(|p| p.id == id)
                 .ok_or_else(|| AppError::new("PROVIDER", "供应商不存在"))?
                 .clone();
-            let proxy = p
-                .proxy_id
-                .as_ref()
-                .and_then(|id| s.store.proxies.iter().find(|x| &x.id == id))
-                .cloned();
-            (p, proxy, s.store.settings.clone())
+            (p, s.store.settings.clone())
         };
-        let connector = Connector::new(proxy, Duration::from_secs(cfg.connect_seconds), cfg.port)
-            .with_ports(self.0.network.ports.clone());
+        let connector = Connector::new(Duration::from_secs(cfg.connect_seconds), cfg.port)
+            .with_ports(self.0.registry.ports.clone());
         let began = Instant::now();
         let uri = p
             .base_url
@@ -876,21 +875,8 @@ impl Gateway {
     fn route(&self, id: &str) -> Option<Route> {
         let mut s = self.0.inner.lock().unwrap();
         let provider = s.store.providers.iter().find(|p| p.id == id)?.clone();
-        let proxy = provider
-            .proxy_id
-            .as_ref()
-            .and_then(|id| s.store.proxies.iter().find(|p| &p.id == id))
-            .cloned();
         let provider_circuit = s.circuits.entry(pkey(&provider)).or_default().clone();
-        let proxy_circuit = proxy
-            .as_ref()
-            .map(|p| s.circuits.entry(xkey(p)).or_default().clone());
-        let key = format!(
-            "{}:{}:{}",
-            pkey(&provider),
-            proxy.as_ref().map(xkey).unwrap_or_default(),
-            s.store.settings.connect_seconds
-        );
+        let key = format!("{}:{}", pkey(&provider), s.store.settings.connect_seconds);
         let mut clients = self.0.clients.lock().unwrap();
         let client = clients
             .entry(key)
@@ -901,11 +887,10 @@ impl Gateway {
                     .retry_canceled_requests(false)
                     .build(
                         Connector::new(
-                            proxy.clone(),
                             Duration::from_secs(s.store.settings.connect_seconds),
                             s.store.settings.port,
                         )
-                        .with_ports(self.0.network.ports.clone()),
+                        .with_ports(self.0.registry.ports.clone()),
                     )
             })
             .clone();
@@ -914,7 +899,6 @@ impl Gateway {
             provider,
             client,
             provider_circuit,
-            proxy_circuit,
         })
     }
     #[cfg(test)]
