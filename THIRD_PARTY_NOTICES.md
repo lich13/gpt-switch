@@ -51,6 +51,10 @@ Usage and pricing UI behavior was independently implemented with behavioral refe
 
 https://github.com/farion1231/cc-switch/tree/846de29c13ac4d65f164db8c15dd5fd58e29f972/src/components/usage
 
+The v0.6.1 independent 429 cooldown and operations overview also use behavioral references from Wei-Shaw/sub2api at `9a62841fd124d026cf3694fcf9b79e98addcdbdc`: `backend/internal/service/rate_limit_429_cooldown_test.go` and `backend/internal/repository/ops_repo_dashboard.go` (LGPL-3.0). No Go code or tests are copied. gpt-Switch counts client logical requests, retains separate upstream attempts, and separates business rejection/cancellation from service failure.
+
+https://github.com/Wei-Shaw/sub2api/tree/9a62841fd124d026cf3694fcf9b79e98addcdbdc/backend/internal
+
 LiteLLM model price data is bundled from the public MIT-licensed repository at https://github.com/BerriAI/litellm . The bundled seed records its source URL, download timestamp and SHA-256; prices are used only for estimates.
 
 models.dev model metadata and pricing are read from https://models.dev/api.json . The models.dev project is MIT licensed; its data remains attributed to that source.

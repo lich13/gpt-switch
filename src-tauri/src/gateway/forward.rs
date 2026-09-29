@@ -39,6 +39,8 @@ pub async fn serve(
 }
 #[derive(Clone)]
 struct LocalError(String);
+#[derive(Clone)]
+struct DeferredUsage;
 pub(super) fn error(status: StatusCode, code: &str, message: &str) -> Response<WireBody> {
     let mut response=Response::builder().status(status).header(header::CONTENT_TYPE,"application/json")
         .body(replay::full(serde_json::to_vec(&serde_json::json!({"error":{"type":"gpt_switch_gateway","code":code,"message":message}})).unwrap())).unwrap();
@@ -194,20 +196,35 @@ impl Observe {
 }
 async fn forward(gateway: Gateway, request: Request<Incoming>) -> Response<WireBody> {
     let logical_id = uuid::Uuid::new_v4().to_string();
-    let response = forward_inner(gateway.clone(), request, logical_id.clone()).await;
+    let response_ws = request
+        .headers()
+        .get(header::UPGRADE)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        && matches!(
+            request.uri().path().trim_end_matches('/'),
+            "/responses" | "/v1/responses"
+        );
+    let logical = gateway.0.usage.logical(&logical_id, !response_ws);
+    let response = forward_inner(gateway.clone(), request, logical.clone()).await;
     if let Some(error) = response.extensions().get::<LocalError>() {
-        gateway
-            .0
-            .usage
-            .rejected(&logical_id, response.status().as_u16(), &error.0, None);
+        if response_ws {
+            gateway
+                .0
+                .usage
+                .rejected(&logical_id, response.status().as_u16(), &error.0, None);
+        }
+        logical.reject(response.status().as_u16(), &error.0);
+    } else if response.extensions().get::<DeferredUsage>().is_none() {
+        logical.finish_last(response.status().as_u16());
     }
     response
 }
 async fn forward_inner(
     gateway: Gateway,
     mut request: Request<Incoming>,
-    logical_id: String,
+    logical: crate::usage::LogicalSpan,
 ) -> Response<WireBody> {
+    let logical_id = logical.id();
     let began = Instant::now();
     let (settings, mode, mut ids, token, running) = {
         let s = gateway.0.inner.lock().unwrap();
@@ -349,10 +366,12 @@ async fn forward_inner(
     } else {
         Requirement::model(model.as_deref())
     };
+    logical.model(model.as_deref());
     let mut last = None;
     let mut attempted = 0usize;
     let mut last_category = "NO_PROVIDER";
     let mut wait_budget = Budget::new(settings.queue_seconds);
+    wait_budget.trace = logical.trace();
     while !ids.is_empty() && attempted <= settings.max_retries && (!pinned || attempted == 0) {
         let candidates: Vec<_> = ids
             .iter()
@@ -376,6 +395,9 @@ async fn forward_inner(
         {
             Ok(value) => value,
             Err(Rejected::Full | Rejected::Timeout) => {
+                if attempted > 0 {
+                    break;
+                }
                 let mut response = error(
                     StatusCode::TOO_MANY_REQUESTS,
                     "CAPACITY",
@@ -384,6 +406,20 @@ async fn forward_inner(
                 response
                     .headers_mut()
                     .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+                return response;
+            }
+            Err(Rejected::Cooling(seconds)) => {
+                if attempted > 0 {
+                    break;
+                }
+                let mut response = error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "PROVIDERS_COOLING_DOWN",
+                    "供应商正在冷却或恢复探测，请稍后重试",
+                );
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, seconds.max(1).into());
                 return response;
             }
             Err(Rejected::Model) => {
@@ -435,6 +471,7 @@ async fn forward_inner(
             service_tier.as_deref(),
             stream_hint,
         );
+        usage.attach(&logical, &wait_budget.trace);
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(if stream_hint {
                 settings.first_byte_seconds
@@ -475,7 +512,7 @@ async fn forward_inner(
             .unwrap_or("");
         usage.response(status.as_u16(), response_stream, encoding);
         if status == StatusCode::SWITCHING_PROTOCOLS && websocket {
-            gateway.successful_response(&route.provider);
+            usage.final_attempt();
             permits.success(&settings);
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             let (mut response_parts, _) = response.into_parts();
@@ -500,6 +537,9 @@ async fn forward_inner(
                             "STREAM_INTERRUPTED"
                         },
                     );
+                    if usage.outcome_class() == "success" {
+                        g.successful_response(&route.provider);
+                    }
                     permits.neutral(&cfg);
                     g.record(
                         &route,
@@ -514,7 +554,9 @@ async fn forward_inner(
                     );
                 }
             });
-            return Response::from_parts(response_parts, replay::empty());
+            let mut response = Response::from_parts(response_parts, replay::empty());
+            response.extensions_mut().insert(DeferredUsage);
+            return response;
         }
         if circuit::retryable(status.as_u16()) {
             let cooldown = response
@@ -529,7 +571,11 @@ async fn forward_inner(
                 Replay::capture(body, gateway.0.spool.path()),
             )
             .await;
-            permits.failure(&settings, false, cooldown);
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                permits.rate_limited(&settings, cooldown);
+            } else {
+                permits.failure(&settings, false, cooldown);
+            }
             gateway.record(&route, Some(status.as_u16()), started, attempt, "HTTP");
             if let Ok(Ok(body)) = captured {
                 body.observe_usage(&mut usage).await;
@@ -572,9 +618,6 @@ async fn forward_inner(
                 continue;
             }
         };
-        if status.is_success() {
-            gateway.successful_response(&route.provider);
-        }
         let total_deadline = tokio::time::Instant::now()
             + Duration::from_secs(settings.total_seconds).saturating_sub(began.elapsed());
         let mut observe = Observe::new(
@@ -586,13 +629,14 @@ async fn forward_inner(
         let g = gateway.clone();
         let cfg = settings.clone();
         let neutral = status.as_u16() >= 400;
+        usage.final_attempt();
         let output = async_stream::try_stream! {
             let _active=active;
             let _slot=slot;
             if let Some(frame)=first {
-                if let Some(data)=frame.data_ref(){observe.feed(data);usage.feed(data);}
+                if let Some(data)=frame.data_ref(){observe.feed(data);usage.feed(data);settle_usage(&mut usage,&mut permits,&cfg);}
                 let complete=body.is_end_stream();
-                if complete {observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
+                if complete {observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});settle_usage(&mut usage,&mut permits,&cfg);if usage.outcome_class()=="success" { g.successful_response(&route.provider); } g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
                 yield frame;
                 if complete {return;}
             }
@@ -600,24 +644,27 @@ async fn forward_inner(
                 let limit=if stream {tokio::time::Instant::now()+Duration::from_secs(cfg.idle_seconds)}else{total_deadline};
                 match tokio::time::timeout_at(limit,body.frame()).await {
                     Ok(Some(Ok(frame)))=>{
-                        if let Some(data)=frame.data_ref(){observe.feed(data);usage.feed(data);}
+                        if let Some(data)=frame.data_ref(){observe.feed(data);usage.feed(data);settle_usage(&mut usage,&mut permits,&cfg);}
                         let complete=body.is_end_stream();
-                        if complete {observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
+                        if complete {observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});settle_usage(&mut usage,&mut permits,&cfg);if usage.outcome_class()=="success" { g.successful_response(&route.provider); } g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});}
                         yield frame;
                         if complete {break;}
                     }
-                    Ok(None)=>{observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});if neutral{permits.neutral(&cfg);}else{permits.success(&cfg);}
+                    Ok(None)=>{observe.finish();usage.finish(Some(status.as_u16()),if neutral{"HTTP"}else{"OK"});settle_usage(&mut usage,&mut permits,&cfg);if usage.outcome_class()=="success" { g.successful_response(&route.provider); }
                         g.record(&route,Some(status.as_u16()),began,attempt,if neutral{"CLIENT_ERROR"}else{"OK"});break;}
                     result=>{
                         let category=if result.is_err(){"STREAM_TIMEOUT"}else{"STREAM_INTERRUPTED"};
                         usage.finish(Some(status.as_u16()),category);
-                        permits.failure(&cfg,false,None);g.record(&route,Some(status.as_u16()),began,attempt,category);
+                        settle_usage(&mut usage,&mut permits,&cfg);g.record(&route,Some(status.as_u16()),began,attempt,category);
                         Err::<(),BoxError>(std::io::Error::other("上游流中断").into())?;
                     }
                 }
             }
         };
-        return Response::from_parts(response_parts, StreamBody::new(output).boxed_unsync());
+        let mut response =
+            Response::from_parts(response_parts, StreamBody::new(output).boxed_unsync());
+        response.extensions_mut().insert(DeferredUsage);
+        return response;
     }
     last.unwrap_or_else(|| {
         error(
@@ -635,11 +682,31 @@ async fn forward_inner(
         )
     })
 }
+pub(super) fn settle_usage(usage: &mut crate::usage::Span, permits: &mut Permits, cfg: &Settings) {
+    use crate::usage::parser::Terminal;
+    match usage.terminal() {
+        Some(Terminal::Success | Terminal::Limited) => permits.success(cfg),
+        Some(Terminal::Failure) => permits.failure(cfg, false, None),
+        Some(_) => permits.neutral(cfg),
+        None if usage.finished() => match usage.outcome_class() {
+            "success" => permits.success(cfg),
+            "failure" => permits.failure(cfg, false, None),
+            _ => permits.neutral(cfg),
+        },
+        _ => (),
+    }
+}
 pub(super) struct Permits {
     provider: Option<Permit>,
     proxy: Option<Permit>,
 }
 impl Permits {
+    pub(super) fn rate_limited(&mut self, cfg: &Settings, retry: Option<Duration>) {
+        self.proxy_success(cfg);
+        if let Some(p) = self.provider.take() {
+            p.finish(Outcome::RateLimited(retry), cfg);
+        }
+    }
     pub(super) fn acquire(route: &Route, manual: bool) -> Option<Self> {
         let proxy = match &route.proxy_circuit {
             Some(c) => Some(c.acquire(manual)?),

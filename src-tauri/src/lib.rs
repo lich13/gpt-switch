@@ -707,6 +707,18 @@ async fn gateway_smoke(r: &Runtime) -> Result<()> {
     .map_err(|_| AppError::new("SMOKE", "网关响应超时"))?
     .map_err(storage::io_error)?;
     r.gateway.stop().await?;
+    let usage = r.gateway.usage();
+    usage.flush();
+    let summary = usage.dashboard(usage::Filters::default())?.summary;
+    if (
+        summary.requests,
+        summary.rejected,
+        summary.failures,
+        summary.attempts,
+    ) != (1, 1, 0, 0)
+    {
+        return Err(AppError::new("SMOKE", "逻辑请求统计或拒绝分类校验失败"));
+    }
     if !response.starts_with(b"HTTP/1.1 401")
         || auth != storage::read_optional(&home.join("auth.json"))?
         || config != storage::read_optional(&home.join("config.toml"))?

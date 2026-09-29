@@ -379,6 +379,9 @@ async fn port_conflict_startup_recovery_and_single_candidate_breaker() {
     })
     .await;
     let (t, g) = fixture(vec![format!("http://127.0.0.1:{port}")]).await;
+    let mut settings = g.view().settings;
+    settings.queue_seconds = 1;
+    update(&g, &t, Edit::Settings { settings });
     let occupied = tokio::net::TcpListener::bind(("127.0.0.1", g.view().settings.port))
         .await
         .unwrap();
@@ -395,7 +398,8 @@ async fn port_conflict_startup_recovery_and_single_candidate_breaker() {
     start(&g, &t).await;
     assert_eq!(request(&g, "/v1/a", vec![], vec![]).await.status(), 429);
     assert_eq!(request(&g, "/v1/a", vec![], vec![]).await.status(), 503);
-    assert!(g.view().providers[0].health.retry_in >= 119);
+    assert!(g.view().providers[0].health.retry_in >= 118);
+    assert_eq!(g.view().providers[0].health.failures, 0);
     g.stop().await.unwrap();
     let (_, pair) = takeover::read(t.path()).unwrap();
     takeover::attach(
@@ -640,10 +644,9 @@ async fn socks_remote_dns_auth_http_sse_websocket_and_pool_isolation() {
     let r = request(&g, "/v1/no-fallback", vec![], vec![]).await;
     assert_eq!(r.status(), 502);
     assert_eq!(g.view().providers[0].health.failures, 0);
-    assert_eq!(
-        g.view().proxies[0].health.state,
-        circuit::CircuitState::Open
-    );
+    assert!(!g.view().proxies[0].health.available);
+    assert!(g.view().proxies[0].health.retry_in > 0);
+    assert!(g.view().proxies[0].health.failures > 0);
     g.stop().await.unwrap();
 }
 #[tokio::test]
@@ -1622,3 +1625,6 @@ mod concurrency;
 
 #[path = "model_tests.rs"]
 mod models;
+
+#[path = "v061_tests.rs"]
+mod v061;

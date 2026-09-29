@@ -40,7 +40,7 @@ pub async fn get_usage_logs(
         .map_err(|_| AppError::new("USAGE", "日志查询失败"))?
 }
 #[tauri::command]
-pub async fn get_usage_detail(r: R<'_>, id: String) -> Result<Option<usage::Record>> {
+pub async fn get_usage_detail(r: R<'_>, id: String) -> Result<Option<usage::LogicalDetail>> {
     let svc = r.gateway.usage();
     tauri::async_runtime::spawn_blocking(move || svc.detail(&id))
         .await

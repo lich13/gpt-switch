@@ -307,7 +307,7 @@ export default function QuickPanel() {
                       <span className="quick-name">
                         <strong title={p.name}>{p.name}</strong>
                         <span>
-                          {p.health.state === "open"
+                          {p.health.probeInFlight ? "恢复探测中" : p.health.cooldownReason === "rate_limit" ? `限流冷却 ${p.health.retryIn}s` : p.health.cooldownReason === "retry_after" ? `上游冷却 ${p.health.retryIn}s` : p.health.state === "open"
                             ? "熔断"
                             : p.health.state === "half_open"
                               ? "恢复探测"

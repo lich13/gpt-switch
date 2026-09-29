@@ -44,15 +44,18 @@ pub enum Rejected {
     Unavailable,
     Full,
     Timeout,
+    Cooling(u64),
     Model,
 }
 pub struct Budget {
     remaining: Duration,
+    pub trace: crate::usage::RoutingTrace,
 }
 impl Budget {
     pub fn new(seconds: u64) -> Self {
         Self {
             remaining: Duration::from_secs(seconds),
+            trace: Default::default(),
         }
     }
 }
@@ -112,6 +115,7 @@ impl Scheduler {
         let epoch = self.0.state.lock().unwrap().epoch;
         let mut waiting: Option<Waiting> = None;
         let deadline = tokio::time::Instant::now() + budget.remaining;
+        let mut cooling;
         let result = loop {
             let notified = self.0.wake.notified();
             tokio::pin!(notified);
@@ -128,6 +132,19 @@ impl Scheduler {
                 if matching.is_empty() {
                     break Err(Rejected::Unavailable);
                 }
+                for r in &matching {
+                    if !requirement.allows(s.models.get(&r.provider.id).and_then(|m| m.as_deref()))
+                    {
+                        budget.trace.push(
+                            &r.provider.id,
+                            &r.provider.name,
+                            "model",
+                            s.active.get(&r.provider.id).copied().unwrap_or(0),
+                            s.limits[&r.provider.id],
+                            0,
+                        );
+                    }
+                }
                 let matching: Vec<_> = matching
                     .into_iter()
                     .filter(|r| {
@@ -137,17 +154,9 @@ impl Scheduler {
                 if matching.is_empty() {
                     break Err(Rejected::Model);
                 }
-                let eligible: Vec<_> = matching
-                    .into_iter()
-                    .filter(|r| {
-                        s.limits.contains_key(&r.provider.id)
-                            && r.provider_circuit.available(manual)
-                            && r.proxy_circuit.as_ref().is_none_or(|c| c.available(manual))
-                    })
-                    .collect();
-                if eligible.is_empty() {
-                    break Err(Rejected::Unavailable);
-                }
+                let eligible = matching;
+                let mut any_ready = false;
+                let mut retry_in = u64::MAX;
                 let ticket = waiting.as_ref().map(|w| w.ticket);
                 if let Some(ticket) = ticket {
                     if let Some(entry) = s.waiting.iter_mut().find(|(id, _)| *id == ticket) {
@@ -155,33 +164,125 @@ impl Scheduler {
                     }
                 }
                 let mut accepted = None;
-                for route in eligible.iter() {
-                    let id = &route.provider.id;
-                    let limit = s.limits[id];
-                    if limit != 0 && s.active.get(id).copied().unwrap_or(0) >= limit as usize {
-                        continue;
+                let mut retry_selection = true;
+                'selection: loop {
+                    for (position, route) in eligible.iter().enumerate() {
+                        let id = &route.provider.id;
+                        let limit = s.limits[id];
+                        let active = s.active.get(id).copied().unwrap_or(0);
+                        let health = route.provider_circuit.health();
+                        let proxy_health = route.proxy_circuit.as_ref().map(|c| c.health());
+                        let blocked = proxy_health
+                            .as_ref()
+                            .filter(|h| !h.available)
+                            .map(|h| ("proxy_cooldown", h))
+                            .or_else(|| {
+                                (!health.available).then(|| {
+                                    (
+                                        health
+                                            .cooldown_reason
+                                            .as_deref()
+                                            .unwrap_or("half_open_probe"),
+                                        &health,
+                                    )
+                                })
+                            });
+                        if let Some((reason, health)) = blocked {
+                            retry_in = retry_in.min(health.retry_in.max(1));
+                            budget.trace.push(
+                                id,
+                                &route.provider.name,
+                                reason,
+                                active,
+                                limit,
+                                health.retry_in,
+                            );
+                            continue;
+                        }
+                        any_ready = true;
+                        if limit != 0 && active >= limit as usize {
+                            budget.trace.push(
+                                id,
+                                &route.provider.name,
+                                "capacity",
+                                active,
+                                limit,
+                                0,
+                            );
+                            continue;
+                        }
+                        // A waiter pinned to another provider never blocks this provider.
+                        if s.waiting
+                            .iter()
+                            .take_while(|(id, _)| Some(*id) != ticket)
+                            .any(|(_, ids)| ids.contains(id))
+                        {
+                            budget
+                                .trace
+                                .push(id, &route.provider.name, "fifo", active, limit, 0);
+                            continue;
+                        }
+                        // Capacity cannot change under this lock, but a higher-priority
+                        // circuit may recover between its health read and this reservation.
+                        if retry_selection
+                            && eligible[..position].iter().any(|earlier| {
+                                let id = &earlier.provider.id;
+                                let limit = s.limits[id];
+                                (limit == 0
+                                    || s.active.get(id).copied().unwrap_or(0) < limit as usize)
+                                    && earlier.provider_circuit.health().available
+                                    && earlier
+                                        .proxy_circuit
+                                        .as_ref()
+                                        .is_none_or(|c| c.health().available)
+                                    && !s
+                                        .waiting
+                                        .iter()
+                                        .take_while(|(n, _)| Some(*n) != ticket)
+                                        .any(|(_, ids)| ids.contains(id))
+                            })
+                        {
+                            retry_selection = false;
+                            continue 'selection;
+                        }
+                        if let Some(permits) = Permits::acquire(route, manual) {
+                            budget.trace.push(
+                                id,
+                                &route.provider.name,
+                                "selected",
+                                active + 1,
+                                limit,
+                                0,
+                            );
+                            *s.active.entry(id.clone()).or_default() += 1;
+                            accepted = Some(Admission {
+                                route: (**route).clone(),
+                                permits,
+                                slot: Slot {
+                                    scheduler: self.clone(),
+                                    id: id.clone(),
+                                },
+                            });
+                            break;
+                        }
+                        budget.trace.push(
+                            id,
+                            &route.provider.name,
+                            "state_changed",
+                            active,
+                            limit,
+                            0,
+                        );
+                        if retry_selection {
+                            retry_selection = false;
+                            any_ready = false;
+                            retry_in = u64::MAX;
+                            continue 'selection;
+                        }
                     }
-                    // A waiter pinned to another provider never blocks this provider.
-                    if s.waiting
-                        .iter()
-                        .take_while(|(id, _)| Some(*id) != ticket)
-                        .any(|(_, ids)| ids.contains(id))
-                    {
-                        continue;
-                    }
-                    if let Some(permits) = Permits::acquire(route, manual) {
-                        *s.active.entry(id.clone()).or_default() += 1;
-                        accepted = Some(Admission {
-                            route: (**route).clone(),
-                            permits,
-                            slot: Slot {
-                                scheduler: self.clone(),
-                                id: id.clone(),
-                            },
-                        });
-                        break;
-                    }
+                    break;
                 }
+                cooling = (!any_ready).then_some(if retry_in == u64::MAX { 1 } else { retry_in });
                 if let Some(admission) = accepted {
                     break Ok(admission);
                 }
@@ -204,7 +305,7 @@ impl Scheduler {
             }
             tokio::select! {
                 _ = notified => {},
-                _ = tokio::time::sleep_until(deadline) => break Err(Rejected::Timeout),
+                _ = tokio::time::sleep_until(deadline) => break Err(cooling.map_or(Rejected::Timeout, Rejected::Cooling)),
                 // Circuit cooldowns may expire without a separate request or UI event.
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {},
             }

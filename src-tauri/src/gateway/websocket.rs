@@ -114,33 +114,27 @@ fn value(frame: &Frame) -> Option<serde_json::Value> {
 fn creates(frame: &Frame) -> bool {
     value(frame).is_some_and(|v| v["type"] == "response.create")
 }
-fn turn_failed(value: &serde_json::Value) -> bool {
-    let error = value
-        .get("error")
-        .or_else(|| value.pointer("/response/error"));
-    if let Some(status) = error
-        .and_then(|e| e.get("status").or_else(|| e.get("status_code")))
-        .and_then(|v| v.as_u64())
-    {
-        return circuit::retryable(status as u16);
-    }
-    let code = error
-        .and_then(|e| e.get("type").or_else(|| e.get("code")))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    !matches!(
-        code,
-        "invalid_request_error"
-            | "invalid_request"
-            | "context_length_exceeded"
-            | "response_not_found"
-    )
+fn reject_turn(logical: &crate::usage::LogicalSpan, failure: Failure) -> Failure {
+    let (status, category) = match failure {
+        (1000, _) => (499, "CANCELLED"),
+        (1008, "MODEL_NOT_ALLOWED") => (400, "MODEL_NOT_ALLOWED"),
+        (1008, "MODEL_UNDETERMINED") => (400, "MODEL_UNDETERMINED"),
+        (1008, _) => (400, "BUSINESS_REJECTED"),
+        (1013, "provider concurrency full; retry later") => (429, "CAPACITY"),
+        (1013, "providers cooling down; retry later") => (503, "PROVIDERS_COOLING_DOWN"),
+        (1013, _) => (503, "NO_PROVIDER"),
+        (1012, _) => (503, "STOPPED"),
+        _ => (502, "STREAM_INTERRUPTED"),
+    };
+    logical.reject(status, category);
+    failure
 }
 fn rejected(reason: Rejected) -> Failure {
     match reason {
         Rejected::Model => (1008, "MODEL_NOT_ALLOWED or MODEL_UNDETERMINED"),
         Rejected::Stopped => (1012, "gateway stopped"),
         Rejected::Unavailable => (1013, "no available provider"),
+        Rejected::Cooling(_) => (1013, "providers cooling down; retry later"),
         Rejected::Full | Rejected::Timeout => (1013, "provider concurrency full; retry later"),
     }
 }
@@ -369,13 +363,19 @@ async fn session(
             ids.truncate(1);
         }
     }
-    let mut current_model = turn_model(g, &first, None, None)?;
+    let logical_id = uuid::Uuid::new_v4().to_string();
+    let mut logical = Some(g.0.usage.logical(&logical_id, true));
+    let mut current_model =
+        turn_model(g, &first, None, None).map_err(|e| reject_turn(logical.as_ref().unwrap(), e))?;
+    logical.as_ref().unwrap().model(current_model.as_deref());
     let requirement = Requirement::model(current_model.as_deref());
     let mut budget = Budget::new(cfg.queue_seconds);
     let mut attempts = 0;
-    let logical_id = uuid::Uuid::new_v4().to_string();
+    budget.trace = logical.as_ref().unwrap().trace();
+    let mut last_status = 503;
     let (mut upstream_peer, admission, initial_usage) = loop {
         if ids.is_empty() || attempts > cfg.max_retries {
+            logical.as_ref().unwrap().finish_last(last_status);
             return Err((1013, "all providers failed"));
         }
         let candidates: Vec<_> = ids
@@ -391,7 +391,15 @@ async fn session(
             &mut budget,
             &requirement,
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            if attempts > 0 && e.0 != 1000 {
+                logical.as_ref().unwrap().finish_last(last_status);
+                e
+            } else {
+                reject_turn(logical.as_ref().unwrap(), e)
+            }
+        })?;
         ids.retain(|id| id != &admission.route.provider.id);
         attempts += 1;
         let began = Instant::now();
@@ -407,6 +415,7 @@ async fn session(
                 .and_then(|v| v["service_tier"].as_str()),
             true,
         );
+        usage.attach(logical.as_ref().unwrap(), &budget.trace);
         let mut closed = client.closed.clone();
         let result = tokio::select! {
             result = upstream(&admission.route, &uri, &headers, cfg) => result,
@@ -415,12 +424,16 @@ async fn session(
         match result {
             Ok(peer) => {
                 admission.permits.proxy_success(cfg);
+                usage.final_attempt();
                 break (peer, admission, usage);
             }
             Err((status, proxy, retry)) => {
+                last_status = status.unwrap_or(502);
                 usage.finish(status, if proxy { "PROXY" } else { "WS_HANDSHAKE" });
                 let retryable = status.is_none_or(circuit::retryable);
-                if retryable {
+                if status == Some(429) {
+                    admission.permits.rate_limited(cfg, retry);
+                } else if retryable {
                     admission.permits.failure(cfg, proxy, retry);
                 } else {
                     admission.permits.neutral(cfg);
@@ -433,6 +446,7 @@ async fn session(
                     if proxy { "PROXY" } else { "WS_HANDSHAKE" },
                 );
                 if !retryable {
+                    logical.as_ref().unwrap().finish_last(last_status);
                     return Err((1008, "upstream rejected websocket handshake"));
                 }
             }
@@ -447,6 +461,9 @@ async fn session(
     let mut received = false;
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(cfg.first_byte_seconds);
     if let Err(e) = upstream_peer.send(first).await {
+        if let Some(u) = &mut usage {
+            u.finish(Some(101), "NETWORK");
+        }
         if let Some(mut admission) = turn.take() {
             admission.permits.failure(cfg, false, None);
         }
@@ -455,14 +472,18 @@ async fn session(
     loop {
         if turn.is_none() {
             if let Some(frame) = pending.take() {
+                logical = Some(g.0.usage.logical(&uuid::Uuid::new_v4().to_string(), true));
                 let model = turn_model(
                     g,
                     &frame,
                     confirmed_model.as_deref(),
                     Some(&route.provider.id),
-                )?;
+                )
+                .map_err(|e| reject_turn(logical.as_ref().unwrap(), e))?;
+                logical.as_ref().unwrap().model(model.as_deref());
                 let requirement = Requirement::model(model.as_deref());
                 let mut budget = Budget::new(cfg.queue_seconds);
+                budget.trace = logical.as_ref().unwrap().trace();
                 turn = Some(
                     take_slot(
                         g,
@@ -473,12 +494,13 @@ async fn session(
                         &mut budget,
                         &requirement,
                     )
-                    .await?,
+                    .await
+                    .map_err(|e| reject_turn(logical.as_ref().unwrap(), e))?,
                 );
                 current_model = model;
                 let v = value(&frame);
                 usage = Some(g.0.usage.begin(
-                    &uuid::Uuid::new_v4().to_string(),
+                    &logical.as_ref().unwrap().id(),
                     0,
                     &route.provider.id,
                     &route.provider.name,
@@ -486,11 +508,18 @@ async fn session(
                     v.as_ref().and_then(|v| v["service_tier"].as_str()),
                     true,
                 ));
+                if let Some(u) = &mut usage {
+                    u.attach(logical.as_ref().unwrap(), &budget.trace);
+                    u.final_attempt();
+                }
                 began = Instant::now();
                 received = false;
                 deadline =
                     tokio::time::Instant::now() + Duration::from_secs(cfg.first_byte_seconds);
                 if let Err(e) = upstream_peer.send(frame).await {
+                    if let Some(u) = &mut usage {
+                        u.finish(Some(101), "NETWORK");
+                    }
                     if let Some(mut admission) = turn.take() {
                         admission.permits.failure(cfg, false, None);
                     }
@@ -522,15 +551,12 @@ async fn session(
                     if matches!(kind, "response.created" | "response.completed" | "response.done") { confirmed_model = current_model.clone(); }
                     if matches!(kind, "response.completed" | "response.done" | "response.failed" | "response.incomplete" | "response.cancelled" | "response.canceled" | "error") {
                         if let Some(mut admission) = turn.take() {
-                            if matches!(kind, "response.failed" | "error") {
-                                if turn_failed(&v) { admission.permits.failure(cfg, false, None); } else { admission.permits.neutral(cfg); }
-                            } else if matches!(kind, "response.cancelled" | "response.canceled") {
-                                admission.permits.neutral(cfg);
-                            } else { admission.permits.success(cfg); g.successful_response(&route.provider); }
                             if let Some(mut u)=usage.take() {
-                                let outcome=match kind {"response.completed"|"response.done"=>"OK","response.cancelled"|"response.canceled"=>"CANCELLED",_=>"UPSTREAM_ERROR"};
-                                u.finish(Some(101),outcome);
+                                u.finish(Some(101), "UPSTREAM_ERROR");
+                                forward::settle_usage(&mut u, &mut admission.permits, cfg);
+                                if u.outcome_class() == "success" { g.successful_response(&route.provider); }
                             }
+                            logical.take();
                             g.record(&route, Some(101), began, 0, "WEBSOCKET_TURN");
                         }
                     }
@@ -544,7 +570,11 @@ async fn session(
                 if creates(&frame) {
                     if pending.is_some() { return Err((1013, "too many pending turns")); }
                     pending = Some(frame);
-                } else { upstream_peer.send(frame).await?; }
+                } else if let Err(e) = upstream_peer.send(frame).await {
+                    if let Some(mut u) = usage.take() { u.finish(Some(101), "NETWORK"); }
+                    if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, false, None); }
+                    return Err(e);
+                }
                 if closing { return Ok(()); }
             },
             _ = tokio::time::sleep_until(deadline), if turn.is_some() => {

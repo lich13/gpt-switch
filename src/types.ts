@@ -62,6 +62,7 @@ export type GatewaySettings = {
   failureThreshold: number;
   successThreshold: number;
   cooldownSeconds: number;
+  rateLimitSeconds: number;
   errorRate: number;
   minRequests: number;
   firstByteSeconds: number;
@@ -76,6 +77,9 @@ export type Health = {
   failures: number;
   requests: number;
   retryIn: number;
+  cooldownReason?: string | null;
+  probeInFlight?: boolean;
+  available?: boolean;
 };
 export type Provider = {
   id: string;

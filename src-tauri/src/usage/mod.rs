@@ -1,4 +1,5 @@
 mod database;
+mod logical;
 pub mod parser;
 use crate::{
     pricing::{
@@ -9,6 +10,7 @@ use crate::{
     storage::{self, AppError, Result},
 };
 pub use database::{Dashboard, Filters, LogPage};
+pub use logical::{LogicalDetail, LogicalRecord, LogicalSpan, RoutingDecision, RoutingTrace};
 use parser::{Observation, Observer, Tokens};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -65,13 +67,44 @@ pub struct Record {
     pub tokens: Tokens,
     pub incomplete: bool,
     pub cost: Cost,
+    #[serde(default)]
+    pub routing: Vec<RoutingDecision>,
+    #[serde(default)]
+    pub terminal_evidence: Option<String>,
 }
 impl Record {
     pub fn successful(&self) -> bool {
-        self.outcome == "OK"
+        matches!(self.outcome.as_str(), "OK" | "OUTPUT_LIMIT")
             && self
                 .status
                 .is_some_and(|s| (200..300).contains(&s) || s == 101)
+    }
+    pub fn outcome_class(&self) -> &'static str {
+        if self.successful() {
+            "success"
+        } else if self.outcome == "IN_PROGRESS" {
+            "pending"
+        } else if self.outcome == "CANCELLED" {
+            "cancelled"
+        } else if matches!(self.outcome.as_str(), "INTERRUPTED" | "UNKNOWN_TERMINAL") {
+            "unknown"
+        } else if matches!(
+            self.outcome.as_str(),
+            "CAPACITY"
+                | "MODEL_NOT_ALLOWED"
+                | "MODEL_UNDETERMINED"
+                | "BODY"
+                | "LOCAL_AUTH"
+                | "WEBSOCKET"
+                | "BUSINESS_REJECTED"
+        ) || self
+            .status
+            .is_some_and(|s| [400, 404, 405, 406, 413, 414, 415, 422].contains(&s))
+        {
+            "rejected"
+        } else {
+            "failure"
+        }
     }
     pub fn model(&self) -> &str {
         self.billing_model
@@ -91,6 +124,7 @@ pub struct State {
 enum WriteEvent {
     Start(Box<Record>),
     Finish(Box<Record>),
+    Logical(Box<Record>, bool),
     Backfill(Arc<pricing::Snapshot>),
     Maintain(u16),
     Barrier(mpsc::Sender<()>),
@@ -152,6 +186,7 @@ impl Service {
                     let result = match event {
                         WriteEvent::Start(r) => database::insert(&db, &r, false),
                         WriteEvent::Finish(r) => database::insert(&db, &r, true),
+                        WriteEvent::Logical(r, finished) => database::logical(&db, &r, finished),
                         WriteEvent::Backfill(p) => database::backfill(&mut db, &p),
                         WriteEvent::Maintain(days) => database::prune(&mut db, days),
                         WriteEvent::Barrier(tx) => {
@@ -268,6 +303,8 @@ impl Service {
             tokens: Tokens::default(),
             incomplete: false,
             cost: Cost::default(),
+            routing: vec![],
+            terminal_evidence: None,
         };
         if settings.enabled {
             self.send(WriteEvent::Start(Box::new(record.clone())));
@@ -281,6 +318,9 @@ impl Service {
             observation: Observation::default(),
             enabled: settings.enabled,
             finished: false,
+            logical: None,
+            final_attempt: false,
+            trace: None,
         }
     }
     pub fn rejected(&self, id: &str, code: u16, category: &str, model: Option<&str>) {
@@ -302,7 +342,7 @@ impl Service {
     pub fn logs(&self, filters: Filters, page: u32) -> Result<LogPage> {
         database::logs(&self.0.path, filters, page)
     }
-    pub fn detail(&self, id: &str) -> Result<Option<Record>> {
+    pub fn detail(&self, id: &str) -> Result<Option<LogicalDetail>> {
         database::detail(&self.0.path, id)
     }
 }
@@ -315,41 +355,76 @@ pub struct Span {
     observation: Observation,
     enabled: bool,
     finished: bool,
+    logical: Option<LogicalSpan>,
+    final_attempt: bool,
+    trace: Option<RoutingTrace>,
 }
 impl Span {
+    pub fn attach(&mut self, logical: &LogicalSpan, trace: &RoutingTrace) {
+        self.logical = Some(logical.clone());
+        self.trace = Some(trace.clone());
+    }
+    pub fn final_attempt(&mut self) {
+        self.final_attempt = true;
+    }
+    pub fn terminal(&mut self) -> Option<parser::Terminal> {
+        if let Some(o) = &mut self.observer {
+            self.observation = o.snapshot(false);
+        }
+        self.observation.terminal
+    }
+    pub fn outcome_class(&self) -> &'static str {
+        self.record.outcome_class()
+    }
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
     pub fn response(&mut self, status: u16, stream: bool, encoding: &str) {
         self.record.status = Some(status);
         self.record.streaming = stream;
         self.observer = Some(Observer::new(stream, encoding));
     }
     pub fn feed(&mut self, bytes: &[u8]) {
-        if !self.enabled {
-            return;
-        }
         if let Some(o) = &mut self.observer {
             o.feed(bytes, self.started.elapsed().as_millis() as u64);
         }
     }
     pub fn value(&mut self, value: &serde_json::Value) {
-        if self.enabled {
-            self.observation
-                .value(value, self.started.elapsed().as_millis() as u64);
-        }
+        self.observation
+            .value(value, self.started.elapsed().as_millis() as u64);
     }
     pub fn finish(&mut self, status: Option<u16>, outcome: &str) {
         if self.finished {
             return;
         }
         self.finished = true;
-        if !self.enabled {
-            return;
-        }
         if let Some(observer) = &mut self.observer {
             self.observation = observer.snapshot(outcome == "OK" || outcome == "HTTP");
         }
         let o = &self.observation;
         self.record.status = status.or(self.record.status);
-        self.record.outcome = outcome.into();
+        self.record.outcome = if self.record.status.is_none_or(|s| s < 400) {
+            o.terminal
+                .map(|t| t.outcome())
+                .unwrap_or_else(|| {
+                    if outcome == "OK" && self.record.streaming && o.expects_terminal {
+                        if o.incomplete {
+                            "UNKNOWN_TERMINAL"
+                        } else {
+                            "STREAM_INTERRUPTED"
+                        }
+                    } else {
+                        outcome
+                    }
+                })
+                .into()
+        } else {
+            outcome.into()
+        };
+        self.record.terminal_evidence = o.terminal.map(|t| t.outcome().into());
+        if let Some(trace) = &self.trace {
+            self.record.routing = trace.snapshot();
+        }
         self.record.latency_ms = self.started.elapsed().as_millis() as u64;
         self.record.first_token_ms = o.first_token_ms;
         self.record.duration_ms = o
@@ -358,7 +433,8 @@ impl Span {
         self.record.response_model = o.model.clone();
         self.record.tokens = o.tokens.clone();
         self.record.service_tier = o.service_tier.clone().or(self.record.service_tier.clone());
-        self.record.incomplete = o.incomplete || outcome != "OK";
+        self.record.incomplete =
+            o.incomplete || !matches!(self.record.outcome.as_str(), "OK" | "OUTPUT_LIMIT");
         self.record.billing_model = if self.record.model_source == "request" {
             self.record.request_model.clone().or(o.model.clone())
         } else {
@@ -376,8 +452,13 @@ impl Span {
             &self.record.multiplier,
             &self.prices.version,
         );
-        self.service
-            .send(WriteEvent::Finish(Box::new(self.record.clone())));
+        if self.enabled {
+            self.service
+                .send(WriteEvent::Finish(Box::new(self.record.clone())));
+        }
+        if let Some(logical) = &self.logical {
+            logical.record(&self.record, self.final_attempt);
+        }
     }
 }
 impl Drop for Span {
@@ -408,5 +489,56 @@ mod tests {
         assert_eq!(data.summary.unpriced, 1);
         assert_eq!(data.summary.tokens.total(), 110);
         assert_eq!(svc.logs(Filters::default(), 0).unwrap().total, 2);
+    }
+    #[test]
+    fn confirmed_terminal_survives_drop_but_partial_usage_does_not_imply_success() {
+        let t = tempfile::tempdir().unwrap();
+        let svc = Service::new(t.path(), pricing::Service::new(t.path()).unwrap());
+        for (id, event, finish) in [
+            (
+                "complete",
+                r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#,
+                false,
+            ),
+            (
+                "cancel",
+                r#"{"type":"response.created","response":{"usage":{"input_tokens":3}}}"#,
+                false,
+            ),
+            (
+                "truncated",
+                r#"{"type":"response.output_text.delta","delta":"text"}"#,
+                true,
+            ),
+            (
+                "error",
+                r#"{"type":"response.failed","response":{"error":{"code":"server_error"}}}"#,
+                true,
+            ),
+            (
+                "limit",
+                r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+                true,
+            ),
+        ] {
+            let logical = svc.logical(id, true);
+            let mut span = svc.begin(id, 0, "p", "Provider", None, None, true);
+            span.attach(&logical, &logical.trace());
+            span.final_attempt();
+            span.response(200, true, "");
+            span.feed(format!("data: {event}\n\n").as_bytes());
+            if finish {
+                span.finish(Some(200), "OK");
+                span.finish(Some(200), "CANCELLED");
+            }
+            drop(span);
+        }
+        svc.flush();
+        let s = svc.dashboard(Filters::default()).unwrap().summary;
+        assert_eq!(
+            (s.requests, s.successes, s.failures, s.cancelled, s.attempts),
+            (5, 2, 2, 1, 5)
+        );
+        assert_eq!(s.tokens.total(), 8);
     }
 }

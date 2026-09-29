@@ -1,5 +1,6 @@
 // Adapted from cc-switch circuit_breaker.rs and forwarder.rs, commit 1ee2fdc3.
 // Copyright (c) 2025 JasonYoung. MIT; see THIRD_PARTY_NOTICES.md.
+// Independent 429 cooldown follows Sub2API 9a62841f (default: 5 seconds).
 use super::model::Settings;
 use serde::Serialize;
 use std::{
@@ -21,6 +22,10 @@ pub struct Health {
     pub failures: u32,
     pub requests: u32,
     pub retry_in: u64,
+    pub cooldown_reason: Option<String>,
+    pub probe_in_flight: bool,
+    pub available: bool,
+    pub revision: u64,
 }
 struct State {
     phase: CircuitState,
@@ -31,6 +36,11 @@ struct State {
     until: Option<Instant>,
     probe: bool,
     generation: u64,
+    retry_until: Option<Instant>,
+    retry_reason: Option<&'static str>,
+    retry_probe: bool,
+    retry_generation: u64,
+    revision: u64,
 }
 impl Default for State {
     fn default() -> Self {
@@ -43,7 +53,28 @@ impl Default for State {
             until: None,
             probe: false,
             generation: 0,
+            retry_until: None,
+            retry_reason: None,
+            retry_probe: false,
+            retry_generation: 0,
+            revision: 0,
         }
+    }
+}
+impl State {
+    fn available(&self) -> bool {
+        let now = Instant::now();
+        !self.probe
+            && !self.retry_probe
+            && self.retry_until.is_none_or(|t| t <= now)
+            && (self.phase != CircuitState::Open || self.until.is_none_or(|t| t <= now))
+    }
+    fn cooldown(&mut self, duration: Duration, reason: &'static str) {
+        let until = Instant::now() + duration;
+        self.retry_until = Some(self.retry_until.map_or(until, |old| old.max(until)));
+        self.retry_reason = Some(reason);
+        self.retry_probe = false;
+        self.retry_generation += 1;
     }
 }
 #[derive(Clone, Default)]
@@ -51,66 +82,75 @@ pub struct Circuit(Arc<Mutex<State>>);
 pub enum Outcome {
     Success,
     Failure(Option<Duration>),
+    RateLimited(Option<Duration>),
     Neutral,
 }
 pub struct Permit {
     circuit: Circuit,
     generation: u64,
     half_open: bool,
+    retry_generation: u64,
+    retry_probe: bool,
     complete: bool,
 }
 impl Circuit {
-    pub fn available(&self, manual: bool) -> bool {
-        let s = self.0.lock().unwrap();
-        match s.phase {
-            CircuitState::Closed => true,
-            CircuitState::Open => manual || s.until.is_none_or(|at| at <= Instant::now()),
-            CircuitState::HalfOpen => !s.probe,
-        }
-    }
     pub fn health(&self) -> Health {
         let s = self.0.lock().unwrap();
+        let now = Instant::now();
+        let retry = [
+            s.until.filter(|_| s.phase == CircuitState::Open),
+            s.retry_until,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|t| t.saturating_duration_since(now))
+        .max()
+        .unwrap_or_default();
         Health {
             state: s.phase,
             failures: s.failures,
             requests: s.total,
-            retry_in: s
-                .until
-                .map(|t| t.saturating_duration_since(Instant::now()).as_secs())
-                .unwrap_or(0),
+            retry_in: retry.as_millis().div_ceil(1000) as u64,
+            cooldown_reason: if s.phase == CircuitState::Open && s.until.is_some_and(|t| t > now) {
+                Some("circuit_open".into())
+            } else {
+                s.retry_reason.map(str::to_owned)
+            },
+            probe_in_flight: s.probe || s.retry_probe,
+            available: s.available(),
+            revision: s.revision,
         }
     }
-    pub fn acquire(&self, manual: bool) -> Option<Permit> {
+    pub fn acquire(&self, _manual: bool) -> Option<Permit> {
         let mut s = self.0.lock().unwrap();
-        if s.phase == CircuitState::Open {
-            if s.until.is_none_or(|t| t <= Instant::now()) {
-                s.phase = CircuitState::HalfOpen;
-                s.successes = 0;
-                s.probe = false;
-                s.generation += 1;
-            } else if !manual {
-                return None;
-            }
-        }
-        let half_open = s.phase == CircuitState::HalfOpen;
-        if half_open && s.probe {
+        if !s.available() {
             return None;
         }
-        if half_open {
-            s.probe = true;
+        if s.phase == CircuitState::Open {
+            s.phase = CircuitState::HalfOpen;
+            s.successes = 0;
+            s.generation += 1;
         }
+        let half_open = s.phase == CircuitState::HalfOpen;
+        let retry_probe = s.retry_until.is_some();
+        s.probe = half_open;
+        s.retry_probe = retry_probe;
+        s.revision += 1;
         Some(Permit {
             circuit: self.clone(),
             generation: s.generation,
             half_open,
+            retry_generation: s.retry_generation,
+            retry_probe,
             complete: false,
         })
     }
     pub fn reset(&self) {
         let mut s = self.0.lock().unwrap();
-        let generation = s.generation + 1;
         *s = State {
-            generation,
+            generation: s.generation + 1,
+            retry_generation: s.retry_generation + 1,
+            revision: s.revision + 1,
             ..Default::default()
         };
     }
@@ -119,47 +159,56 @@ impl Permit {
     pub fn finish(mut self, outcome: Outcome, cfg: &Settings) {
         let mut s = self.circuit.0.lock().unwrap();
         self.complete = true;
+        if self.retry_probe && self.retry_generation == s.retry_generation {
+            s.retry_probe = false;
+        }
         if s.generation != self.generation {
             return;
         }
         if self.half_open {
             s.probe = false;
         }
+        s.revision += 1;
         match outcome {
             Outcome::Neutral => (),
+            Outcome::RateLimited(retry) => s.cooldown(
+                retry.unwrap_or(Duration::from_secs(cfg.rate_limit_seconds)),
+                "rate_limit",
+            ),
             Outcome::Success => {
+                if self.retry_probe && self.retry_generation == s.retry_generation {
+                    s.retry_until = None;
+                    s.retry_reason = None;
+                }
                 s.failures = 0;
                 s.total = s.total.saturating_add(1);
                 if s.phase == CircuitState::HalfOpen {
                     s.successes += 1;
                     if s.successes >= cfg.success_threshold {
-                        let generation = s.generation + 1;
-                        *s = State {
-                            generation,
-                            ..Default::default()
-                        };
+                        s.phase = CircuitState::Closed;
+                        s.until = None;
+                        s.total = 0;
+                        s.failed = 0;
+                        s.generation += 1;
                     }
                 }
             }
-            Outcome::Failure(retry_after) => {
+            Outcome::Failure(retry) => {
+                if let Some(retry) = retry {
+                    s.cooldown(retry, "retry_after");
+                }
                 s.failures = s.failures.saturating_add(1);
                 s.failed = s.failed.saturating_add(1);
                 s.total = s.total.saturating_add(1);
-                let trip = s.phase != CircuitState::Closed
+                if s.phase != CircuitState::Closed
                     || s.failures >= cfg.failure_threshold
                     || (s.total >= cfg.min_requests
                         && f64::from(s.failed) / f64::from(s.total) >= cfg.error_rate)
-                    || retry_after.is_some();
-                if trip {
+                {
                     s.phase = CircuitState::Open;
                     s.probe = false;
                     s.generation += 1;
-                    s.until = Some(
-                        Instant::now()
-                            + retry_after
-                                .unwrap_or_default()
-                                .max(Duration::from_secs(cfg.cooldown_seconds)),
-                    );
+                    s.until = Some(Instant::now() + Duration::from_secs(cfg.cooldown_seconds));
                 }
             }
         }
@@ -167,11 +216,15 @@ impl Permit {
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        if !self.complete && self.half_open {
+        if !self.complete {
             let mut s = self.circuit.0.lock().unwrap();
-            if s.generation == self.generation {
+            if self.half_open && s.generation == self.generation {
                 s.probe = false;
             }
+            if self.retry_probe && s.retry_generation == self.retry_generation {
+                s.retry_probe = false;
+            }
+            s.revision += 1;
         }
     }
 }
@@ -185,12 +238,13 @@ pub fn retry_after(value: &str) -> Option<Duration> {
         .ok()
         .map(Duration::from_secs)
         .or_else(|| {
-            httpdate::parse_http_date(value)
-                .ok()?
-                .duration_since(std::time::SystemTime::now())
-                .ok()
+            Some(
+                httpdate::parse_http_date(value)
+                    .ok()?
+                    .duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default(),
+            )
         })
-        .filter(|d| !d.is_zero())
         .map(|d| d.min(Duration::from_secs(86400)))
 }
 #[cfg(test)]
@@ -252,5 +306,66 @@ mod tests {
             .finish(Outcome::Failure(retry_after("120")), &Settings::default());
         assert!(c.health().retry_in >= 119);
         assert!(retry_after("bad").is_none());
+    }
+}
+
+#[cfg(test)]
+mod cooldown_tests {
+    use super::*;
+    #[test]
+    fn rate_limit_uses_exact_hint_and_does_not_poison_fault_statistics() {
+        let c = Circuit::default();
+        let cfg = Settings::default();
+        let stale = c.acquire(false).unwrap();
+        c.acquire(false)
+            .unwrap()
+            .finish(Outcome::RateLimited(Some(Duration::from_secs(2))), &cfg);
+        assert_eq!(c.health().retry_in, 2);
+        assert_eq!(c.health().failures, 0);
+        assert_eq!(c.health().requests, 0);
+        assert_eq!(c.health().state, CircuitState::Closed);
+        stale.finish(Outcome::Success, &cfg);
+        assert!(!c.health().available);
+        assert!(c.acquire(true).is_none());
+        c.0.lock().unwrap().retry_until = Some(Instant::now());
+        let probe = c.acquire(false).unwrap();
+        assert!(c.acquire(false).is_none());
+        drop(probe);
+        c.acquire(false).unwrap().finish(Outcome::Success, &cfg);
+        assert!(c.health().available);
+        assert!(c.health().cooldown_reason.is_none());
+    }
+    #[test]
+    fn default_cooldown_zero_hint_and_fault_retry_after_are_independent() {
+        let c = Circuit::default();
+        let cfg = Settings::default();
+        c.acquire(false)
+            .unwrap()
+            .finish(Outcome::RateLimited(None), &cfg);
+        assert_eq!(c.health().retry_in, 5);
+        c.reset();
+        c.acquire(false)
+            .unwrap()
+            .finish(Outcome::RateLimited(retry_after("0")), &cfg);
+        assert!(c.health().available);
+        c.acquire(false)
+            .unwrap()
+            .finish(Outcome::Failure(Some(Duration::from_secs(120))), &cfg);
+        assert_eq!(c.health().failures, 1);
+        assert_eq!(c.health().retry_in, 120);
+        assert_eq!(c.health().state, CircuitState::Closed);
+        c.0.lock().unwrap().retry_until = Some(Instant::now());
+        c.acquire(false)
+            .unwrap()
+            .finish(Outcome::Failure(None), &cfg);
+        assert_eq!(c.health().state, CircuitState::Closed);
+        c.acquire(false)
+            .unwrap()
+            .finish(Outcome::Failure(None), &cfg);
+        c.acquire(false)
+            .unwrap()
+            .finish(Outcome::Failure(None), &cfg);
+        assert_eq!(c.health().state, CircuitState::Open);
+        assert_eq!(c.health().retry_in, 60);
     }
 }

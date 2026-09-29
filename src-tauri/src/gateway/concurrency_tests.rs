@@ -444,6 +444,21 @@ async fn responses_websocket_counts_turns_preserves_compressed_payload_and_spill
     let pong = ws_next(&mut first).await;
     assert_eq!(pong.opcode(), yawc::OpCode::Pong);
     assert_eq!(pong.payload().as_ref(), b"control-ping");
+    g.usage().flush();
+    let summary = g
+        .usage()
+        .dashboard(crate::usage::Filters::default())
+        .unwrap()
+        .summary;
+    assert_eq!(
+        (
+            summary.requests,
+            summary.successes,
+            summary.failures,
+            summary.attempts
+        ),
+        (3, 3, 0, 3)
+    );
     first
         .send(yawc::Frame::close(1000.into(), "done"))
         .await
@@ -451,6 +466,15 @@ async fn responses_websocket_counts_turns_preserves_compressed_payload_and_spill
     drop(first);
     drop(second);
     g.stop().await.unwrap();
+    g.usage().flush();
+    assert_eq!(
+        g.usage()
+            .dashboard(crate::usage::Filters::default())
+            .unwrap()
+            .summary
+            .cancelled,
+        0
+    );
 }
 #[tokio::test]
 async fn responses_websocket_fragmented_messages_and_busy_pinned_turn_close_1013() {

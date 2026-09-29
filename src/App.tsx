@@ -247,7 +247,7 @@ export default function App() {
         <div className="sidebar-bottom">
           <button className="nav-item" onClick={() => setDialog("settings")}>
             <Settings size={17} />
-            设置<span className="version">v0.6.0</span>
+            设置<span className="version">v0.6.1</span>
           </button>
         </div>
       </aside>

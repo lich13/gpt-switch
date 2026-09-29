@@ -36,6 +36,29 @@ pub struct Observation {
     pub service_tier: Option<String>,
     pub first_token_ms: Option<u64>,
     pub incomplete: bool,
+    pub terminal: Option<Terminal>,
+    pub expects_terminal: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Terminal {
+    Success,
+    Limited,
+    Rejected,
+    Failure,
+    Cancelled,
+    Unknown,
+}
+impl Terminal {
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::Success => "OK",
+            Self::Limited => "OUTPUT_LIMIT",
+            Self::Rejected => "BUSINESS_REJECTED",
+            Self::Failure => "UPSTREAM_ERROR",
+            Self::Cancelled => "CANCELLED",
+            Self::Unknown => "UNKNOWN_TERMINAL",
+        }
+    }
 }
 fn count(v: &Value, paths: &[&str]) -> Option<u64> {
     paths
@@ -70,6 +93,45 @@ impl Observation {
             self.service_tier = Some(tier.to_owned());
         }
         let event = outer.get("type").and_then(Value::as_str).unwrap_or("");
+        self.expects_terminal |= event.starts_with("response.") || outer.get("choices").is_some();
+        if self.terminal.is_none() {
+            let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+            let terminal = match event {
+                "response.completed" | "response.done" | "message_stop" => Some(Terminal::Success),
+                "response.cancelled" | "response.canceled" => Some(Terminal::Cancelled),
+                "response.failed" | "error" => Some(error_terminal(value)),
+                "response.incomplete" => Some(incomplete_terminal(value)),
+                _ => match status {
+                    "completed" => Some(Terminal::Success),
+                    "failed" => Some(error_terminal(value)),
+                    "incomplete" => Some(incomplete_terminal(value)),
+                    "cancelled" => Some(Terminal::Cancelled),
+                    _ if value.get("error").is_some_and(|e| !e.is_null()) => {
+                        Some(error_terminal(value))
+                    }
+                    _ => None,
+                },
+            };
+            // A chat completion finishes only once all reported choices finish.
+            let choices = outer.get("choices").and_then(Value::as_array);
+            self.terminal = terminal.or_else(|| {
+                choices
+                    .filter(|c| {
+                        !c.is_empty()
+                            && c.iter()
+                                .all(|v| v.get("finish_reason").is_some_and(|v| !v.is_null()))
+                    })
+                    .map(|c| {
+                        if c.iter().any(|v| v["finish_reason"] == "content_filter") {
+                            Terminal::Rejected
+                        } else if c.iter().any(|v| v["finish_reason"] == "length") {
+                            Terminal::Limited
+                        } else {
+                            Terminal::Success
+                        }
+                    })
+            });
+        }
         let delta = event.ends_with(".delta")
             || event == "content_block_delta"
             || outer
@@ -171,6 +233,38 @@ impl Observation {
         }
     }
 }
+fn error_terminal(value: &Value) -> Terminal {
+    let e = value.get("error").unwrap_or(value);
+    let code = e
+        .get("code")
+        .or_else(|| e.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if matches!(
+        code,
+        "invalid_request_error"
+            | "invalid_request"
+            | "context_length_exceeded"
+            | "response_not_found"
+            | "content_filter"
+    ) {
+        Terminal::Rejected
+    } else {
+        Terminal::Failure
+    }
+}
+fn incomplete_terminal(value: &Value) -> Terminal {
+    match value
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    {
+        "max_output_tokens" | "max_tokens" => Terminal::Limited,
+        "content_filter" => Terminal::Rejected,
+        "server_error" | "rate_limit_exceeded" => Terminal::Failure,
+        _ => Terminal::Unknown,
+    }
+}
 struct Sink {
     observation: Observation,
     buffer: Vec<u8>,
@@ -193,6 +287,10 @@ impl Sink {
         }
     }
     fn parse(&mut self, data: &[u8]) {
+        if data.trim_ascii() == b"[DONE]" {
+            self.observation.terminal.get_or_insert(Terminal::Success);
+            return;
+        }
         if let Ok(v) = serde_json::from_slice(data) {
             self.observation.value(&v, self.elapsed);
         }
@@ -337,6 +435,51 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn protocol_terminal_and_error_categories_are_idempotent() {
+        for (value, expected) in [
+            (serde_json::json!({"status":"completed"}), Terminal::Success),
+            (
+                serde_json::json!({"status":"failed","error":{"code":"server_error"}}),
+                Terminal::Failure,
+            ),
+            (
+                serde_json::json!({"type":"error","error":{"code":"rate_limit_exceeded"}}),
+                Terminal::Failure,
+            ),
+            (
+                serde_json::json!({"type":"error","error":{"type":"invalid_request_error"}}),
+                Terminal::Rejected,
+            ),
+            (
+                serde_json::json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}),
+                Terminal::Limited,
+            ),
+            (
+                serde_json::json!({"choices":[{"finish_reason":"length"}]}),
+                Terminal::Limited,
+            ),
+            (
+                serde_json::json!({"choices":[{"finish_reason":"content_filter"}]}),
+                Terminal::Rejected,
+            ),
+            (
+                serde_json::json!({"type":"response.cancelled"}),
+                Terminal::Cancelled,
+            ),
+        ] {
+            let mut o = Observation::default();
+            o.value(&value, 10);
+            assert_eq!(o.terminal, Some(expected));
+            o.value(&serde_json::json!({"type":"response.completed"}), 11);
+            assert_eq!(o.terminal, Some(expected));
+        }
+        let mut observer = Observer::new(true, "");
+        for chunk in b"data: {\"type\":\"response.failed\"}\n\ndata: [DONE]\n\n".chunks(3) {
+            observer.feed(chunk, 1);
+        }
+        assert_eq!(observer.snapshot(true).terminal, Some(Terminal::Failure));
+    }
     #[test]
     fn fragmented_sse_duplicate_usage_and_cache_normalization() {
         let bytes = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\r\n\r\ndata: {\"response\":{\"model\":\"gpt-fixture\",\"usage\":{\"input_tokens\":100,\"output_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":80},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\n";

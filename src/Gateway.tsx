@@ -35,7 +35,7 @@ type Dialog =
   | { kind: "models"; item: Provider }
   | null;
 const healthText = (h: Health) =>
-  h.state === "open"
+  h.probeInFlight ? "恢复探测中" : h.cooldownReason === "rate_limit" ? `限流冷却 · ${h.retryIn}s` : h.cooldownReason === "retry_after" ? `上游冷却 · ${h.retryIn}s` : h.state === "open"
     ? `熔断 · ${h.retryIn}s`
     : h.state === "half_open"
       ? "恢复探测"
@@ -694,6 +694,7 @@ function Advanced({
     ["failureThreshold", "连续失败阈值"],
     ["successThreshold", "恢复成功次数"],
     ["cooldownSeconds", "熔断等待 / 秒"],
+    ["rateLimitSeconds", "429 默认冷却 / 秒"],
     ["errorRate", "错误率阈值 (0–1)"],
     ["minRequests", "最小请求数"],
     ["firstByteSeconds", "首字节 / 秒"],
