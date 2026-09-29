@@ -40,6 +40,7 @@ import StartupSettings from "./StartupSettings";
 import PowerSettings from "./PowerSettings";
 import LinkSettings from "./LinkSettings";
 import ProviderImports from "./ProviderImports";
+import { version } from "../package.json";
 import {
   errorOf,
   type Account,
@@ -287,7 +288,7 @@ export default function App() {
         <div className="sidebar-bottom">
           <button className="nav-item" onClick={() => setDialog("settings")}>
             <Settings size={17} />
-            设置<span className="version">v0.7.0</span>
+            设置<span className="version">v{version}</span>
           </button>
         </div>
       </aside>
