@@ -40,6 +40,7 @@ impl Observation {
                     matches!(v, "response" | "chat.completion" | "chat.completion.chunk")
                 })
             || outer.get("response").is_some()
+            || outer.get("message").is_some()
         {
             if let Some(id) = identifier(value.get("id")) {
                 self.response_id = Some(id);
@@ -49,7 +50,16 @@ impl Observation {
             self.model = Some(model);
         }
         let event = outer.get("type").and_then(Value::as_str).unwrap_or("");
-        self.expects_terminal |= event.starts_with("response.") || outer.get("choices").is_some();
+        self.expects_terminal |= event.starts_with("response.")
+            || matches!(
+                event,
+                "message_start"
+                    | "message_delta"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+            )
+            || outer.get("choices").is_some();
         if self.terminal.is_none() {
             let status = value.get("status").and_then(Value::as_str).unwrap_or("");
             let terminal = match event {
@@ -57,6 +67,9 @@ impl Observation {
                 "response.cancelled" | "response.canceled" => Some(Terminal::Cancelled),
                 "response.failed" | "error" => Some(error_terminal(value)),
                 "response.incomplete" => Some(incomplete_terminal(value)),
+                "message" if value.get("stop_reason").is_some_and(|v| !v.is_null()) => {
+                    Some(Terminal::Success)
+                }
                 _ => match status {
                     "completed" => Some(Terminal::Success),
                     "failed" => Some(error_terminal(value)),

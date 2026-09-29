@@ -41,6 +41,22 @@ pub(super) fn error(status: StatusCode, code: &str, message: &str) -> Response<W
     Response::builder().status(status).header(header::CONTENT_TYPE,"application/json")
         .body(replay::full(serde_json::to_vec(&serde_json::json!({"error":{"type":"gpt_switch_gateway","code":code,"message":message}})).unwrap())).unwrap()
 }
+pub(super) fn target_for(
+    client: super::ClientId,
+    base: &str,
+    incoming: &Uri,
+) -> Result<Uri, BoxError> {
+    if client == super::ClientId::Codex {
+        return target(base, incoming);
+    }
+    format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        incoming.path_and_query().map(|p| p.as_str()).unwrap_or("/")
+    )
+    .parse()
+    .map_err(Into::into)
+}
 pub(super) fn target(base: &str, incoming: &Uri) -> Result<Uri, BoxError> {
     let path = incoming.path();
     let suffix = if path == "/v1" {
@@ -329,7 +345,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             Err(_) => break,
         };
         ids.retain(|id| id != &route.provider.id);
-        let uri = match target(&route.provider.base_url, &parts.uri) {
+        let uri = match target_for(route.client_id, &route.provider.base_url, &parts.uri) {
             Ok(uri) => uri,
             Err(_) => continue,
         };
@@ -340,6 +356,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         clean_headers(upstream.headers_mut(), websocket);
         upstream.headers_mut().remove(header::HOST);
         upstream.headers_mut().remove(header::AUTHORIZATION);
+        upstream.headers_mut().remove("x-api-key");
         let Ok(auth) = header::HeaderValue::from_str(&format!("Bearer {}", route.provider.token))
         else {
             continue;

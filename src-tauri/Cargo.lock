@@ -1510,57 +1510,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpt-switch"
-version = "0.7.2"
-dependencies = [
- "async-stream",
- "auto-launch",
- "base64 0.22.1",
- "block2",
- "bytes",
- "chrono",
- "dirs 6.0.0",
- "flate2",
- "futures-util",
- "http-body-util",
- "httpdate",
- "hyper",
- "hyper-util",
- "libc",
- "mime",
- "multer",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "open",
- "plist",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "sysinfo",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-single-instance",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tokio-util",
- "toml 0.9.12+spec-1.1.0",
- "toml_edit 0.23.10+spec-1.0.0",
- "tower-service",
- "url",
- "uuid",
- "webpki-roots",
- "windows-sys 0.61.2",
- "winreg 0.55.0",
- "yawc",
- "zstd",
-]
-
-[[package]]
 name = "gtk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2199,6 +2148,57 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61ff90caf6077a803a240f62fdbe88645a890bbca49ef8174c3cb0404362171d"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "lich13-switch"
+version = "0.8.0"
+dependencies = [
+ "async-stream",
+ "auto-launch",
+ "base64 0.22.1",
+ "block2",
+ "bytes",
+ "chrono",
+ "dirs 6.0.0",
+ "flate2",
+ "futures-util",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "mime",
+ "multer",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "open",
+ "plist",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "sysinfo",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
+ "toml_edit 0.23.10+spec-1.0.0",
+ "tower-service",
+ "url",
+ "uuid",
+ "webpki-roots",
+ "windows-sys 0.61.2",
+ "winreg 0.55.0",
+ "yawc",
+ "zstd",
 ]
 
 [[package]]

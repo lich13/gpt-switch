@@ -19,7 +19,7 @@ mod platform;
 mod platform;
 
 pub const APPS: &[(&str, &str)] = &[
-    ("com.lich13.gpt-switch", "gpt-Switch"),
+    ("com.lich13.gpt-switch", "lich13-switch"),
     ("com.ccswitch.desktop", "CC Switch"),
     ("com.lich13.studio", "lich13studio"),
 ];
@@ -40,6 +40,7 @@ pub struct HandlerState {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
+    pub client_id: gateway::ClientId,
     pub id: String,
     pub name: String,
     pub base_url: String,
@@ -79,10 +80,18 @@ fn parse(raw: &str) -> Result<Pending> {
         }
     }
     if fields.get("resource").map(String::as_str) != Some("provider")
-        || fields.get("app").map(String::as_str) != Some("codex")
+        || !matches!(
+            fields.get("app").map(String::as_str),
+            Some("codex" | "claude")
+        )
     {
-        return Err(invalid("仅支持 Codex 供应商导入"));
+        return Err(invalid("仅支持 Codex 或 Claude Code 供应商导入"));
     }
+    let client_id = if fields.get("app").map(String::as_str) == Some("claude") {
+        gateway::ClientId::Claude
+    } else {
+        gateway::ClientId::Codex
+    };
     let base = fields
         .get("endpoint")
         .map(|s| s.trim())
@@ -113,10 +122,15 @@ fn parse(raw: &str) -> Result<Pending> {
         return Err(invalid("无效的供应商名称"));
     }
     let fingerprint = crate::storage::digest(
-        format!("{}\0{key}", endpoint.as_str().trim_end_matches('/')).as_bytes(),
+        format!(
+            "{client_id:?}\0{}\0{key}",
+            endpoint.as_str().trim_end_matches('/')
+        )
+        .as_bytes(),
     );
     Ok(Pending {
         preview: Preview {
+            client_id,
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_owned(),
             base_url: base.to_owned(),
@@ -208,14 +222,14 @@ pub fn confirm_provider_import(
     expected_revision: String,
 ) -> Result<gateway::View> {
     main_only(&window)?;
-    let home = crate::lock(&r.core)?.home();
     let mut imports = r.imports.lock().unwrap();
     let p = imports
         .pending
         .iter()
         .find(|p| p.preview.id == id)
         .ok_or_else(|| invalid("导入请求已处理"))?;
-    let result = r.gateway.edit(
+    let home = r.home(p.preview.client_id)?;
+    let result = r.gateway(p.preview.client_id).edit(
         gateway::Edit::ImportLink {
             base_url: p.preview.base_url.clone(),
             token: p.key.clone(),
@@ -268,6 +282,18 @@ mod tests {
     use super::*;
     const URL:&str="ccswitch://v1/import?resource=provider&app=codex&name=Fixture&endpoint=https%3A%2F%2Fexample.invalid%2Fsite%2Fv1&apiKey=fixture-only&model=ignored";
     #[test]
+    fn client_identity_is_part_of_import_deduplication() {
+        let codex = parse("ccswitch://v1/import?resource=provider&app=codex&endpoint=https%3A%2F%2Fexample.invalid%2Fsite&apiKey=fixture-only").unwrap();
+        let claude = parse("ccswitch://v1/import?resource=provider&app=claude&endpoint=https%3A%2F%2Fexample.invalid%2Fsite&apiKey=fixture-only").unwrap();
+        assert_eq!(claude.preview.client_id, gateway::ClientId::Claude);
+        assert_eq!(claude.preview.base_url, "https://example.invalid/site");
+        assert_ne!(codex.fingerprint, claude.fingerprint);
+        assert!(!serde_json::to_string(&claude.preview)
+            .unwrap()
+            .contains("fixture-only"));
+    }
+
+    #[test]
     fn decode_redact_and_preserve_path() {
         let p = parse(URL).unwrap();
         assert_eq!(p.preview.base_url, "https://example.invalid/site/v1");
@@ -300,7 +326,7 @@ mod tests {
     #[test]
     fn invalid_resources_and_secrets_never_enter_errors() {
         for u in [
-            URL.replace("app=codex", "app=claude"),
+            URL.replace("app=codex", "app=unsupported"),
             URL.replace("resource=provider", "resource=skill"),
             format!("{URL}&apiKey=again"),
             URL.replace(

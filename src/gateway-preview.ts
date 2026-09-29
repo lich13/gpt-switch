@@ -6,6 +6,7 @@ const healthy = {
   retryIn: 0,
 };
 export const gatewayDemo: GatewayState = {
+  clientId: "codex",
   revision: "preview-gateway",
   running: false,
   address: "http://127.0.0.1:15722/v1",
@@ -76,8 +77,25 @@ export const gatewayDemo: GatewayState = {
   error: null,
   recoveryPending: false,
 };
+export const claudeGatewayDemo: GatewayState = {
+  ...structuredClone(gatewayDemo),
+  clientId: "claude",
+  revision: "preview-claude",
+  address: "http://127.0.0.1:15723",
+  settings: { ...gatewayDemo.settings, port: 15723 },
+  selected: "claude-primary",
+  configProvider: "claude-primary",
+  providers: gatewayDemo.providers.map((p, i) => ({
+    ...structuredClone(p),
+    id: `claude-${p.id}`,
+    name: i ? "Claude 备用供应商" : "claude.example.com",
+    baseUrl: "https://claude.example.com",
+    allowedModels: null,
+  })),
+  proxies: gatewayDemo.proxies,
+};
 export function gatewayPreview(name: string, args: Record<string, unknown>) {
-  const s = gatewayDemo;
+  const s = args.clientId === "claude" ? claudeGatewayDemo : gatewayDemo;
   if (name === "start_gateway") {
     s.running = true;
     s.configState = "gateway";
@@ -186,14 +204,22 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
         });
     }
     if (e.op === "deleteProxy") {
-      if (s.providers.some((p) => p.proxyId === id))
+      if (
+        [...gatewayDemo.providers, ...claudeGatewayDemo.providers].some(
+          (p) => p.proxyId === id,
+        )
+      )
         throw new Error("请先解绑或替换引用此代理的供应商");
-      s.proxies = s.proxies.filter((x) => x.id !== id);
+      s.proxies.splice(
+        0,
+        s.proxies.length,
+        ...s.proxies.filter((x) => x.id !== id),
+      );
     }
     if (e.op === "modelsProvider" && p)
       p.allowedModels = e.allowedModels as string[] | null;
     if (e.op === "settings") s.settings = e.settings as GatewaySettings;
-    if (e.op === "import") throw new Error("预览模式无法读取真实 Codex 配置");
+    if (e.op === "import") throw new Error("预览模式无法读取真实客户端配置");
     s.revision = crypto.randomUUID();
   }
   return structuredClone(s);

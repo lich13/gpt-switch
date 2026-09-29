@@ -36,6 +36,7 @@ struct Runtime {
     data: PathBuf,
     imports: Mutex<links::Imports>,
     gateway: gateway::Gateway,
+    claude: gateway::Gateway,
     login: Mutex<login::Session>,
     quitting: AtomicBool,
     quit_pending: AtomicBool,
@@ -50,7 +51,29 @@ struct Runtime {
     startup_error: Mutex<Option<AppError>>,
     cleanup_error: Mutex<Option<AppError>>,
 }
+impl Runtime {
+    fn gateway(&self, client: gateway::ClientId) -> &gateway::Gateway {
+        match client {
+            gateway::ClientId::Codex => &self.gateway,
+            gateway::ClientId::Claude => &self.claude,
+        }
+    }
+    fn home(&self, client: gateway::ClientId) -> Result<PathBuf> {
+        let core = lock(&self.core)?;
+        Ok(match client {
+            gateway::ClientId::Codex => core.home(),
+            gateway::ClientId::Claude => PathBuf::from(core.preferences().claude_home),
+        })
+    }
+    async fn stop_gateways(&self) -> Result<()> {
+        let a = self.gateway.stop_for_exit().await;
+        let b = self.claude.stop_for_exit().await;
+        a.and(b).map(|_| ())
+    }
+}
 struct SmokeSnapshot {
+    claude_home: PathBuf,
+    claude_config: Option<Vec<u8>>,
     home: PathBuf,
     auth: Option<Vec<u8>>,
     config: Option<Vec<u8>>,
@@ -64,10 +87,10 @@ fn application_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     menu.remove_at(0)?;
     let application = tauri::menu::Submenu::with_items(
         app,
-        "gpt-Switch",
+        "lich13-switch",
         true,
         &[
-            &PredefinedMenuItem::about(app, Some("关于 gpt-Switch"), None)?,
+            &PredefinedMenuItem::about(app, Some("关于 lich13-switch"), None)?,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::services(app, None)?,
             &PredefinedMenuItem::separator(app)?,
@@ -77,7 +100,7 @@ fn application_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &MenuItem::with_id(
                 app,
                 "app-quit",
-                "退出 gpt-Switch",
+                "退出 lich13-switch",
                 true,
                 Some("CmdOrCtrl+Q"),
             )?,
@@ -91,7 +114,7 @@ fn login_active(s: &login::LoginState) -> bool {
 }
 fn lock<T>(m: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>> {
     m.lock()
-        .map_err(|_| AppError::new("STATE", "应用状态异常，请重新启动 gpt-Switch"))
+        .map_err(|_| AppError::new("STATE", "应用状态异常，请重新启动 lich13-switch"))
 }
 fn show(app: &tauri::AppHandle, page: Option<&str>) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -112,11 +135,11 @@ fn show(app: &tauri::AppHandle, page: Option<&str>) -> Result<()> {
 fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let menu = Menu::new(app)?;
     for (id, label) in [
-        ("open", "打开 gpt-Switch"),
+        ("open", "打开 lich13-switch"),
         ("config", "编辑配置"),
         ("gateway", "打开网关"),
         ("settings", "设置"),
-        ("quit", "退出 gpt-Switch"),
+        ("quit", "退出 lich13-switch"),
     ] {
         if id == "quit" {
             menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -130,6 +153,7 @@ fn open_main(
     app: tauri::AppHandle,
     page: Option<String>,
     provider_id: Option<String>,
+    client_id: Option<gateway::ClientId>,
 ) -> Result<()> {
     if page.as_ref().is_some_and(|p| {
         !["accounts", "config", "gateway", "proxies", "settings"].contains(&p.as_str())
@@ -140,7 +164,10 @@ fn open_main(
     if let Some(id) = provider_id {
         show(&app, None)?;
         if let Some(w) = app.get_webview_window("main") {
-            let _ = w.emit("provider-settings", id);
+            let _ = w.emit(
+                "provider-settings",
+                serde_json::json!({"id":id,"clientId":client_id.unwrap_or_default()}),
+            );
         }
         Ok(())
     } else {
@@ -155,7 +182,7 @@ fn publish(app: &tauri::AppHandle, state: ViewState) {
             .find(|a| a.current)
             .map(|a| a.name.as_str())
             .unwrap_or("未保存账号");
-        let _ = tray.set_tooltip(Some(format!("gpt-Switch · {current}")));
+        let _ = tray.set_tooltip(Some(format!("lich13-switch · {current}")));
     }
     let _ = app.emit("switch-state", &state);
 }
@@ -167,11 +194,12 @@ fn refresh(app: &tauri::AppHandle, r: &Runtime) -> Result<ViewState> {
 }
 #[tauri::command]
 async fn list_provider_models(
+    client_id: gateway::ClientId,
     r: tauri::State<'_, Arc<Runtime>>,
     provider_id: String,
     force: bool,
 ) -> Result<gateway::catalog::View> {
-    r.gateway.list_models(&provider_id, force).await
+    r.gateway(client_id).list_models(&provider_id, force).await
 }
 #[tauri::command]
 fn get_state(r: tauri::State<'_, Arc<Runtime>>) -> Result<ViewState> {
@@ -290,7 +318,17 @@ fn set_preferences(
             "更换 Codex 目录前请先停用网关并恢复配置",
         ));
     }
+    if r.claude.guarded_home()
+        && lock(&r.core)?.preferences().claude_home != preferences.claude_home
+    {
+        return Err(AppError::new(
+            "GATEWAY",
+            "请先停止 Claude Code 网关并处理恢复事务",
+        ));
+    }
     let s = lock(&r.core)?.set_preferences(preferences)?;
+    r.gateway.observe_home(&r.home(gateway::ClientId::Codex)?);
+    r.claude.observe_home(&r.home(gateway::ClientId::Claude)?);
     publish(&app, s.clone());
     Ok(s)
 }
@@ -436,7 +474,7 @@ fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
     let runtime = r.clone();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = runtime.gateway.stop_for_exit().await {
+        if let Err(e) = runtime.stop_gateways().await {
             if runtime.smoke.is_some() {
                 if let Ok(mut result) = runtime.smoke_result.lock() {
                     *result = Some(Err(e));
@@ -464,23 +502,24 @@ fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
     });
 }
 #[tauri::command]
-fn get_gateway(r: tauri::State<'_, Arc<Runtime>>) -> gateway::View {
-    if let Ok(core) = lock(&r.core) {
-        r.gateway.observe_home(&core.home());
+fn get_gateway(client_id: gateway::ClientId, r: tauri::State<'_, Arc<Runtime>>) -> gateway::View {
+    if let Ok(home) = r.home(client_id) {
+        r.gateway(client_id).observe_home(&home);
     }
-    r.gateway.view()
+    r.gateway(client_id).view()
 }
 #[tauri::command]
 fn update_gateway(
+    client_id: gateway::ClientId,
     app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
     edit: gateway::Edit,
     expected_revision: String,
     expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
-    let home = lock(&r.core)?.home();
+    let home = r.home(client_id)?;
     let selected = matches!(&edit, gateway::Edit::Select { .. });
-    let result = r.gateway.edit_checked(
+    let result = r.gateway(client_id).edit_checked(
         edit,
         &expected_revision,
         &home,
@@ -491,9 +530,9 @@ fn update_gateway(
         let _ = app.emit(
             "switch-notice",
             if result.running {
-                "已切换供应商，新请求立即生效"
+                "已切换供应商，新请求立即生效".to_string()
             } else {
-                "文件已切换，请重新打开 Codex"
+                format!("文件已切换，请重新打开 {}", client_id.name())
             },
         );
     }
@@ -501,14 +540,15 @@ fn update_gateway(
 }
 #[tauri::command]
 async fn start_gateway(
+    client_id: gateway::ClientId,
     app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
     expected_revision: String,
     expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
-    let home = lock(&r.core)?.home();
+    let home = r.home(client_id)?;
     let result = r
-        .gateway
+        .gateway(client_id)
         .start_checked(
             &expected_revision,
             &home,
@@ -516,34 +556,46 @@ async fn start_gateway(
         )
         .await?;
     let _ = refresh(&app, &r);
-    let _ = app.emit("switch-notice", "网关已启用，请重新打开 Codex");
+    let _ = app.emit(
+        "switch-notice",
+        format!("网关已启用，请重新打开 {}", client_id.name()),
+    );
     Ok(result)
 }
 #[tauri::command]
 async fn stop_gateway(
+    client_id: gateway::ClientId,
     app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
     expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
     let result = r
-        .gateway
+        .gateway(client_id)
         .stop_checked(expected_config_revision.as_deref())
         .await?;
     let _ = refresh(&app, &r);
-    let _ = app.emit("switch-notice", "已写入当前供应商，请重新打开 Codex");
+    let _ = app.emit(
+        "switch-notice",
+        format!("已写入当前供应商，请重新打开 {}", client_id.name()),
+    );
     Ok(result)
 }
 #[tauri::command]
-async fn test_provider(r: tauri::State<'_, Arc<Runtime>>, id: String) -> Result<u64> {
-    r.gateway.test_connection(&id).await
+async fn test_provider(
+    client_id: gateway::ClientId,
+    r: tauri::State<'_, Arc<Runtime>>,
+    id: String,
+) -> Result<u64> {
+    r.gateway(client_id).test_connection(&id).await
 }
 #[tauri::command]
 async fn query_provider_quota(
+    client_id: gateway::ClientId,
     r: tauri::State<'_, Arc<Runtime>>,
     provider_id: String,
     force: bool,
 ) -> Result<gateway::QuotaView> {
-    r.gateway.query_quota(&provider_id, force).await
+    r.gateway(client_id).query_quota(&provider_id, force).await
 }
 #[tauri::command]
 async fn frontend_ready(
@@ -590,10 +642,12 @@ async fn frontend_ready(
         app.exit(0);
     } else {
         if r.startup.preferences()?.restore_gateway {
-            let home = lock(&r.core)?.home();
-            if let Err(e) = r.gateway.resume(&home).await {
-                *r.startup_error.lock().unwrap() = Some(e.clone());
-                let _ = app.emit("switch-error", e);
+            for client in [gateway::ClientId::Codex, gateway::ClientId::Claude] {
+                if let Err(e) = r.gateway(client).resume(&r.home(client)?).await {
+                    let e = AppError::new(&e.code, &format!("{}：{}", client.name(), e.message));
+                    *r.startup_error.lock().unwrap() = Some(e.clone());
+                    let _ = app.emit("switch-error", e);
+                }
             }
         }
         if !r.start_silently {
@@ -604,7 +658,10 @@ async fn frontend_ready(
 }
 async fn prepare_exit_smoke(r: &Runtime) -> Result<SmokeSnapshot> {
     let home = lock(&r.core)?.home();
+    let claude_home = r.home(gateway::ClientId::Claude)?;
     let snapshot = SmokeSnapshot {
+        claude_config: storage::read_optional(&claude_home.join("settings.json"))?,
+        claude_home,
         auth: storage::read_optional(&home.join("auth.json"))?,
         config: storage::read_optional(&home.join("config.toml"))?.map(|raw| {
             String::from_utf8(raw)
@@ -625,6 +682,9 @@ async fn prepare_exit_smoke(r: &Runtime) -> Result<SmokeSnapshot> {
         &r.gateway.view().revision,
         &snapshot.home,
     )?;
+    r.claude
+        .start(&r.claude.view().revision, &snapshot.claude_home)
+        .await?;
     Ok(snapshot)
 }
 fn report_exit_smoke(app: &tauri::AppHandle, r: &Runtime, restored: Result<()>) -> Result<()> {
@@ -635,6 +695,9 @@ fn report_exit_smoke(app: &tauri::AppHandle, r: &Runtime, restored: Result<()>) 
         restored?;
         if !r.quit_pending.load(Ordering::Relaxed)
             || r.gateway.guarded_home()
+            || r.claude.guarded_home()
+            || snapshot.claude_config
+                != storage::read_optional(&snapshot.claude_home.join("settings.json"))?
             || snapshot.auth != storage::read_optional(&snapshot.home.join("auth.json"))?
             || snapshot.config != storage::read_optional(&snapshot.home.join("config.toml"))?
         {
@@ -689,7 +752,26 @@ async fn gateway_smoke(r: &Runtime) -> Result<()> {
         &r.gateway.view().revision,
         &home,
     )?;
+    let claude_home = r.home(gateway::ClientId::Claude)?;
+    storage::atomic_write(&claude_home.join("settings.json"), br#"{"env":{"ANTHROPIC_BASE_URL":"https://claude.example.invalid","ANTHROPIC_AUTH_TOKEN":"fixture-claude"},"model":"keep"}"#, Some("missing"))?;
+    r.claude.import_initial(&claude_home)?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(storage::io_error)?;
+    let claude_port = listener.local_addr().map_err(storage::io_error)?.port();
+    drop(listener);
+    r.claude.edit(
+        gateway::Edit::Settings {
+            settings: gateway::Settings {
+                port: claude_port,
+                ..Default::default()
+            },
+        },
+        &r.claude.view().revision,
+        &claude_home,
+    )?;
     r.gateway.start(&r.gateway.view().revision, &home).await?;
+    r.claude
+        .start(&r.claude.view().revision, &claude_home)
+        .await?;
     let live = storage::read_optional(&home.join("config.toml"))?;
     r.gateway.edit(
         gateway::Edit::Select {
@@ -724,6 +806,10 @@ async fn gateway_smoke(r: &Runtime) -> Result<()> {
     .map_err(|_| AppError::new("SMOKE", "网关响应超时"))?
     .map_err(storage::io_error)?;
     r.gateway.stop().await?;
+    if !r.claude.view().running {
+        return Err(AppError::new("SMOKE", "双网关状态未隔离"));
+    }
+    r.claude.stop().await?;
     if !response.starts_with(b"HTTP/1.1 401")
         || auth != storage::read_optional(&home.join("auth.json"))?
         || config != storage::read_optional(&home.join("config.toml"))?
@@ -751,7 +837,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, args, _| {
             links::receive(app, args.iter().cloned());
-            if !args.iter().any(|a| a == startup::LOGIN_ARG) {
+            if !args.iter().any(|a| startup::is_login_argument(a)) {
                 let _ = show(app, None);
             }
         }))
@@ -760,7 +846,7 @@ pub fn run() {
             let fixture = if smoke.is_some() {
                 Some(
                     tempfile::Builder::new()
-                        .prefix("gpt-switch-smoke-")
+                        .prefix("lich13-switch-smoke-")
                         .tempdir()?,
                 )
             } else {
@@ -780,16 +866,31 @@ pub fn run() {
                 });
             let cleanup_error = cleanup::retired_statistics(&data).err();
             let gateway = gateway::Gateway::new(data.clone())?;
+            let claude = gateway.companion(data.join("claude"))?;
             let startup = startup::Service::new(&data);
             let start_silently = smoke.is_none() && startup::silent(&args, &startup.preferences()?);
             app.manage(quick::Panel::new(&data)?);
             let power = power::Service::new(&data);
-            let core = Core::new(data.clone(), home)?;
+            let mut core = Core::new(data.clone(), home)?;
+            if let Some(fixture) = &fixture {
+                let mut preferences = core.preferences();
+                preferences.claude_home =
+                    fixture.path().join("claude").to_string_lossy().into_owned();
+                core.set_preferences(preferences)?;
+            }
+            let claude_import_error = if smoke.is_none() {
+                claude
+                    .import_initial(std::path::Path::new(&core.preferences().claude_home))
+                    .err()
+            } else {
+                None
+            };
             let runtime = Arc::new(Runtime {
                 core: Mutex::new(core),
                 data,
                 imports: Mutex::new(links::Imports::default()),
                 gateway,
+                claude,
                 login: Mutex::new(Default::default()),
                 quitting: AtomicBool::new(false),
                 quit_pending: AtomicBool::new(false),
@@ -801,10 +902,13 @@ pub fn run() {
                 power,
                 frontend_started: AtomicBool::new(false),
                 force_quitting: AtomicBool::new(false),
-                startup_error: Mutex::new(None),
+                startup_error: Mutex::new(claude_import_error),
                 cleanup_error: Mutex::new(cleanup_error),
             });
             runtime.gateway.observe_home(&lock(&runtime.core)?.home());
+            runtime
+                .claude
+                .observe_home(&runtime.home(gateway::ClientId::Claude)?);
             let state = lock(&runtime.core)?.state()?;
             app.manage(runtime.clone());
             links::receive(app.handle(), args.iter().cloned());
@@ -823,36 +927,38 @@ pub fn run() {
                     }
                 });
             }
-            let mut quota_events = runtime.gateway.quota_events();
-            let quota_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    match quota_events.recv().await {
-                        Ok(view) => {
-                            let _ = quota_app.emit("provider-quota", view);
+            for g in [runtime.gateway.clone(), runtime.claude.clone()] {
+                let mut quota_events = g.quota_events();
+                let quota_app = app.handle().clone();
+                let client_id = g.client_id();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        match quota_events.recv().await {
+                            Ok(view) => {
+                                let _ = quota_app.emit(
+                                    "provider-quota",
+                                    serde_json::json!({"clientId":client_id,"quota":view}),
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => break,
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(_) => break,
                     }
-                }
-            });
-            let mut gateway_events = runtime.gateway.subscribe();
-            let gateway_runtime = runtime.clone();
-            let gateway_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                loop {
-                    match gateway_events.recv().await {
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => (),
-                        Err(_) => break,
+                });
+                let mut events = g.subscribe();
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    while let Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) =
+                        events.recv().await
+                    {
+                        let _ = handle.emit("gateway-state", g.view());
                     }
-                    let _ = gateway_app.emit("gateway-state", gateway_runtime.gateway.view());
-                    let _ = refresh(&gateway_app, &gateway_runtime);
-                }
-            });
+                });
+            }
             let mut tray = TrayIconBuilder::with_id("switch")
                 .menu(&tray_menu(app.handle())?)
                 .show_menu_on_left_click(false)
-                .tooltip("gpt-Switch");
+                .tooltip("lich13-switch");
             #[cfg(target_os = "macos")]
             {
                 tray = tray
@@ -910,10 +1016,10 @@ pub fn run() {
                 .on_menu_event(|app, e| match e.id().as_ref() {
                     "quit" => quit(app, &app.state::<Arc<Runtime>>()),
                     "open" => {
-                        let _ = open_main(app.clone(), None, None);
+                        let _ = open_main(app.clone(), None, None, None);
                     }
                     "config" | "gateway" | "settings" => {
-                        let _ = open_main(app.clone(), Some(e.id().as_ref().into()), None);
+                        let _ = open_main(app.clone(), Some(e.id().as_ref().into()), None, None);
                     }
                     _ => (),
                 })
@@ -1046,7 +1152,7 @@ pub fn run() {
             frontend_ready
         ])
         .build(tauri::generate_context!())
-        .expect("gpt-Switch initialization failed")
+        .expect("lich13-switch initialization failed")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = &event {
@@ -1069,8 +1175,7 @@ pub fn run() {
                 let r = app.state::<Arc<Runtime>>();
                 // macOS Dock/system termination can bypass ExitRequested.
                 // Serialize restoration with any in-flight takeover before returning to the OS.
-                let restored =
-                    tauri::async_runtime::block_on(r.gateway.stop_for_exit()).map(|_| ());
+                let restored = tauri::async_runtime::block_on(r.stop_gateways());
                 if r.smoke.is_some() {
                     let _ = report_exit_smoke(app, &r, restored);
                 }

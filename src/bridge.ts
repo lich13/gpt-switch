@@ -8,7 +8,7 @@ export async function command<T>(
 ): Promise<T> {
   if (native) return invoke<T>(name, args);
   if (preview) return (await import("./preview")).run(name, args) as Promise<T>;
-  throw new Error("请在 gpt-Switch 桌面客户端中打开");
+  throw new Error("请在 lich13-switch 桌面客户端中打开");
 }
 export async function subscribe<T>(
   event: string,

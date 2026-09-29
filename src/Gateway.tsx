@@ -1,3 +1,8 @@
+import ClientSelection, {
+  useClientSelection,
+  clientName,
+} from "./ClientSelection";
+import type { ClientId } from "./types";
 import ProviderSettings from "./ProviderSettings";
 import ProviderControls from "./ProviderControls";
 import SortableProviders, { type ProviderCommit } from "./SortableProviders";
@@ -5,7 +10,7 @@ import Modal from "./Modal";
 import { providerStatus } from "./provider-status";
 import ModelPolicyDialog from "./ModelPolicyDialog";
 import { QuotaInfo, useProviderQuota } from "./Quota";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Plus,
   Power,
@@ -53,12 +58,48 @@ const healthText = (h: Health) =>
             : h.requests
               ? "可用"
               : "待请求";
-export default function Gateway({
+type GatewayProps = {
+  section: "gateway" | "proxies";
+  notify: (s: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
+  focusProvider?: { id: string; sequence: number; clientId?: ClientId } | null;
+};
+export default function Gateway(props: GatewayProps) {
+  const [clientId, select] = useClientSelection("main");
+  const dirty = useRef(false);
+  const changed = useCallback(
+    (value: boolean) => {
+      dirty.current = value;
+      props.onDirtyChange?.(value);
+    },
+    [props.onDirtyChange],
+  );
+  useEffect(() => {
+    if (props.focusProvider)
+      select(props.focusProvider.clientId ?? "codex", dirty.current);
+  }, [props.focusProvider?.sequence]);
+  return (
+    <GatewayContent
+      key={clientId}
+      {...props}
+      clientId={clientId}
+      onClientChange={(id) => {
+        select(id, dirty.current);
+      }}
+      onDirtyChange={changed}
+    />
+  );
+}
+function GatewayContent({
   section,
+  clientId,
+  onClientChange,
   notify,
   onDirtyChange,
   focusProvider,
 }: {
+  clientId: ClientId;
+  onClientChange: (id: ClientId) => void;
   section: "gateway" | "proxies";
   notify: (s: string) => void;
   onDirtyChange?: (dirty: boolean) => void;
@@ -71,17 +112,22 @@ export default function Gateway({
   useEffect(() => {
     setDialog(null);
   }, [section]);
-  const quota = useProviderQuota(state?.providers ?? [], section === "gateway");
+  const quota = useProviderQuota(
+    state?.providers ?? [],
+    section === "gateway",
+    "app-visibility",
+    clientId,
+  );
   useEffect(() => {
     let disposed = false,
       clean: (() => void) | undefined;
-    void command<GatewayState>("get_gateway")
+    void command<GatewayState>("get_gateway", { clientId })
       .then((s) => {
-        if (!disposed) setState(s);
+        if (!disposed && (s.clientId ?? "codex") === clientId) setState(s);
       })
       .catch((e) => setError(errorOf(e).message));
     void subscribe<GatewayState>("gateway-state", (s) => {
-      if (!disposed) setState(s);
+      if (!disposed && (s.clientId ?? "codex") === clientId) setState(s);
     }).then((c) => {
       if (disposed) c();
       else clean = c;
@@ -120,13 +166,14 @@ export default function Gateway({
   const edit = async (payload: Edit, expected?: string) => {
     if (!state) return;
     const next = await command<GatewayState>("update_gateway", {
+      clientId,
       edit: payload,
       expectedRevision: expected ?? state.revision,
       ...(payload.op === "select" && !state.running
         ? { expectedConfigRevision: state.configRevision }
         : {}),
     }).catch(async (error) => {
-      await command<GatewayState>("get_gateway")
+      await command<GatewayState>("get_gateway", { clientId })
         .then(setState)
         .catch(() => {});
       throw error;
@@ -152,12 +199,13 @@ export default function Gateway({
             ? "stop_gateway"
             : "start_gateway",
           {
+            clientId,
             expectedRevision: state.revision,
             expectedConfigRevision: state.configRevision,
           },
         ),
       );
-      notify("配置已切换，请重新打开 Codex");
+      notify(`配置已切换，请重新打开 ${clientName(clientId)}`);
     });
   const choose = (p: Provider) =>
     run(async () => {
@@ -165,7 +213,7 @@ export default function Gateway({
       notify(
         state.running
           ? "已切换供应商，新请求立即生效"
-          : "文件已切换，请重新打开 Codex",
+          : `文件已切换，请重新打开 ${clientName(clientId)}`,
       );
     });
   const menuClose = (e: React.MouseEvent) =>
@@ -173,7 +221,15 @@ export default function Gateway({
   return (
     <section className="gateway-page">
       <div className="page-heading gateway-heading">
-        <h1>{section === "gateway" ? "网关" : "代理设置"}</h1>
+        {section === "gateway" ? (
+          <ClientSelection
+            client={clientId}
+            select={onClientChange}
+            disabled={busy}
+          />
+        ) : (
+          <h1>代理设置</h1>
+        )}
         {section === "gateway" ? (
           <div className="gateway-toolbar">
             <div className="segmented" aria-label="路由模式">
@@ -254,6 +310,11 @@ export default function Gateway({
           </button>
         )}
       </div>
+      {state.configWarning && (
+        <div className="inline-error" role="status">
+          {state.configWarning}
+        </div>
+      )}
       {(error || state.error || state.configError) && (
         <div className="banner error" role="alert">
           {error || state.error || state.configError}
@@ -368,7 +429,7 @@ export default function Gateway({
                             onClick={() =>
                               run(async () =>
                                 notify(
-                                  `TCP / TLS 连接正常 · ${await command<number>("test_provider", { id: p.id })} ms`,
+                                  `TCP / TLS 连接正常 · ${await command<number>("test_provider", { clientId, id: p.id })} ms`,
                                 ),
                               )
                             }
@@ -441,6 +502,7 @@ export default function Gateway({
               </span>
             </div>
             <Advanced
+              onDirtyChange={onDirtyChange}
               settings={state.settings}
               revision={state.revision}
               busy={busy}
@@ -535,6 +597,7 @@ export default function Gateway({
       )}
       {dialog?.kind === "models" && (
         <ModelPolicyDialog
+          clientId={clientId}
           provider={dialog.item}
           version={
             state.providers.find((p) => p.id === dialog.item.id)
@@ -557,6 +620,7 @@ export default function Gateway({
           dialog.kind === "proxy" ||
           dialog.kind === "rename") && (
           <GatewayDialog
+            clientId={clientId}
             dialog={dialog}
             onDirtyChange={onDirtyChange}
             close={() => setDialog(null)}
@@ -570,11 +634,13 @@ export default function Gateway({
   );
 }
 function Advanced({
+  onDirtyChange,
   settings,
   revision,
   busy,
   save,
 }: {
+  onDirtyChange?: (dirty: boolean) => void;
   settings: GatewaySettings;
   revision: string;
   busy: boolean;
@@ -582,6 +648,7 @@ function Advanced({
 }) {
   const [draft, setDraft] = useState(settings),
     [error, setError] = useState("");
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
   const editing = useRef(false),
     baseRevision = useRef(revision);
   useEffect(() => {
@@ -614,6 +681,7 @@ function Advanced({
         void save(draft, baseRevision.current)
           .then(() => {
             editing.current = false;
+            onDirtyChange?.(false);
           })
           .catch((e) => setError(errorOf(e).message));
       }}
@@ -631,6 +699,7 @@ function Advanced({
               onChange={(e) => {
                 if (!editing.current) baseRevision.current = revision;
                 editing.current = true;
+                onDirtyChange?.(true);
                 setDraft({ ...draft, [key]: Number(e.target.value) });
               }}
             />
@@ -649,11 +718,13 @@ function Advanced({
   );
 }
 function GatewayDialog({
+  clientId,
   dialog,
   close,
   save,
   onDirtyChange,
 }: {
+  clientId: ClientId;
   dialog: Extract<
     NonNullable<Dialog>,
     { kind: "provider" | "proxy" | "rename" }
@@ -725,18 +796,24 @@ function GatewayDialog({
         {dialog.kind === "provider" ? (
           <>
             <label>
-              base_url
+              {clientId === "claude" ? "ANTHROPIC_BASE_URL" : "base_url"}
               <input
                 required
                 type="url"
                 autoFocus
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="https://api.example.com/v1"
+                placeholder={
+                  clientId === "claude"
+                    ? "https://api.example.com"
+                    : "https://api.example.com/v1"
+                }
               />
             </label>
             <label>
-              experimental_bearer_token
+              {clientId === "claude"
+                ? "ANTHROPIC_AUTH_TOKEN"
+                : "experimental_bearer_token"}
               <input
                 required={!dialog.item}
                 type="password"

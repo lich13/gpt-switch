@@ -1,0 +1,61 @@
+import { useCallback, useState } from "react";
+import type { ClientId } from "./types";
+
+export const clientName = (client: ClientId) =>
+  client === "claude" ? "Claude Code" : "Codex";
+export function useClientSelection(surface: "main" | "quick") {
+  const key = `lich13-switch.${surface}.client`;
+  const [client, setClient] = useState<ClientId>(() => {
+    try {
+      return localStorage.getItem(key) === "claude" ? "claude" : "codex";
+    } catch {
+      return "codex";
+    }
+  });
+  const select = useCallback(
+    (next: ClientId, dirty = false) => {
+      if (next === client) return true;
+      if (
+        (dirty || document.querySelector("[data-provider-draft]")) &&
+        !windowConfirm()
+      )
+        return false;
+      try {
+        localStorage.setItem(key, next);
+      } catch {
+        /* Selection remains usable without storage. */
+      }
+      setClient(next);
+      return true;
+    },
+    [client, key],
+  );
+  return [client, select] as const;
+}
+const windowConfirm = () =>
+  window.confirm("切换客户端会丢弃未保存的表单，是否继续？");
+export default function ClientSelection({
+  client,
+  select,
+  disabled = false,
+}: {
+  client: ClientId;
+  select: (id: ClientId) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <nav className="segmented client-selection" aria-label="客户端">
+      {(["codex", "claude"] as const).map((id) => (
+        <button
+          key={id}
+          data-client-switch
+          disabled={disabled}
+          aria-pressed={id === client}
+          onClick={() => select(id)}
+        >
+          {clientName(id)}
+        </button>
+      ))}
+    </nav>
+  );
+}

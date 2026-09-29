@@ -24,10 +24,10 @@ vi.mock("./bridge", () => ({
 import LinkSettings from "./LinkSettings";
 
 const original = "com.example.original";
-const target = "com.example.gpt-switch";
+const target = "com.example.lich13-switch";
 const apps = [
   { id: original, name: "原接收应用", path: "/fixture/Original.app" },
-  { id: target, name: "gpt-Switch", path: "/fixture/gpt-Switch.app" },
+  { id: target, name: "lich13-switch", path: "/fixture/lich13-switch.app" },
 ];
 type Handlers = {
   current: string | null;

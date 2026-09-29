@@ -88,6 +88,7 @@ struct Shared {
 #[derive(Clone)]
 pub struct Service(Arc<Shared>);
 pub struct Query {
+    pub client_id: super::ClientId,
     pub id: String,
     pub version: String,
     pub base: String,
@@ -243,7 +244,7 @@ async fn get(input: &Query, url: String, auth: bool) -> std::result::Result<Repl
             .header(header::ACCEPT_ENCODING, "identity")
             .header(
                 header::USER_AGENT,
-                concat!("gpt-switch/", env!("CARGO_PKG_VERSION")),
+                concat!("lich13-switch/", env!("CARGO_PKG_VERSION")),
             );
         if auth {
             req = req.header(header::AUTHORIZATION, format!("Bearer {}", input.token));

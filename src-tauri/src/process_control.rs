@@ -208,7 +208,7 @@ mod tests {
         other.user = "another".into();
         let mut f = Fake {
             items: vec![
-                e(1, None, "/app/gpt-switch", false),
+                e(1, None, "/app/lich13-switch", false),
                 e(2, None, "/Applications/ChatGPT.app/ChatGPT", true),
                 e(3, Some(2), "/node", false),
                 e(4, None, "/bin/codex", false),

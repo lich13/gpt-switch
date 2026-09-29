@@ -2058,3 +2058,23 @@ select:focus-visible {
   margin: 0;
   overflow-wrap: anywhere;
 }
+
+.client-selection {
+  flex-shrink: 0;
+}
+.client-selection button {
+  white-space: nowrap;
+}
+.quick-scroll .client-selection {
+  width: max-content;
+  margin: 0 12px 12px;
+}
+@media (max-width: 800px) {
+  .gateway-heading {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .gateway-toolbar {
+    flex-wrap: wrap;
+  }
+}

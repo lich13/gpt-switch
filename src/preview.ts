@@ -42,7 +42,12 @@ export const demo: ViewState = {
   authRevision: "preview",
   configRevision: "preview",
   currentState: "saved",
-  preferences: { codexHome: "~/.codex", cliPath: "", theme: "system" },
+  preferences: {
+    claudeHome: "~/.claude",
+    codexHome: "~/.codex",
+    cliPath: "",
+    theme: "system",
+  },
   authSource: {
     provider: "openai",
     credentialStore: "file",
@@ -92,8 +97,8 @@ let imports = importPreview
 const linkApps = [
   {
     id: "com.lich13.gpt-switch",
-    name: "gpt-Switch",
-    path: "/Applications/gpt-Switch.app",
+    name: "lich13-switch",
+    path: "/Applications/lich13-switch.app",
   },
   {
     id: "com.lich13.studio",
@@ -165,7 +170,11 @@ export async function run(
     ].includes(name)
   ) {
     const result = gatewayPreview(name, args);
-    if (name === "query_provider_quota") emit("provider-quota", result);
+    if (name === "query_provider_quota")
+      emit("provider-quota", {
+        clientId: args.clientId ?? "codex",
+        quota: result,
+      });
     else if (name !== "test_provider") emit("gateway-state", result);
     return result;
   }

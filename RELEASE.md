@@ -1,8 +1,8 @@
-# gpt-Switch v0.7.2
+# lich13-switch v0.8.0
 
-- 主面板和快捷面板直接调整并发上限、加入／移出故障转移队列，继续保持两行紧凑布局。
-- 使用左侧手柄拖动供应商，支持键盘排序与边缘滚动；列表顺序决定已入队供应商的 P1、P2 优先级。
-- 排序和快捷调整共用版本校验，失败恢复真实状态；并发输入在后台刷新或保存失败后保留，配置冲突不会覆盖其他窗口的修改。
-- 供应商设置只保存代理字段，移除重复的并发、队列和上下移动入口。已有请求、账号、Codex 文件与当前供应商选择保持原状。
-
-安装包：macOS Apple Silicon DMG、Windows x64 NSIS；另附图标和 SHA-256。macOS 使用 ad-hoc 签名，Windows 未配置商业代码签名。升级后助手代码身份变化需重新授权一次。
+- 产品与仓库改名为 lich13-switch，沿用原应用身份和私有数据，保留全部 Codex 账号、供应商、代理和系统设置。
+- 新增 Claude Code 独立供应商、网关、队列、并发、白名单、故障转移、模型列表与额度查询；Codex 和 Claude 网关可同时运行，代理配置共用。
+- Claude 仅修改 settings.json 中 env.ANTHROPIC_BASE_URL、env.ANTHROPIC_AUTH_TOKEN；Codex 仍仅修改 custom 的原有两字段。热切换只改变内部路由，停止或退出写回供应商，冲突时保留现场。
+- 主窗口和快捷面板增加客户端切换，分别记住选择；保留两行列表、拖动、并发浮层和队列开关。CC Switch 导入支持 app=claude，确认只新增对应供应商。
+- 首次导入现有 Claude 供应商，Claude 网关默认关闭。静默启动迁移正式应用路径，电源助手保留原恢复记录，升级后可能需系统授权修复。
+- 提供 macOS Apple Silicon DMG、Windows x64 NSIS、图标和 SHA-256。Windows 延续旧升级与卸载标识；不发布 Intel DMG。

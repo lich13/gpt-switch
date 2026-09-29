@@ -1,3 +1,7 @@
+mod claude_config;
+mod client;
+mod network;
+pub use client::{claude_home, ClientId};
 mod admission;
 pub mod catalog;
 mod circuit;
@@ -63,6 +67,7 @@ pub struct ProxyView {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
+    pub client_id: ClientId,
     pub revision: String,
     pub running: bool,
     pub address: String,
@@ -73,6 +78,7 @@ pub struct View {
     pub config_provider: Option<String>,
     pub config_state: String,
     pub config_error: Option<String>,
+    pub config_warning: Option<String>,
     pub providers: Vec<ProviderView>,
     pub proxies: Vec<ProxyView>,
     pub settings: Settings,
@@ -94,6 +100,8 @@ struct Inner {
     home: Option<PathBuf>,
 }
 struct Shared {
+    client: ClientId,
+    network: Arc<network::Network>,
     inner: Mutex<Inner>,
     lifecycle: tokio::sync::Mutex<()>,
     clients: Mutex<HashMap<String, HttpClient>>,
@@ -109,6 +117,7 @@ struct Shared {
 pub struct Gateway(Arc<Shared>);
 #[derive(Clone)]
 struct Route {
+    client_id: ClientId,
     provider: Provider,
     client: HttpClient,
     provider_circuit: Circuit,
@@ -122,9 +131,27 @@ fn xkey(p: &Proxy) -> String {
 }
 impl Gateway {
     pub fn new(data: PathBuf) -> Result<Self> {
+        Self::new_client(data, ClientId::Codex, None)
+    }
+    pub fn companion(&self, data: PathBuf) -> Result<Self> {
+        Self::new_client(data, ClientId::Claude, Some(self.0.network.clone()))
+    }
+    fn new_client(
+        data: PathBuf,
+        client: ClientId,
+        shared: Option<Arc<network::Network>>,
+    ) -> Result<Self> {
         storage::private_dir(&data)?;
         let error = takeover::recover(&data).err().map(|e| e.message);
-        let (store, revision) = Store::load(&data.join("gateway.json"))?;
+        let (mut store, revision) = Store::load(&data.join("gateway.json"))?;
+        if revision == "missing" {
+            store.settings.port = client.port();
+        }
+        let network = match shared {
+            Some(n) => n,
+            None => network::Network::new(&data, &store.proxies)?,
+        };
+        store.proxies = network.snapshot().0;
         let spool = tempfile::Builder::new()
             .prefix("gateway-spool-")
             .tempdir_in(&data)
@@ -133,7 +160,9 @@ impl Gateway {
         let (events, _) = broadcast::channel(32);
         let admission = admission::Scheduler::new(events.clone());
         admission.configure(&store.providers, false);
-        Ok(Self(Arc::new(Shared {
+        let gateway = Self(Arc::new(Shared {
+            client,
+            network: network.clone(),
             inner: Mutex::new(Inner {
                 store,
                 revision,
@@ -155,7 +184,55 @@ impl Gateway {
             quota: quota::Service::new(),
             catalog: catalog::Service::new(),
             admission,
-        })))
+        }));
+        network.register(&gateway.0);
+        Ok(gateway)
+    }
+    pub fn import_initial(&self, home: &Path) -> Result<()> {
+        if self.0.client != ClientId::Claude {
+            return Ok(());
+        }
+        let _guard = self.0.network.mutation.lock().unwrap();
+        let mut s = self.0.inner.lock().unwrap();
+        s.home = Some(home.to_owned());
+        if s.store.initialized {
+            return Ok(());
+        }
+        let mut next = s.store.clone();
+        if next.providers.is_empty() {
+            if !self.0.client.config(home).exists() {
+                return Ok(());
+            }
+            let (_, pair) = takeover::read_for(self.0.client, home)?;
+            if pair.base_url.as_deref().is_none_or(str::is_empty)
+                && pair.token.as_deref().is_none_or(str::is_empty)
+            {
+                return Ok(());
+            }
+            let (base_url, token) = takeover::import_for(self.0.client, home)?;
+            for port in self.0.network.ports.lock().unwrap().iter() {
+                model::base_url(&base_url, *port)?;
+            }
+            next.edit(
+                Edit::SaveProvider {
+                    id: None,
+                    base_url,
+                    token,
+                },
+                false,
+            )?;
+        }
+        next.initialized = true;
+        s.revision = next.persist(&self.0.data.join("gateway.json"), &s.revision)?;
+        s.store = next;
+        self.0.admission.configure(&s.store.providers, false);
+        Ok(())
+    }
+    pub fn client_id(&self) -> ClientId {
+        self.0.client
+    }
+    fn view_revision(&self, s: &Inner) -> String {
+        storage::digest(format!("{}:{}", s.revision, self.0.network.snapshot().1).as_bytes())
     }
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.0.events.subscribe()
@@ -167,7 +244,10 @@ impl Gateway {
         let s = self.0.inner.lock().unwrap();
         let (occupied, waiting) = self.0.admission.counts();
         let health = |key: String| s.circuits.get(&key).cloned().unwrap_or_default().health();
-        let config = s.home.as_ref().map(|h| takeover::read(h));
+        let config = s
+            .home
+            .as_ref()
+            .map(|h| takeover::read_for(self.0.client, h));
         let config_revision = config
             .as_ref()
             .and_then(|r| r.as_ref().ok())
@@ -178,7 +258,7 @@ impl Gateway {
             config_state = "unsaved";
             if pair
                 == &takeover::Pair::new(
-                    &format!("http://127.0.0.1:{}/v1", s.store.settings.port),
+                    &self.0.client.address(s.store.settings.port),
                     &s.store.local_token,
                 )
             {
@@ -194,14 +274,20 @@ impl Gateway {
             }
         }
         View {
+            client_id: self.0.client,
             config_revision,
             config_provider,
             config_state: config_state.into(),
             config_error: config.and_then(|r| r.err()).map(|e| e.message),
+            config_warning: if self.0.client == ClientId::Claude {
+                s.home.as_ref().and_then(|h| claude_config::warning(h))
+            } else {
+                None
+            },
             last_successful: s.last_successful.clone(),
-            revision: s.revision.clone(),
+            revision: self.view_revision(&s),
             running: s.running,
-            address: format!("http://127.0.0.1:{}/v1", s.store.settings.port),
+            address: self.0.client.address(s.store.settings.port),
             mode: s.store.mode.clone(),
             selected: s.store.selected.clone(),
             settings: s.store.settings.clone(),
@@ -279,9 +365,17 @@ impl Gateway {
         home: &Path,
         config_revision: Option<&str>,
     ) -> Result<View> {
+        let _network_guard = self.0.network.mutation.lock().unwrap();
+        if matches!(&edit, Edit::SaveProxy { .. } | Edit::DeleteProxy { .. }) {
+            if expected != self.view_revision(&self.0.inner.lock().unwrap()) {
+                return Err(AppError::new("CONFLICT", "网关设置已变化，请刷新后重试"));
+            }
+            self.0.network.edit(edit)?;
+            return Ok(self.view());
+        }
         let mut s = self.0.inner.lock().unwrap();
         s.home = Some(home.to_owned());
-        if expected != s.revision {
+        if expected != self.view_revision(&s) {
             return Err(AppError::new(
                 "CONFLICT",
                 "网关设置已变化，请使用最新状态重试",
@@ -302,7 +396,7 @@ impl Gateway {
                 }
             }
             Edit::Import => {
-                let (base_url, token) = takeover::import(home)?;
+                let (base_url, token) = takeover::import_for(self.0.client, home)?;
                 next.edit(
                     Edit::SaveProvider {
                         id: None,
@@ -313,6 +407,31 @@ impl Gateway {
                 )?;
             }
             edit => next.edit(edit, s.running)?,
+        }
+        let mut ports = self.0.network.ports.lock().unwrap().clone();
+        ports.push(next.settings.port);
+        for provider in &next.providers {
+            for port in &ports {
+                model::base_url(&provider.base_url, *port)?;
+            }
+        }
+        // A port change must not turn another client's existing upstream into a loop.
+        if next.settings.port != s.store.settings.port {
+            for peer in self
+                .0
+                .network
+                .gateways
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+            {
+                if !Arc::ptr_eq(&peer, &self.0) {
+                    for p in &peer.inner.lock().unwrap().store.providers {
+                        model::base_url(&p.base_url, next.settings.port)?;
+                    }
+                }
+            }
         }
         let revision = if s.running || direct_select {
             let p = Self::exit_provider(&next, s.last_successful.as_deref())?;
@@ -329,7 +448,8 @@ impl Gateway {
             }
             let after = serde_json::to_string_pretty(&next)
                 .map_err(|_| AppError::new("STORE", "无法写入网关设置"))?;
-            takeover::commit_store(
+            takeover::commit_store_for(
+                self.0.client,
                 &self.0.data,
                 home,
                 old.map(|v| String::from_utf8(v).unwrap()),
@@ -359,6 +479,7 @@ impl Gateway {
                 .collect(),
         );
         drop(s);
+        self.0.network.update_ports();
         self.0.clients.lock().unwrap().clear();
         self.changed();
         Ok(self.view())
@@ -375,7 +496,7 @@ impl Gateway {
         let _guard = self.0.lifecycle.lock().await;
         let (port, token) = {
             let s = self.0.inner.lock().unwrap();
-            if expected != s.revision {
+            if expected != self.view_revision(&s) {
                 return Err(AppError::new("CONFLICT", "网关设置已变化，请重试"));
             }
             if s.running {
@@ -392,19 +513,19 @@ impl Gateway {
             .map_err(|_| AppError::new("PORT", "无法绑定本地端口，请检查端口占用或修改端口"))?;
         {
             let s = self.0.inner.lock().unwrap();
-            if s.revision != expected {
+            if self.view_revision(&s) != expected {
                 return Err(AppError::new("CONFLICT", "绑定端口期间设置已变化，请重试"));
             }
         }
         let (tx, rx) = watch::channel(false);
         {
             let mut s = self.0.inner.lock().unwrap();
-            if s.revision != expected {
+            if self.view_revision(&s) != expected {
                 return Err(AppError::new("CONFLICT", "设置已变化，请重试"));
             }
             let p = Self::exit_provider(&s.store, None)?;
             let exit = takeover::Pair::new(&p.base_url, &p.token);
-            let (current, _) = takeover::read(home)?;
+            let (current, _) = takeover::read_for(self.0.client, home)?;
             let mut next = s.store.clone();
             next.resume = Some(model::Resume {
                 home: home.to_owned(),
@@ -417,7 +538,8 @@ impl Gateway {
             }
             let after = serde_json::to_string_pretty(&next)
                 .map_err(|_| AppError::new("STORE", "无法生成网关启动事务"))?;
-            takeover::attach_store(
+            takeover::attach_store_for(
+                self.0.client,
                 &self.0.data,
                 home,
                 port,
@@ -458,7 +580,7 @@ impl Gateway {
         }
         let (revision, intent) = {
             let s = self.0.inner.lock().unwrap();
-            (s.revision.clone(), s.store.resume.clone())
+            (self.view_revision(&s), s.store.resume.clone())
         };
         let Some(intent) = intent.filter(|i| i.desired) else {
             return Ok(());
@@ -467,14 +589,14 @@ impl Gateway {
             if intent.home != home {
                 return Err(AppError::new(
                     "RESUME_CONFLICT",
-                    "Codex 目录已变化，自动恢复已停止",
+                    "客户端目录已变化，自动恢复已停止",
                 ));
             }
-            let (config_revision, pair) = takeover::read(home)?;
+            let (config_revision, pair) = takeover::read_for(self.0.client, home)?;
             if pair.fingerprint() != intent.pair_hash {
                 return Err(AppError::new(
                     "RESUME_CONFLICT",
-                    "custom 的地址或 Token 在退出后已被修改，自动恢复已停止",
+                    "受管地址或 Token 在退出后已被修改，自动恢复已停止",
                 ));
             }
             self.start_checked(&revision, home, Some(&config_revision))
@@ -497,7 +619,7 @@ impl Gateway {
         let listener_task = {
             let mut s = self.0.inner.lock().unwrap();
             if let (Some(expected), Some(home)) = (expected_config, &s.home) {
-                if takeover::read(home)?.0 != expected {
+                if takeover::read_for(self.0.client, home)?.0 != expected {
                     return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
                 }
             }
@@ -514,7 +636,7 @@ impl Gateway {
                         let target = match exit.as_ref() {
                             Some(pair) => pair.clone(),
                             None => {
-                                let (_, pair) = takeover::read(home)?;
+                                let (_, pair) = takeover::read_for(self.0.client, home)?;
                                 if pair.fingerprint() != intent.pair_hash {
                                     return Err(AppError::new(
                                         "RECOVERY",
@@ -532,7 +654,8 @@ impl Gateway {
                         let after = serde_json::to_string_pretty(&next)
                             .map_err(|_| AppError::new("STORE", "无法生成停止事务"))?;
                         if exit.is_some() {
-                            takeover::commit_store(
+                            takeover::commit_store_for(
+                                self.0.client,
                                 &self.0.data,
                                 home,
                                 before.map(|b| String::from_utf8(b).unwrap()),
@@ -563,7 +686,11 @@ impl Gateway {
                 return Err(e);
             }
             // Recovery may have completed a store/config transaction interrupted by an I/O failure.
-            let (store, revision) = Store::load(&self.0.data.join("gateway.json"))?;
+            let (mut store, revision) = Store::load(&self.0.data.join("gateway.json"))?;
+            if revision == "missing" {
+                store.settings.port = self.0.client.port();
+            }
+            store.proxies = self.0.network.snapshot().0;
             s.store = store;
             s.revision = revision;
             if let Some(tx) = s.shutdown.take() {
@@ -618,7 +745,8 @@ impl Gateway {
                 }
                 let after = serde_json::to_string_pretty(&next)
                     .map_err(|_| AppError::new("STORE", "无法记录最近供应商"))?;
-                takeover::commit_store(
+                takeover::commit_store_for(
+                    self.0.client,
                     &self.0.data,
                     home,
                     before.map(|b| String::from_utf8(b).unwrap()),
@@ -686,17 +814,17 @@ impl Gateway {
                 .and_then(|id| s.store.proxies.iter().find(|x| &x.id == id))
                 .cloned();
             quota::Query {
+                client_id: self.0.client,
                 id: p.id.clone(),
                 version: Self::quota_version(&s.store, p),
                 base: p.base_url.clone(),
                 token: p.token.clone(),
                 client: Client::builder(TokioExecutor::new())
                     .retry_canceled_requests(false)
-                    .build(Connector::new(
-                        proxy,
-                        Duration::from_secs(10),
-                        s.store.settings.port,
-                    )),
+                    .build(
+                        Connector::new(proxy, Duration::from_secs(10), s.store.settings.port)
+                            .with_ports(self.0.network.ports.clone()),
+                    ),
             }
         })
     }
@@ -732,7 +860,8 @@ impl Gateway {
                 .cloned();
             (p, proxy, s.store.settings.clone())
         };
-        let connector = Connector::new(proxy, Duration::from_secs(cfg.connect_seconds), cfg.port);
+        let connector = Connector::new(proxy, Duration::from_secs(cfg.connect_seconds), cfg.port)
+            .with_ports(self.0.network.ports.clone());
         let began = Instant::now();
         let uri = p
             .base_url
@@ -770,14 +899,18 @@ impl Gateway {
                     .pool_idle_timeout(Duration::from_secs(60))
                     .pool_max_idle_per_host(8)
                     .retry_canceled_requests(false)
-                    .build(Connector::new(
-                        proxy.clone(),
-                        Duration::from_secs(s.store.settings.connect_seconds),
-                        s.store.settings.port,
-                    ))
+                    .build(
+                        Connector::new(
+                            proxy.clone(),
+                            Duration::from_secs(s.store.settings.connect_seconds),
+                            s.store.settings.port,
+                        )
+                        .with_ports(self.0.network.ports.clone()),
+                    )
             })
             .clone();
         Some(Route {
+            client_id: self.0.client,
             provider,
             client,
             provider_circuit,

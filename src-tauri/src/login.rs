@@ -184,7 +184,7 @@ pub async fn run(
     events: mpsc::Sender<LoginState>,
 ) -> Result<Option<String>> {
     let temp = tempfile::Builder::new()
-        .prefix("gpt-switch-login-")
+        .prefix("lich13-switch-login-")
         .tempdir()
         .map_err(storage::io_error)?;
     storage::protect(temp.path(), true)?;
@@ -293,7 +293,7 @@ mod tests {
     }
     #[test]
     fn missing_cli_is_clear() {
-        assert!(resolve_cli("/missing/gpt-switch-codex").is_err());
+        assert!(resolve_cli("/missing/lich13-switch-codex").is_err());
     }
     #[cfg(unix)]
     #[tokio::test]
@@ -310,7 +310,7 @@ mod tests {
         let raw = run(&script, "browser", rx, events).await.unwrap().unwrap();
         assert!(raw.contains("fixture-only"));
         let path = std::fs::read_to_string(marker).unwrap();
-        assert!(path.contains("gpt-switch-login-"));
+        assert!(path.contains("lich13-switch-login-"));
         assert!(!Path::new(&path).exists());
     }
     #[cfg(unix)]

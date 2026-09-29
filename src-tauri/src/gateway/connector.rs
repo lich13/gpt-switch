@@ -100,6 +100,7 @@ pub struct Connector {
     pub timeout: Duration,
     pub gateway_port: u16,
     tls: TlsConnector,
+    ports: Option<Arc<std::sync::Mutex<Vec<u16>>>>,
 }
 impl Connector {
     pub fn new(proxy: Option<Proxy>, timeout: Duration, gateway_port: u16) -> Self {
@@ -109,11 +110,23 @@ impl Connector {
             .with_root_certificates(roots)
             .with_no_client_auth();
         Self {
+            ports: None,
             proxy,
             timeout,
             gateway_port,
             tls: TlsConnector::from(Arc::new(tls)),
         }
+    }
+    pub fn with_ports(mut self, ports: Arc<std::sync::Mutex<Vec<u16>>>) -> Self {
+        self.ports = Some(ports);
+        self
+    }
+    fn is_gateway_port(&self, port: u16) -> bool {
+        port == self.gateway_port
+            || self
+                .ports
+                .as_ref()
+                .is_some_and(|p| p.lock().unwrap().contains(&port))
     }
     pub async fn connect(&self, uri: Uri) -> Result<Transport, ConnectError> {
         let host = uri
@@ -122,6 +135,14 @@ impl Connector {
             .trim_matches(['[', ']']);
         let tls = uri.scheme_str() == Some("https");
         let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+        if self.is_gateway_port(port)
+            && (host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback()))
+        {
+            return Err(ConnectError::Loop);
+        }
         let tcp = if let Some(proxy) = &self.proxy {
             let mut tcp = tokio::time::timeout(
                 self.timeout,
@@ -144,7 +165,7 @@ impl Connector {
                     .map_err(|_| ConnectError::TargetConnect)?;
                 let mut stream = None;
                 for address in addresses {
-                    if port == self.gateway_port && address.ip().is_loopback() {
+                    if self.is_gateway_port(port) && address.ip().is_loopback() {
                         return Err(ConnectError::Loop);
                     }
                     if let Ok(s) = TcpStream::connect(address).await {

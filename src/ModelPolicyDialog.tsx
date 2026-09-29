@@ -1,15 +1,18 @@
+import type { ClientId } from "./types";
 import { useEffect, useRef, useState } from "react";
 import { RefreshCw, Search, X } from "lucide-react";
 import { command } from "./bridge";
 import { errorOf, type ModelCatalog, type Provider } from "./types";
 
 export default function ModelPolicyDialog({
+  clientId = "codex",
   provider,
   version,
   close,
   save,
   onDirtyChange,
 }: {
+  clientId?: ClientId;
   provider: Provider;
   version: string;
   close: () => void;
@@ -39,6 +42,7 @@ export default function ModelPolicyDialog({
     setLoading(true);
     try {
       const result = await command<ModelCatalog>("list_provider_models", {
+        clientId,
         providerId: provider.id,
         force,
       });

@@ -1,6 +1,6 @@
-# gpt-Switch
+# lich13-switch
 
-轻量的 Codex 账号切换、TOML 编辑与本地 API 网关，支持 macOS 和 Windows。Tauri 2 + Rust + React。首次启动网关默认关闭，可设置登录自启动与恢复上次网关状态。
+Codex 与 Claude Code 独立供应商管理、本地 API 网关，兼具 Codex 账号切换与 TOML 编辑，支持 macOS 和 Windows。Tauri 2 + Rust + React。首次启动两个网关均默认关闭，可设置登录自启动与恢复上次网关状态。
 
 <img src="assets/icon.svg" alt="Prism Relay icon" width="100" />
 
@@ -11,7 +11,9 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/lich13/gpt-switch/releases) 下载 macOS Apple Silicon DMG 或 Windows x64 安装程序。macOS 包使用 ad-hoc 签名，Windows 包未配置商业代码签名；系统可能要求确认来自非商店开发者的应用。校验下载文件时使用 Release 中的 `SHA256SUMS`。
+从 [GitHub Releases](https://github.com/lich13/lich13-switch/releases) 下载 macOS Apple Silicon DMG 或 Windows x64 安装程序。macOS 包使用 ad-hoc 签名，Windows 包未配置商业代码签名；系统可能要求确认来自非商店开发者的应用。校验下载文件时使用 Release 中的 `SHA256SUMS`。
+
+v0.8.0 从 gpt-Switch 改名，仍使用 `com.lich13.gpt-switch` 内部身份及原私有目录。macOS 安装到 `/Applications/lich13-switch.app`；保留账号、供应商、代理、启动偏好、电源记录和协议默认应用。已启用的启动项迁移路径，旧登录参数继续兼容。Windows 保留原升级／卸载标识，显示名和可执行文件更新为 lich13-switch。
 
 ## 使用
 
@@ -27,9 +29,23 @@ ChatGPT 登录需要本机已安装 [官方 Codex CLI](https://developers.openai
 
 ## 快捷面板
 
-左键反复点击菜单栏／托盘图标始终显示并聚焦独立面板，失焦后收起；固定后保留，Escape 或关闭按钮始终可关闭。供应商和账号标签记住上次选择。供应商页可以启停网关、选择模式与供应商，查看优先级、当前选择和额度；满载、冷却或故障时显示异常状态，设置入口打开对应供应商配置；账号页可搜索并切换。面板不会重置主窗口草稿，也不会更改 Dock 显示状态。右键菜单提供打开主窗口、配置、网关、设置与退出，普通打开保留当前页面。
+左键反复点击菜单栏／托盘图标始终显示并聚焦独立面板，失焦后收起；固定后保留，Escape 或关闭按钮始终可关闭。供应商和账号标签记住上次选择。供应商页通过 Codex／Claude Code 切换客户端，可以启停对应网关、选择模式与供应商，查看优先级、当前选择和额度；满载、冷却或故障时显示异常状态，设置入口打开对应供应商配置；账号页可搜索并切换。面板不会重置主窗口草稿，也不会更改 Dock 显示状态。右键菜单提供打开主窗口、配置、网关、设置与退出，普通打开保留当前页面。
 
-## 本地网关
+## 双客户端网关
+
+主面板与快捷面板分别记住 Codex／Claude Code 选择，切换视图不改变实际连接。供应商、队列、并发、熔断、模型限制、额度缓存及启动恢复按客户端隔离；代理配置共用，删除前检查两边引用。两个网关可同时运行。
+
+### Claude Code
+
+默认读取 `CLAUDE_CONFIG_DIR` 或 `~/.claude`，可在设置指定目录。首次从现有 `settings.json` 导入供应商，网关保持关闭。添加表单仅填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`。
+
+仅替换 `settings.json` 中 `env` 下的这两个字段。缺少文件、env 或字段时补齐必要结构；其他字段、顺序、缩进和换行保留。无效 JSON、重复受管键或非字符串值停止操作。不会修改 shell 启动文件、环境变量、模型、权限和插件。检测到的其他认证来源仅提示，项目或组织的更高优先级配置仍由 Claude Code 决定。
+
+Claude 默认监听 `127.0.0.1:15723`，本地地址不带 `/v1`。请求完整路径附加到供应商地址的部署子路径；例如地址 `https://example.test/site` 收到 `/v1/messages` 时转发到 `/site/v1/messages`。HTTP、SSE、工具调用、原始载荷及 Anthropic 协议头保持，认证替换为对应供应商 Bearer Token。原生模型列表读取 `/v1/models` 并处理分页。参考 [Claude 配置](https://code.claude.com/docs/en/settings) 和 [环境变量](https://code.claude.com/docs/en/env-vars)。
+
+两客户端启停与换商使用相同事务：先监听再接管，热切换不写配置，停用或退出写回当前供应商；自动模式写回最近成功供应商、无成功记录则队首。文件变更提示重新打开对应客户端。指定代理失败不会直连，两个本地网关地址均禁止作为上游。
+
+### Codex
 
 在“网关”添加 `base_url` 和 `experimental_bearer_token`，或从现有 `custom` 配置导入。当前生效的 provider 必须为 `custom`，且已有 `[model_providers.custom]`。应用只替换该表中的两个字段，不新增 provider，不改选择器、模型、协议或其他设置；其余配置字节、注释和换行保持原样。
 
@@ -79,13 +95,13 @@ SOCKS5 本身不加密；HTTPS 供应商内容仍经端到端 TLS 加密。腾�
 
 ## CC Switch 链接
 
-设置中的“CC Switch 链接”读取系统默认接收应用，可选择已安装且支持协议的 gpt-Switch、CC Switch 或 lich13studio。macOS 直接设置并回读；Windows 打开系统默认应用界面完成选择。安装、启动和刷新均不抢占默认关联。
+设置中的“CC Switch 链接”读取系统默认接收应用，可选择已安装且支持协议的 lich13-switch、CC Switch 或 lich13studio。macOS 直接设置并回读；Windows 打开系统默认应用界面完成选择。安装、启动和刷新均不抢占默认关联。
 
-支持 `ccswitch://v1/import?resource=provider&app=codex`。接收后确认名称和地址，再新增供应商；不切换当前供应商、不启停网关、不改 Codex 配置。部署子路径原样保留，凭据只在 Rust 内存中等待确认。已有表单草稿会保留，导入排队处理。其他资源、客户端、脚本和远程配置不导入。
+支持 `ccswitch://v1/import?resource=provider&app=codex` 和 `app=claude`。导入预览显示目标客户端，重复检测按客户端隔离。接收后确认名称和地址，再新增供应商；不切换当前供应商、不启停网关、不改 Codex 配置。部署子路径原样保留，凭据只在 Rust 内存中等待确认。已有表单草稿会保留，导入排队处理。其他资源、客户端、脚本和远程配置不导入。
 
 ## 本地数据
 
-数据目录为 Tauri 的 `com.lich13.gpt-switch` 应用数据目录（macOS：`~/Library/Application Support/com.lich13.gpt-switch`；Windows：`%APPDATA%/com.lich13.gpt-switch`）。`accounts.json` 保存完整账号，`previous-auth.json`、`previous-config.toml` 各保留一份最近写入前的文件。`startup.json` 保存启动偏好，`quick.json` 保存快捷面板标签与固定状态。`gateway.json` 独立保存供应商、代理、并发上限、模型白名单、本地访问令牌及网关恢复意图，`gateway-recovery.json` 保存版本化的两字段事务与停止目标，写入完成后清理。供应商 Token 仅用于其上游认证，代理密码仅用于 SOCKS5 握手；凭据不写日志、不返回到列表或事件。文件采用当前用户权限，**未加密**，应像原 `auth.json` 一样保护。
+数据目录为 Tauri 的 `com.lich13.gpt-switch` 应用数据目录（macOS：`~/Library/Application Support/com.lich13.gpt-switch`；Windows：`%APPDATA%/com.lich13.gpt-switch`）。`accounts.json` 保存完整账号，`previous-auth.json`、`previous-config.toml` 各保留一份最近写入前的文件。`startup.json` 保存启动偏好，`quick.json` 保存快捷面板标签与固定状态。`gateway.json` 保存 Codex 状态，`claude/gateway.json` 保存 Claude 状态（供应商、并发、模型白名单、访问令牌和恢复意图）；`proxy-profiles.json` 保存两边共用的代理，旧库中的代理 ID 与绑定保留，各客户端目录内的 `gateway-recovery.json` 保存版本化的两字段事务与停止目标，写入完成后清理。供应商 Token 仅用于其上游认证，代理密码仅用于 SOCKS5 握手；凭据不写日志、不返回到列表或事件。文件采用当前用户权限，**未加密**，应像原 `auth.json` 一样保护。
 
 v0.7.0 已移除使用统计、请求日志和模型定价。升级会精确删除应用私有目录内的 `usage.sqlite` 及 WAL／SHM／journal、`usage-settings.json`、`model-pricing.json`；失败可在设置中重试。账号、供应商、代理、Key 额度、电源助手和 Codex 文件保留。
 
@@ -114,7 +130,7 @@ MIT License。独立项目，与 OpenAI 无隶属关系。
 
 快捷面板底部提供“强制退出 ChatGPT / Codex”和 macOS 电池“合盖不休眠”。前者在本版本只做模拟验收，不会在开发预览中终止真实进程；后者通过独立电源助手执行限定的 `pmset` 操作，恢复原电池休眠值（包括 0），兼容旧脚本的恢复记录。
 
-macOS 首次操作需系统管理员授权安装助手；日常开关走 XPC，不重复请求密码。设置页可安装、修复或移除助手。助手由系统 launchd 管理，仅接受状态读取、合盖切换与恢复；验证获授权用户、正式应用路径和实际进程的代码签名，升级导致代码身份变化时需重新授权。安装程序不保存密码、不配置免密 sudo。应用须位于 `/Applications/gpt-Switch.app`；开发和隔离运行不会调用或安装正式助手。
+macOS 首次操作需系统管理员授权安装助手；日常开关走 XPC，不重复请求密码。设置页可安装、修复或移除助手。助手由系统 launchd 管理，仅接受状态读取、合盖切换与恢复；验证获授权用户、正式应用路径和实际进程的代码签名，升级导致代码身份变化时需重新授权。安装程序不保存密码、不配置免密 sudo。应用须位于 `/Applications/lich13-switch.app`；开发和隔离运行不会调用或安装正式助手。
 
 v0.7.1 修复系统助手目录为 `1755` 时安装失败的问题，保留原目录权限。安装在新服务通过应用的 XPC 校验后完成；失败显示具体阶段及实际回滚结果，设置页刷新助手真实状态。
 

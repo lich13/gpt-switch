@@ -106,68 +106,100 @@ impl Service {
 type Failure = (String, Option<u64>);
 async fn fetch(input: &Query) -> std::result::Result<Vec<String>, Failure> {
     let fail = |message: &str| (message.to_owned(), None);
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!("{}/models", input.base.trim_end_matches('/')))
-        .header(header::AUTHORIZATION, format!("Bearer {}", input.token))
-        .header(header::ACCEPT, "application/json")
-        .header(header::ACCEPT_ENCODING, "identity")
-        .body(replay::empty())
-        .map_err(|_| fail("供应商地址或 Key 格式无效"))?;
-    let mut response = input.client.request(request).await.map_err(|e| {
-        fail(
-            &connector::classify(&e)
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "模型列表连接失败".into()),
-        )
-    })?;
-    let status = response.status().as_u16();
-    if status == 429 {
-        let seconds = response
-            .headers()
-            .get(header::RETRY_AFTER)
-            .and_then(|h| h.to_str().ok())
-            .and_then(circuit::retry_after)
-            .map(|d| d.as_secs().max(1))
-            .unwrap_or(60);
-        return Err(("模型列表查询被限流".into(), Some(now() + seconds)));
-    }
-    if (300..400).contains(&status) {
-        return Err(fail("模型接口要求跳转，已停止发送凭据"));
-    }
-    if matches!(status, 401 | 403) {
-        return Err(fail(&format!("模型列表认证失败（HTTP {status}）")));
-    }
-    if !(200..300).contains(&status) {
-        return Err(fail(&format!("模型列表不可用（HTTP {status}）")));
-    }
-    let mut bytes = Vec::new();
-    while let Some(frame) = response.body_mut().frame().await {
-        let frame = frame.map_err(|_| fail("模型列表响应中断"))?;
-        if let Some(data) = frame.data_ref() {
-            if bytes.len() + data.len() > 2_000_000 {
-                return Err(fail("模型列表超过 2 MB"));
-            }
-            bytes.extend_from_slice(data);
+    let claude = input.client_id == super::ClientId::Claude;
+    let base = format!(
+        "{}{}",
+        input.base.trim_end_matches('/'),
+        if claude { "/v1/models" } else { "/models" }
+    );
+    let mut url = url::Url::parse(&base).map_err(|_| fail("模型接口地址无效"))?;
+    let mut models = Vec::new();
+    let mut total = 0usize;
+    let mut cursors = std::collections::HashSet::new();
+    loop {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(url.as_str())
+            .header(header::AUTHORIZATION, format!("Bearer {}", input.token))
+            .header(header::ACCEPT, "application/json")
+            .header(header::ACCEPT_ENCODING, "identity");
+        if claude {
+            builder = builder.header("anthropic-version", "2023-06-01");
         }
+        let request = builder
+            .body(replay::empty())
+            .map_err(|_| fail("供应商地址或 Key 格式无效"))?;
+        let mut response = input.client.request(request).await.map_err(|e| {
+            fail(
+                &connector::classify(&e)
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "模型列表连接失败".into()),
+            )
+        })?;
+        let status = response.status().as_u16();
+        if status == 429 {
+            let seconds = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(circuit::retry_after)
+                .map(|d| d.as_secs().max(1))
+                .unwrap_or(60);
+            return Err(("模型列表查询被限流".into(), Some(now() + seconds)));
+        }
+        if (300..400).contains(&status) {
+            return Err(fail("模型接口要求跳转，已停止发送凭据"));
+        }
+        if matches!(status, 401 | 403) {
+            return Err(fail(&format!("模型列表认证失败（HTTP {status}）")));
+        }
+        if !(200..300).contains(&status) {
+            return Err(fail(&format!("模型列表不可用（HTTP {status}）")));
+        }
+        let mut bytes = Vec::new();
+        while let Some(frame) = response.body_mut().frame().await {
+            let frame = frame.map_err(|_| fail("模型列表响应中断"))?;
+            if let Some(data) = frame.data_ref() {
+                if total + data.len() > 2_000_000 {
+                    return Err(fail("模型列表超过 2 MB"));
+                }
+                total += data.len();
+                bytes.extend_from_slice(data);
+            }
+        }
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| fail("模型接口没有返回有效 JSON"))?;
+        let data = value
+            .get("data")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| fail("无法识别模型列表，可手动添加模型 ID"))?;
+        let page: Vec<String> = data
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|v| v.as_str()))
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 256
+                    && !id.chars().any(char::is_control)
+                    && !id.contains(&input.token)
+            })
+            .map(str::to_owned)
+            .collect();
+        models.extend(page);
+        if !claude || value.get("has_more").and_then(|v| v.as_bool()) != Some(true) {
+            break;
+        }
+        let cursor = value
+            .get("last_id")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty() && v.len() <= 256)
+            .ok_or_else(|| fail("模型分页标记无效"))?;
+        if !cursors.insert(cursor.to_owned()) || cursors.len() > 100 {
+            return Err(fail("模型分页重复或超出上限"));
+        }
+        url.query_pairs_mut()
+            .clear()
+            .append_pair("after_id", cursor);
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| fail("模型接口没有返回有效 JSON"))?;
-    let data = value
-        .get("data")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| fail("无法识别模型列表，可手动添加模型 ID"))?;
-    let mut models: Vec<String> = data
-        .iter()
-        .filter_map(|v| v.get("id").and_then(|v| v.as_str()))
-        .filter(|id| {
-            !id.is_empty()
-                && id.len() <= 256
-                && !id.chars().any(char::is_control)
-                && !id.contains(&input.token)
-        })
-        .map(str::to_owned)
-        .collect();
     models.sort();
     models.dedup();
     Ok(models)

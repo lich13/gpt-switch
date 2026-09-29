@@ -1,3 +1,8 @@
+import ClientSelection, {
+  useClientSelection,
+  clientName,
+} from "./ClientSelection";
+import type { ClientId } from "./types";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ArrowUpRight,
@@ -22,6 +27,18 @@ type Preferences = {
   visible?: boolean;
 };
 export default function QuickPanel() {
+  const [clientId, select] = useClientSelection("quick");
+  return (
+    <QuickContent key={clientId} clientId={clientId} onClientChange={select} />
+  );
+}
+function QuickContent({
+  clientId,
+  onClientChange,
+}: {
+  clientId: ClientId;
+  onClientChange: (id: ClientId) => void;
+}) {
   const [accounts, setAccounts] = useState<ViewState | null>(null);
   const [gateway, setGateway] = useState<GatewayState | null>(null);
   const [prefs, setPrefs] = useState<Preferences>({
@@ -42,6 +59,7 @@ export default function QuickPanel() {
     gateway?.providers ?? [],
     visible && prefs.tab === "providers",
     "panel-visibility",
+    clientId,
   );
   useEffect(() => {
     let disposed = false;
@@ -51,14 +69,16 @@ export default function QuickPanel() {
         if (!disposed) fn(v);
       }).then((c) => (disposed ? c() : clean.push(c)));
     watch<ViewState>("switch-state", setAccounts);
-    watch<GatewayState>("gateway-state", setGateway);
+    watch<GatewayState>("gateway-state", (s) => {
+      if ((s.clientId ?? "codex") === clientId) setGateway(s);
+    });
     watch<Preferences>("quick-state", setPrefs);
     watch<boolean>("panel-visibility", setVisible);
     watch<string>("switch-notice", setNotice);
     watch<unknown>("switch-error", (e) => setError(errorOf(e).message));
     void Promise.all([
       command<ViewState>("get_state"),
-      command<GatewayState>("get_gateway"),
+      command<GatewayState>("get_gateway", { clientId }),
       command<Preferences>("get_quick"),
     ])
       .then(([a, g, p]) => {
@@ -157,13 +177,14 @@ export default function QuickPanel() {
     if (!gateway) return;
     setGateway(
       await command<GatewayState>("update_gateway", {
+        clientId,
         edit,
         expectedRevision: expected ?? gateway.revision,
         ...(edit.op === "select" && !gateway.running
           ? { expectedConfigRevision: gateway.configRevision }
           : {}),
       }).catch(async (error) => {
-        await command<GatewayState>("get_gateway")
+        await command<GatewayState>("get_gateway", { clientId })
           .then(setGateway)
           .catch(() => {});
         throw error;
@@ -173,7 +194,7 @@ export default function QuickPanel() {
       setNotice(
         gateway.running
           ? "供应商已切换，新请求已生效"
-          : "配置已切换，请重新打开 Codex",
+          : `配置已切换，请重新打开 ${clientName(clientId)}`,
       );
   };
   const providerEdit: ProviderCommit = (payload, expected) =>
@@ -234,6 +255,13 @@ export default function QuickPanel() {
       </header>
       <div className="quick-scroll">
         <div ref={content}>
+          {prefs.tab === "providers" && (
+            <ClientSelection
+              client={clientId}
+              select={onClientChange}
+              disabled={busy}
+            />
+          )}
           {(error || gateway?.error || accounts?.error) && (
             <div className="quick-feedback error" role="alert">
               {error || gateway?.error || accounts?.error}
@@ -288,10 +316,13 @@ export default function QuickPanel() {
                           {
                             expectedRevision: gateway.revision,
                             expectedConfigRevision: gateway.configRevision,
+                            clientId,
                           },
                         ),
                       );
-                      setNotice("配置已切换，请重新打开 Codex");
+                      setNotice(
+                        `配置已切换，请重新打开 ${clientName(clientId)}`,
+                      );
                     })
                   }
                 >
@@ -356,6 +387,7 @@ export default function QuickPanel() {
                             void command("open_main", {
                               page: "gateway",
                               providerId: p.id,
+                              clientId,
                             })
                           }
                         >
@@ -454,7 +486,7 @@ export default function QuickPanel() {
       <QuickControls visible={visible} notify={setNotice} error={setError} />
       <footer className="quick-footer">
         <button onClick={() => open()}>
-          打开 gpt-Switch <ArrowUpRight size={12} />
+          打开 lich13-switch <ArrowUpRight size={12} />
         </button>
         <button
           onClick={() =>

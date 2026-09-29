@@ -1,13 +1,13 @@
 [package]
-name = "gpt-switch"
-version = "0.7.2"
-description = "Lightweight Codex account switcher and TOML editor"
+name = "lich13-switch"
+version = "0.8.0"
+description = "Independent Codex and Claude Code providers and local gateways"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
 
 [lib]
-name = "gpt_switch_lib"
+name = "lich13_switch_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

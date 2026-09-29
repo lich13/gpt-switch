@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { command, subscribe } from "./bridge";
-import { errorOf, type GatewayState } from "./types";
+import { errorOf, type ClientId, type GatewayState } from "./types";
 import Modal from "./Modal";
-type Pending = { id: string; name: string; baseUrl: string };
+type Pending = {
+  clientId?: ClientId;
+  id: string;
+  name: string;
+  baseUrl: string;
+};
 export default function ProviderImports({
   notify,
   blocked = false,
@@ -48,7 +53,9 @@ export default function ProviderImports({
   useEffect(() => {
     if (!active && available && !blocked && queue[0]) {
       let disposed = false;
-      void command<GatewayState>("get_gateway")
+      void command<GatewayState>("get_gateway", {
+        clientId: queue[0]?.clientId ?? "codex",
+      })
         .then((s) => {
           if (!disposed) {
             setRevision(s.revision);
@@ -83,6 +90,10 @@ export default function ProviderImports({
   return (
     <Modal title="导入供应商" close={cancel} busy={busy} compact>
       <dl className="import-preview">
+        <div>
+          <dt>客户端</dt>
+          <dd>{active.clientId === "claude" ? "Claude Code" : "Codex"}</dd>
+        </div>
         <div>
           <dt>名称</dt>
           <dd>{active.name}</dd>
@@ -122,9 +133,9 @@ export default function ProviderImports({
               })
               .catch(async (e) => {
                 setError(errorOf(e).message);
-                const state = await command<GatewayState>("get_gateway").catch(
-                  () => null,
-                );
+                const state = await command<GatewayState>("get_gateway", {
+                  clientId: active.clientId ?? "codex",
+                }).catch(() => null);
                 if (state) setRevision(state.revision);
               })
               .finally(() => setBusy(false));

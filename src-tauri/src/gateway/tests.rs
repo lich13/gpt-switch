@@ -1657,3 +1657,9 @@ mod v061;
 
 #[path = "import_tests.rs"]
 mod imports;
+
+#[path = "v080_tests.rs"]
+mod v080;
+
+#[path = "claude_tests.rs"]
+mod claude_v080;

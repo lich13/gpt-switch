@@ -3,6 +3,7 @@ import { RefreshCw } from "lucide-react";
 import { command, subscribe } from "./bridge";
 import {
   errorOf,
+  type ClientId,
   type Provider,
   type ProviderQuota,
   type QuotaPlan,
@@ -12,6 +13,7 @@ export function useProviderQuota(
   providers: Provider[],
   active: boolean,
   visibilityEvent = "app-visibility",
+  clientId: ClientId = "codex",
 ) {
   const latest = useRef(providers);
   latest.current = providers;
@@ -36,7 +38,12 @@ export function useProviderQuota(
     const clean: (() => void)[] = [];
     let disposed = false;
     for (const promise of [
-      subscribe<ProviderQuota>("provider-quota", accept),
+      subscribe<{ clientId: ClientId; quota: ProviderQuota }>(
+        "provider-quota",
+        (e) => {
+          if (e.clientId === clientId) accept(e.quota);
+        },
+      ),
       subscribe<boolean>(visibilityEvent, setNativeVisible),
     ]) {
       void promise.then((fn) => (disposed ? fn() : clean.push(fn)));
@@ -50,7 +57,7 @@ export function useProviderQuota(
       clean.forEach((fn) => fn());
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [accept, visibilityEvent]);
+  }, [accept, visibilityEvent, clientId]);
   const refresh = useCallback(
     async (id: string, force = true) => {
       const provider = latest.current.find((p) => p.id === id);
@@ -61,6 +68,7 @@ export function useProviderQuota(
       try {
         accept(
           await command<ProviderQuota>("query_provider_quota", {
+            clientId,
             providerId: id,
             force,
           }),
@@ -88,7 +96,7 @@ export function useProviderQuota(
         flights.current.delete(flight);
       }
     },
-    [accept],
+    [accept, clientId],
   );
   const refreshAll = useCallback(
     (force = true) => {

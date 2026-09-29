@@ -91,6 +91,111 @@ pub fn actual(executable: &Path) -> Result<bool> {
     }
     system_enabled()
 }
+fn legacy_document(bytes: &[u8], executable: &Path) -> bool {
+    let Ok(value) = plist::Value::from_reader_xml(bytes) else {
+        return false;
+    };
+    let Some(args) = value
+        .as_dictionary()
+        .and_then(|d| d.get("ProgramArguments"))
+        .and_then(plist::Value::as_array)
+    else {
+        return false;
+    };
+    let Some(old_path) = args.first().and_then(plist::Value::as_string) else {
+        return false;
+    };
+    let expected_old = executable.to_string_lossy().replace(
+        "lich13-switch.app/Contents/MacOS/lich13-switch",
+        "gpt-Switch.app/Contents/MacOS/gpt-switch",
+    );
+    if old_path != expected_old
+        || args.len() != 2
+        || args[1].as_string() != Some(super::startup::LEGACY_LOGIN_ARG)
+    {
+        return false;
+    }
+    let Ok(bytes) = document(Path::new(old_path)) else {
+        return false;
+    };
+    let Ok(mut expected) = plist::Value::from_reader_xml(bytes.as_slice()) else {
+        return false;
+    };
+    expected
+        .as_dictionary_mut()
+        .unwrap()
+        .get_mut("ProgramArguments")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()[1] = plist::Value::String(super::startup::LEGACY_LOGIN_ARG.into());
+    expected == value
+}
+pub fn migrate(executable: &Path) -> Result<()> {
+    let path = location()?;
+    let Some(old) = storage::read_optional(&path)? else {
+        return Ok(());
+    };
+    if !legacy_document(&old, executable) {
+        return Ok(());
+    }
+    let target = format!("{}/{LABEL}", domain()?);
+    let was_enabled = system_enabled()?;
+    let job = Command::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()
+        .map_err(storage::io_error)?;
+    let own_job = String::from_utf8_lossy(&job.stdout)
+        .lines()
+        .any(|line| line.trim() == format!("pid = {}", std::process::id()));
+    let result = (|| {
+        storage::atomic_write(&path, &document(executable)?, Some(&storage::digest(&old)))?;
+        // Never unload the process hosting this migration. Its next login reads
+        // the updated plist. A manual launch can safely refresh an inactive job.
+        if !own_job {
+            if job.status.success()
+                && !Command::new("/bin/launchctl")
+                    .args(["bootout", &target])
+                    .output()
+                    .map_err(storage::io_error)?
+                    .status
+                    .success()
+            {
+                return Err(failure());
+            }
+            if was_enabled
+                && !Command::new("/bin/launchctl")
+                    .arg("bootstrap")
+                    .arg(domain()?)
+                    .arg(&path)
+                    .output()
+                    .map_err(storage::io_error)?
+                    .status
+                    .success()
+            {
+                return Err(failure());
+            }
+        }
+        if actual(executable)? != was_enabled {
+            return Err(failure());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        storage::atomic_write(&path, &old, None)?;
+        if !own_job && job.status.success() {
+            let _ = Command::new("/bin/launchctl")
+                .args(["bootout", &target])
+                .output();
+            let _ = Command::new("/bin/launchctl")
+                .arg("bootstrap")
+                .arg(domain()?)
+                .arg(&path)
+                .output();
+        }
+        return Err(failure());
+    }
+    Ok(())
+}
 pub fn set(value: bool, executable: &Path) -> Result<()> {
     let path = location()?;
     let old = storage::read_optional(&path)?;
@@ -155,7 +260,7 @@ mod tests {
     #[test]
     fn launch_arguments_are_separate_and_disable_parser_is_exact() {
         let bytes = document(Path::new(
-            "/Applications/Some Folder/gpt-Switch.app/Contents/MacOS/gpt-switch",
+            "/Applications/Some Folder/lich13-switch.app/Contents/MacOS/lich13-switch",
         ))
         .unwrap();
         let value = plist::Value::from_reader_xml(bytes.as_slice()).unwrap();
@@ -166,5 +271,30 @@ mod tests {
         assert_eq!(args[1].as_string(), Some(crate::startup::LOGIN_ARG));
         assert!(!disabled("\"com.lich13.gpt-switch-other\" => true"));
         assert!(disabled("\"com.lich13.gpt-switch\" => true"));
+        let mut legacy = plist::Value::from_reader_xml(
+            document(Path::new(
+                "/Applications/gpt-Switch.app/Contents/MacOS/gpt-switch",
+            ))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        legacy
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("ProgramArguments")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[1] = plist::Value::String(crate::startup::LEGACY_LOGIN_ARG.into());
+        let mut bytes = Vec::new();
+        legacy.to_writer_xml(&mut bytes).unwrap();
+        assert!(legacy_document(
+            &bytes,
+            Path::new("/Applications/lich13-switch.app/Contents/MacOS/lich13-switch")
+        ));
+        assert!(!legacy_document(
+            &bytes,
+            Path::new("/tmp/lich13-switch.app/Contents/MacOS/lich13-switch")
+        ));
     }
 }

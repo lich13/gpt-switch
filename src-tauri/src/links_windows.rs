@@ -21,7 +21,7 @@ fn executable(command: &str) -> Option<PathBuf> {
 }
 fn app_id(path: &Path) -> Option<&'static str> {
     match path.file_name()?.to_str()?.to_ascii_lowercase().as_str() {
-        "gpt-switch.exe" => Some(APPS[0].0),
+        "lich13-switch.exe" | "gpt-switch.exe" => Some(APPS[0].0),
         "cc-switch.exe" => Some(APPS[1].0),
         "lich13studio.exe" => Some(APPS[2].0),
         _ => None,
@@ -74,10 +74,10 @@ fn installed() -> Vec<Handler> {
                         continue;
                     };
                     let display = k.get_value::<String, _>("DisplayName").unwrap_or_default();
-                    if !APPS
-                        .iter()
-                        .any(|(_, name)| name.eq_ignore_ascii_case(&display))
-                    {
+                    if !APPS.iter().any(|(_, name)| {
+                        name.eq_ignore_ascii_case(&display)
+                            || display.eq_ignore_ascii_case("gpt-Switch")
+                    }) {
                         continue;
                     }
                     let mut candidates = Vec::new();
@@ -87,7 +87,12 @@ fn installed() -> Vec<Handler> {
                         }
                     }
                     if let Ok(root) = k.get_value::<String, _>("InstallLocation") {
-                        for exe in ["gpt-switch.exe", "cc-switch.exe", "lich13studio.exe"] {
+                        for exe in [
+                            "lich13-switch.exe",
+                            "gpt-switch.exe",
+                            "cc-switch.exe",
+                            "lich13studio.exe",
+                        ] {
                             candidates.push(Path::new(&root).join(exe));
                         }
                     }
@@ -134,7 +139,7 @@ fn advertise(app: &Handler) -> Result<String> {
         .ok_or_else(|| invalid("无效的接收应用"))?;
     let prog = format!("gptSwitch.CCSwitch.{suffix}");
     let capability = format!("Software\\gpt-Switch\\LinkHandlers\\{suffix}\\Capabilities");
-    let registered = format!("gpt-Switch Link {}", app.name);
+    let registered = format!("lich13-switch Link {}", app.name);
     let write = || -> std::io::Result<()> {
         let (key, _) = root.create_subkey(format!("Software\\Classes\\{prog}"))?;
         key.set_value("", &format!("{} CC Switch Link", app.name))?;

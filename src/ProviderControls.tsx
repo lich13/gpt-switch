@@ -50,6 +50,7 @@ export default function ProviderControls({
     input.current?.focus();
     input.current?.select();
     const outside = (event: PointerEvent) => {
+      if ((event.target as Element)?.closest?.("[data-client-switch]")) return;
       if (
         !pending.current &&
         !popover.current?.contains(event.target as Node) &&
@@ -166,6 +167,7 @@ export default function ProviderControls({
           <div
             ref={popover}
             role="dialog"
+            data-provider-draft
             aria-label={`${provider.name} 并发上限`}
             className="concurrency-popover"
             style={position}

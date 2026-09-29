@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Provider, ProviderQuota } from "./types";
+import type { ClientId, Provider, ProviderQuota } from "./types";
 const mock = vi.hoisted(() => ({
   command: vi.fn(),
   listeners: new Map<string, (s: unknown) => void>(),
@@ -47,11 +47,13 @@ function result(p = provider): ProviderQuota {
 function Harness({
   p = provider,
   active = true,
+  clientId = "codex",
 }: {
   p?: Provider;
   active?: boolean;
+  clientId?: ClientId;
 }) {
-  const q = useProviderQuota([p], active);
+  const q = useProviderQuota([p], active, "app-visibility", clientId);
   return (
     <>
       <QuotaInfo
@@ -70,6 +72,7 @@ async function flush() {
   });
 }
 beforeEach(() => {
+  localStorage.clear();
   provider = structuredClone(gatewayDemo.providers[0]);
   mock.command.mockReset();
   mock.listeners.clear();
@@ -79,7 +82,10 @@ beforeEach(() => {
     value: "visible",
   });
 });
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  vi.useRealTimers();
+  localStorage.clear();
+});
 describe("quota display and refresh", () => {
   it("refreshes on entry and each minute, pauses while hidden or on another page, resumes with a cache-aware refresh", async () => {
     vi.useFakeTimers();
@@ -100,6 +106,7 @@ describe("quota display and refresh", () => {
     view.rerender(<Harness />);
     await flush();
     expect(mock.command).toHaveBeenLastCalledWith("query_provider_quota", {
+      clientId: "codex",
       providerId: provider.id,
       force: false,
     });
@@ -121,6 +128,7 @@ describe("quota display and refresh", () => {
     );
     await flush();
     expect(mock.command).toHaveBeenLastCalledWith("query_provider_quota", {
+      clientId: "codex",
       providerId: provider.id,
       force: true,
     });
@@ -132,10 +140,13 @@ describe("quota display and refresh", () => {
     await flush();
     act(() =>
       mock.listeners.get("provider-quota")!({
-        ...result(),
-        state: "error",
-        stale: true,
-        error: "SOCKS5 认证失败",
+        clientId: "codex",
+        quota: {
+          ...result(),
+          state: "error",
+          stale: true,
+          error: "SOCKS5 认证失败",
+        },
       }),
     );
     expect(screen.getByText("剩余 8.5 USD")).toBeInTheDocument();
@@ -161,10 +172,53 @@ describe("quota display and refresh", () => {
     await flush();
     expect(screen.getByText("剩余 20 USD")).toBeInTheDocument();
     await act(async () => resolveOld(result()));
-    act(() => mock.listeners.get("provider-quota")!(result()));
+    act(() =>
+      mock.listeners.get("provider-quota")!({
+        clientId: "codex",
+        quota: result(),
+      }),
+    );
     expect(screen.queryByText("剩余 8.5 USD")).not.toBeInTheDocument();
     expect(screen.getByText("剩余 20 USD")).toBeInTheDocument();
   });
+  it.each(["codex", "claude"] as const)(
+    "isolates %s quota events even when another client has the same provider id and version",
+    async (clientId) => {
+      render(<Harness clientId={clientId} />);
+      await flush();
+      expect(mock.command).toHaveBeenCalledWith("query_provider_quota", {
+        clientId,
+        providerId: provider.id,
+        force: false,
+      });
+      act(() =>
+        mock.listeners.get("provider-quota")!({
+          clientId: clientId === "codex" ? "claude" : "codex",
+          quota: {
+            ...result(),
+            plans: [{ ...result().plans[0], remaining: 999 }],
+            state: "error",
+            stale: true,
+            error: "另一个客户端失败",
+          },
+        }),
+      );
+      expect(screen.getByText("剩余 8.5 USD")).toBeInTheDocument();
+      expect(screen.queryByText("剩余 999 USD")).not.toBeInTheDocument();
+      expect(screen.queryByText("另一个客户端失败")).not.toBeInTheDocument();
+      act(() =>
+        mock.listeners.get("provider-quota")!({
+          clientId,
+          quota: {
+            ...result(),
+            plans: [{ ...result().plans[0], remaining: 23 }],
+          },
+        }),
+      );
+      expect(screen.getByText("剩余 23 USD")).toBeInTheDocument();
+      expect(screen.queryByText("剩余 8.5 USD")).not.toBeInTheDocument();
+    },
+  );
   it("distinguishes unsupported, unlimited, empty balance and retry cooldown", () => {
     const q = {
       ...result(),

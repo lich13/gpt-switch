@@ -6,7 +6,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
-pub const LOGIN_ARG: &str = "--gpt-switch-login-startup";
+pub const LOGIN_ARG: &str = "--lich13-switch-login-startup";
+pub const LEGACY_LOGIN_ARG: &str = "--gpt-switch-login-startup";
+pub fn is_login_argument(arg: &str) -> bool {
+    [LOGIN_ARG, LEGACY_LOGIN_ARG].contains(&arg)
+}
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Preferences {
@@ -56,6 +60,7 @@ impl Service {
         let _guard = self.lock.lock().unwrap();
         #[cfg(target_os = "macos")]
         {
+            crate::startup_macos::migrate(&executable()?)?;
             let old = auto_launch(true)?;
             let legacy = old.is_enabled().map_err(system_error)?;
             if legacy {
@@ -69,6 +74,10 @@ impl Service {
                     return Err(AppError::new("STARTUP", "旧登录项未能移除"));
                 }
             }
+        }
+        #[cfg(windows)]
+        if auto_launch(true)?.is_enabled().map_err(system_error)? {
+            register(true)?;
         }
         let (prefs, rev) = self.read()?;
         if rev != "missing" {
@@ -111,7 +120,23 @@ fn registered() -> Result<bool> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        auto_launch(true)?.is_enabled().map_err(system_error)
+        let launch = auto_launch(true)?;
+        let enabled = launch.is_enabled().map_err(system_error)?;
+        #[cfg(windows)]
+        if enabled {
+            use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+            let actual: String = RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run")
+                .and_then(|key| key.get_value("gpt-Switch"))
+                .map_err(storage::io_error)?;
+            if actual != format!("{} {LOGIN_ARG}", launch.get_app_path()) {
+                return Err(AppError::new(
+                    "STARTUP",
+                    "启动路径已变化，请重新启用开机启动",
+                ));
+            }
+        }
+        Ok(enabled)
     }
 }
 fn register(enabled: bool) -> Result<()> {
@@ -132,7 +157,7 @@ fn register(enabled: bool) -> Result<()> {
             launch.disable()
         }
         .map_err(system_error)?;
-        if launch.is_enabled().map_err(system_error)? != enabled {
+        if registered()? != enabled {
             return Err(AppError::new("STARTUP", "启动注册状态不匹配"));
         }
         Ok(())
@@ -162,7 +187,7 @@ fn auto_launch(silent: bool) -> Result<AutoLaunch> {
     if cfg!(target_os = "macos") && path.extension().is_none_or(|e| e != "app") {
         return Err(AppError::new(
             "STARTUP",
-            "请在安装后的 gpt-Switch.app 中设置开机启动",
+            "请在安装后的 lich13-switch.app 中设置开机启动",
         ));
     }
     let path = path
@@ -228,7 +253,7 @@ pub fn smoke_registration() -> Result<()> {
     Ok(())
 }
 pub fn login_source(args: &[String]) -> bool {
-    if args.iter().any(|a| a == LOGIN_ARG) {
+    if args.iter().any(|a| is_login_argument(a)) {
         return true;
     }
     #[cfg(target_os = "macos")]
@@ -276,14 +301,15 @@ mod tests {
     fn installed_path_and_legacy_preferences() {
         assert_eq!(
             bundle_path(Path::new(
-                "/Applications/gpt-Switch.app/Contents/MacOS/gpt-switch"
+                "/Applications/lich13-switch.app/Contents/MacOS/lich13-switch"
             )),
-            PathBuf::from("/Applications/gpt-Switch.app")
+            PathBuf::from("/Applications/lich13-switch.app")
         );
         let prefs: Preferences = serde_json::from_str("{}").unwrap();
         let old: Preferences =
             serde_json::from_str(r#"{"launchToTray":false,"restoreGateway":true}"#).unwrap();
         assert!(silent(&[LOGIN_ARG.into()], &old));
+        assert!(silent(&[LEGACY_LOGIN_ARG.into()], &old));
         assert!(!prefs.restore_gateway);
         assert!(is_login_event(
             u32::from_be_bytes(*b"oapp"),
@@ -295,8 +321,8 @@ mod tests {
         ));
         assert!(!is_login_event(u32::from_be_bytes(*b"oapp"), None));
         assert_eq!(
-            registration_path(r"C:\Program Files\gpt-Switch\gpt-switch.exe", true),
-            r#""C:\Program Files\gpt-Switch\gpt-switch.exe""#
+            registration_path(r"C:\Program Files\lich13-switch\lich13-switch.exe", true),
+            r#""C:\Program Files\lich13-switch\lich13-switch.exe""#
         );
         assert!(silent(&[LOGIN_ARG.into()], &prefs));
     }

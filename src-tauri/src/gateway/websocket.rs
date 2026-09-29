@@ -196,13 +196,14 @@ async fn upstream(
 ) -> Result<Peer, (Option<u16>, bool, Option<Duration>)> {
     let mut request = Request::new(replay::empty());
     *request.method_mut() = hyper::Method::GET;
-    *request.uri_mut() =
-        forward::target(&route.provider.base_url, uri).map_err(|_| (None, false, None))?;
+    *request.uri_mut() = forward::target_for(route.client_id, &route.provider.base_url, uri)
+        .map_err(|_| (None, false, None))?;
     *request.headers_mut() = original.clone();
     let headers = request.headers_mut();
     forward::clean_headers(headers, true);
     headers.remove(header::HOST);
     headers.remove(header::CONTENT_LENGTH);
+    headers.remove("x-api-key");
     headers.insert(
         header::AUTHORIZATION,
         format!("Bearer {}", route.provider.token)

@@ -43,6 +43,7 @@ import ProviderImports from "./ProviderImports";
 import { version } from "../package.json";
 import {
   errorOf,
+  type ClientId,
   type Account,
   type ViewState,
   type Preferences,
@@ -82,6 +83,7 @@ export default function App() {
   const gatewayDirty = useRef(false);
   const [focusProvider, setFocusProvider] = useState<{
     id: string;
+    clientId?: ClientId;
     sequence: number;
   } | null>(null);
   const gatewayDraftChanged = useCallback((value: boolean) => {
@@ -185,7 +187,12 @@ export default function App() {
             return;
           setPage("gateway");
           setDirty(false);
-          setFocusProvider({ id: String(p), sequence: Date.now() });
+          setFocusProvider({
+            ...(typeof p === "string"
+              ? { id: p, clientId: "codex" as const }
+              : (p as { id: string; clientId: ClientId })),
+            sequence: Date.now(),
+          });
         },
       ],
       ["login-state", (p) => setLogin(p as LoginState)],
@@ -252,7 +259,7 @@ export default function App() {
         <div className="brand">
           <img src="/icon.svg" alt="" />
           <div>
-            <strong>gpt-Switch</strong>
+            <strong>lich13-switch</strong>
           </div>
         </div>
         <nav aria-label="主导航">
@@ -845,11 +852,17 @@ function SettingsForm({
     [busy, setBusy] = useState(false);
   const pick = async (kind: string) => {
     try {
-      const path = await command<string | null>("pick_path", { kind });
+      const path = await command<string | null>("pick_path", {
+        kind: kind === "claude" ? "directory" : kind,
+      });
       if (path)
         setPrefs((p) => ({
           ...p,
-          [kind === "directory" ? "codexHome" : "cliPath"]: path,
+          [kind === "directory"
+            ? "codexHome"
+            : kind === "claude"
+              ? "claudeHome"
+              : "cliPath"]: path,
         }));
     } catch (e) {
       setError(errorOf(e).message);
@@ -884,6 +897,24 @@ function SettingsForm({
             className="icon-button"
             aria-label="选择 Codex 目录"
             onClick={() => void pick("directory")}
+          >
+            <FolderOpen size={17} />
+          </button>
+        </div>
+      </label>
+      <label className="field">
+        Claude Code 配置目录
+        <div className="path-input">
+          <input
+            required
+            value={prefs.claudeHome ?? ""}
+            onChange={(e) => setPrefs({ ...prefs, claudeHome: e.target.value })}
+          />
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="选择 Claude Code 目录"
+            onClick={() => void pick("claude")}
           >
             <FolderOpen size={17} />
           </button>

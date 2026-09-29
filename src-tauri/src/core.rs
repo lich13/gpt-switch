@@ -12,6 +12,8 @@ use std::{
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
     pub codex_home: String,
+    #[serde(default = "crate::gateway::claude_home")]
+    pub claude_home: String,
     pub cli_path: String,
     pub theme: String,
 }
@@ -299,6 +301,7 @@ impl Core {
                 profiles: vec![],
                 preferences: Preferences {
                     codex_home: default_home.to_string_lossy().into(),
+                    claude_home: crate::gateway::claude_home(),
                     cli_path: String::new(),
                     theme: "system".into(),
                 },
@@ -310,7 +313,7 @@ impl Core {
         if store.schema != 1 {
             return Err(AppError::new(
                 "STORE_VERSION",
-                "账号库版本较新，请更新 gpt-Switch",
+                "账号库版本较新，请更新 lich13-switch",
             ));
         }
         let mut core = Self {
@@ -683,6 +686,9 @@ impl Core {
         self.read_config()
     }
     pub fn set_preferences(&mut self, prefs: Preferences) -> Result<ViewState> {
+        if !Path::new(&prefs.claude_home).is_absolute() {
+            return Err(AppError::new("PATH", "Claude 配置目录必须是绝对路径"));
+        }
         if !["system", "dark", "light"].contains(&prefs.theme.as_str()) {
             return Err(AppError::new("THEME", "主题无效"));
         }

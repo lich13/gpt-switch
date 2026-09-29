@@ -1,5 +1,7 @@
+export type ClientId = "codex" | "claude";
 export type Preferences = {
   codexHome: string;
+  claudeHome?: string;
   cliPath: string;
   theme: "system" | "dark" | "light";
 };
@@ -104,6 +106,7 @@ export type ProxyProfile = {
   health: Health;
 };
 export type GatewayState = {
+  clientId: ClientId;
   revision: string;
   running: boolean;
   address: string;
@@ -114,6 +117,7 @@ export type GatewayState = {
   configProvider: string | null;
   configState: string;
   configError: string | null;
+  configWarning?: string | null;
   providers: Provider[];
   proxies: ProxyProfile[];
   settings: GatewaySettings;

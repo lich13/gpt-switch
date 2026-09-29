@@ -1,5 +1,6 @@
 //! Only the two credential values in the existing `custom` provider belong to us.
 //! Edits use parser byte spans: unrelated TOML is never serialized again.
+use super::ClientId;
 use crate::storage::{self, AppError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,6 +28,8 @@ impl Pair {
 }
 #[derive(Serialize, Deserialize)]
 struct Journal {
+    #[serde(default)]
+    client: ClientId,
     version: u32,
     path: PathBuf,
     before: Pair,
@@ -81,12 +84,27 @@ fn pair(doc: &Document<&str>) -> Result<Pair> {
         token: read(KEYS[1])?,
     })
 }
+pub fn read_for(client: ClientId, home: &Path) -> Result<(String, Pair)> {
+    let raw = storage::read_optional(&client.config(home))?;
+    if raw.is_none() && client == ClientId::Codex {
+        return Err(AppError::new(
+            "CUSTOM",
+            "缺少 config.toml，请先在配置编辑器中设置 custom",
+        ));
+    }
+    let text = std::str::from_utf8(raw.as_deref().unwrap_or(b"{}"))
+        .map_err(|_| AppError::new("CONFIG", "配置不是 UTF-8"))?;
+    Ok((storage::revision(raw.as_deref()), pair_for(client, text)?))
+}
+fn pair_for(client: ClientId, text: &str) -> Result<Pair> {
+    match client {
+        ClientId::Codex => pair(&parse(text)?),
+        ClientId::Claude => super::claude_config::pair(text),
+    }
+}
+#[cfg(test)]
 pub fn read(home: &Path) -> Result<(String, Pair)> {
-    let raw = storage::read_optional(&home.join("config.toml"))?.ok_or_else(|| {
-        AppError::new("CUSTOM", "缺少 config.toml，请先在配置编辑器中设置 custom")
-    })?;
-    let text = std::str::from_utf8(&raw).map_err(|_| AppError::new("TOML", "配置不是 UTF-8"))?;
-    Ok((storage::digest(&raw), pair(&parse(text)?)?))
+    read_for(ClientId::Codex, home)
 }
 pub fn patch(text: &str, target: &Pair) -> Result<String> {
     let doc = parse(text)?;
@@ -168,27 +186,34 @@ pub fn patch(text: &str, target: &Pair) -> Result<String> {
     Ok(output)
 }
 fn write_pair(
+    client: ClientId,
     path: &Path,
     target: &Pair,
     expected: Option<&str>,
     allowed: Option<&[&Pair]>,
 ) -> Result<()> {
-    let raw =
-        storage::read_optional(path)?.ok_or_else(|| AppError::new("CONFLICT", "配置已被移除"))?;
-    let revision = storage::digest(&raw);
+    let raw = storage::read_optional(path)?;
+    if raw.is_none() && client == ClientId::Codex {
+        return Err(AppError::new("CONFLICT", "配置已被移除"));
+    }
+    let revision = storage::revision(raw.as_deref());
     if expected.is_some_and(|e| e != revision) {
         return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
     }
-    let text = std::str::from_utf8(&raw).map_err(|_| AppError::new("TOML", "配置不是 UTF-8"))?;
-    let current = pair(&parse(text)?)?;
+    let text = std::str::from_utf8(raw.as_deref().unwrap_or(b"{}"))
+        .map_err(|_| AppError::new("TOML", "配置不是 UTF-8"))?;
+    let current = pair_for(client, text)?;
     if allowed.is_some_and(|pairs| !pairs.contains(&&current)) {
         return Err(AppError::new(
             "CONFLICT",
-            "custom 的地址或 Token 已被外部修改，已保留现场与事务记录",
+            "受管地址或 Token 已被外部修改，已保留现场与事务记录",
         ));
     }
-    let output = patch(text, target)?;
-    if output != text {
+    let output = match client {
+        ClientId::Codex => patch(text, target)?,
+        ClientId::Claude => super::claude_config::patch(text, target)?,
+    };
+    if raw.is_none() || output != text {
         storage::atomic_write(path, output.as_bytes(), Some(&revision))?;
     }
     Ok(())
@@ -237,16 +262,16 @@ fn complete_store(data: &Path, record: &mut Journal) -> Result<()> {
     }
     Ok(())
 }
-pub fn import(home: &Path) -> Result<(String, String)> {
-    let (_, p) = read(home)?;
+pub fn import_for(client: ClientId, home: &Path) -> Result<(String, String)> {
+    let (_, p) = read_for(client, home)?;
     let base = p
         .base_url
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::new("IMPORT", "custom 没有 base_url"))?;
+        .ok_or_else(|| AppError::new("IMPORT", "配置缺少供应商地址"))?;
     let token = p
         .token
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::new("IMPORT", "custom 没有 experimental_bearer_token"))?;
+        .ok_or_else(|| AppError::new("IMPORT", "配置缺少供应商 Token"))?;
     if token.starts_with("gs_") && base.contains("127.0.0.1") {
         return Err(AppError::new("MANAGED", "不能导入网关的本地凭据"));
     }
@@ -261,10 +286,20 @@ pub fn attach(
     exit: Pair,
     expected: &str,
 ) -> Result<()> {
-    attach_store(data, home, port, token, exit, expected, None)
+    attach_store_for(
+        ClientId::Codex,
+        data,
+        home,
+        port,
+        token,
+        exit,
+        expected,
+        None,
+    )
 }
 #[allow(clippy::too_many_arguments)]
-pub fn attach_store(
+pub fn attach_store_for(
+    client: ClientId,
     data: &Path,
     home: &Path,
     port: u16,
@@ -276,15 +311,16 @@ pub fn attach_store(
     if data.join(FILE).exists() {
         return Err(AppError::new("RECOVERY", "请先处理现有配置事务"));
     }
-    let (revision, before) = read(home)?;
+    let (revision, before) = read_for(client, home)?;
     if revision != expected {
         return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
     }
     let mut record = Journal {
         version: 2,
-        path: home.join("config.toml"),
+        client,
+        path: client.config(home),
         before,
-        applied: Pair::new(&format!("http://127.0.0.1:{port}/v1"), token),
+        applied: Pair::new(&client.address(port), token),
         exit,
         live: true,
         config_applied: false,
@@ -292,8 +328,14 @@ pub fn attach_store(
         store_after: store.map(|(_, after)| after),
     };
     save(data, &record)?;
-    if let Err(e) = write_pair(&record.path, &record.applied, Some(expected), None) {
-        if read(home).is_ok_and(|(_, p)| p != record.applied) {
+    if let Err(e) = write_pair(
+        record.client,
+        &record.path,
+        &record.applied,
+        Some(expected),
+        None,
+    ) {
+        if read_for(client, home).is_ok_and(|(_, p)| p != record.applied) {
             fs::remove_file(data.join(FILE)).map_err(storage::io_error)?;
         }
         return Err(e);
@@ -305,7 +347,9 @@ pub fn attach_store(
 pub fn exit_pair(data: &Path) -> Result<Option<Pair>> {
     Ok(load(data)?.map(|r| r.exit))
 }
-pub fn commit_store(
+#[allow(clippy::too_many_arguments)]
+pub fn commit_store_for(
+    client: ClientId,
     data: &Path,
     home: &Path,
     before_store: Option<String>,
@@ -319,25 +363,23 @@ pub fn commit_store(
         if record.store_after.is_some() {
             return Err(AppError::new("RECOVERY", "请先停止网关并完成待处理事务"));
         }
-        let (_, current) = read(home)?;
+        let (_, current) = read_for(client, home)?;
         if current != record.applied {
-            return Err(AppError::new(
-                "CONFLICT",
-                "custom 的地址或 Token 已被外部修改",
-            ));
+            return Err(AppError::new("CONFLICT", "受管地址或 Token 已被外部修改"));
         }
         record
     } else {
         if data.join(FILE).exists() {
             return Err(AppError::new("RECOVERY", "请先处理待恢复的配置事务"));
         }
-        let (revision, before) = read(home)?;
+        let (revision, before) = read_for(client, home)?;
         if expected_config.is_some_and(|e| e != revision) {
             return Err(AppError::new("CONFLICT", "配置已变化，请刷新后重试"));
         }
         Journal {
             version: 2,
-            path: home.join("config.toml"),
+            client,
+            path: client.config(home),
             before,
             applied: target.clone(),
             exit: target.clone(),
@@ -353,6 +395,7 @@ pub fn commit_store(
     save(data, &record)?;
     if !running {
         write_pair(
+            record.client,
             &record.path,
             &record.applied,
             expected_config,
@@ -389,7 +432,13 @@ pub fn detach(data: &Path) -> Result<()> {
     } else {
         vec![&record.before, &record.applied, &record.exit]
     };
-    write_pair(&record.path, &record.exit, None, Some(&allowed))?;
+    write_pair(
+        record.client,
+        &record.path,
+        &record.exit,
+        None,
+        Some(&allowed),
+    )?;
     complete_store(data, &mut record)?;
     fs::remove_file(data.join(FILE)).map_err(storage::io_error)
 }
@@ -436,6 +485,12 @@ pub fn recover(data: &Path) -> Result<()> {
         ));
     }
     fs::remove_file(data.join(FILE)).map_err(storage::io_error)
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn import(home: &Path) -> Result<(String, String)> {
+    import_for(ClientId::Codex, home)
 }
 
 #[cfg(test)]
@@ -553,6 +608,7 @@ mod tests {
         let old = Pair::new("https://original.test/v1", "old");
         let new = Pair::new("https://next.test", "new");
         let mut record = Journal {
+            client: ClientId::Codex,
             version: 2,
             path: path.clone(),
             before: old,
@@ -564,7 +620,7 @@ mod tests {
             store_after: Some("{\"selected\":\"new\"}".into()),
         };
         save(t.path(), &record).unwrap();
-        write_pair(&path, &new, None, None).unwrap();
+        write_pair(ClientId::Codex, &path, &new, None, None).unwrap();
         record.config_applied = true;
         save(t.path(), &record).unwrap();
         recover(t.path()).unwrap();

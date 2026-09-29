@@ -109,6 +109,8 @@ impl Settings {
 #[serde(rename_all = "camelCase")]
 pub struct Store {
     pub schema: u32,
+    #[serde(default)]
+    pub initialized: bool,
     pub providers: Vec<Provider>,
     pub proxies: Vec<Proxy>,
     pub settings: Settings,
@@ -129,6 +131,7 @@ impl Default for Store {
     fn default() -> Self {
         Self {
             schema: 1,
+            initialized: false,
             providers: vec![],
             proxies: vec![],
             settings: Settings::default(),
@@ -345,7 +348,7 @@ impl Store {
                     p.version = uuid::Uuid::new_v4().to_string();
                 } else {
                     if token.trim().is_empty() {
-                        return Err(AppError::new("TOKEN", "请输入 experimental_bearer_token"));
+                        return Err(AppError::new("TOKEN", "请输入供应商 Token"));
                     }
                     let id = uuid::Uuid::new_v4().to_string();
                     self.providers.push(Provider {

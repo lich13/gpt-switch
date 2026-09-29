@@ -56,7 +56,7 @@ impl Panel {
             "quick",
             WebviewUrl::App("index.html?panel=quick".into()),
         )
-        .title("gpt-Switch 快捷面板")
+        .title("lich13-switch 快捷面板")
         .inner_size(420., 300.)
         .decorations(false)
         .resizable(false)

@@ -40,7 +40,7 @@ Unmodified WebSocket/deflate dependency, MPL-2.0. The full license is bundled in
 
 ## Tray interaction reference
 
-The separate quick panel, delayed blur handling and temporary macOS context-menu attachment follow the behavior of lich13/sub2api-ops-companion at 4d0eafc1e64385d1cdb6f6bd92eacb0b5c2e6f29. Adapted for gpt-Switch's window-scoped lifecycle and shared account/gateway state.
+The separate quick panel, delayed blur handling and temporary macOS context-menu attachment follow the behavior of lich13/sub2api-ops-companion at 4d0eafc1e64385d1cdb6f6bd92eacb0b5c2e6f29. Adapted for lich13-switch's window-scoped lifecycle and shared account/gateway state.
 
 https://github.com/lich13/sub2api-ops-companion/tree/4d0eafc1e64385d1cdb6f6bd92eacb0b5c2e6f29/desktop
 
@@ -56,3 +56,7 @@ https://github.com/farion1231/cc-switch/tree/846de29c13ac4d65f164db8c15dd5fd58e2
 Independent 429 cooldown behavior references Wei-Shaw/sub2api at `9a62841fd124d026cf3694fcf9b79e98addcdbdc`, `backend/internal/service/rate_limit_429_cooldown_test.go` (LGPL-3.0). No Go implementation or tests are copied.
 
 The native power helper is an original implementation using public macOS XPC and Security APIs; no One Switch code or helper is used.
+
+## Tauri NSIS template
+
+`src-tauri/installer.nsi` derives from Tauri CLI v2.11.4, [upstream installer.nsi](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi). Upgrade registry identities and an in-place rename migration preserve data and protocol choices. MIT license: `licenses/tauri-MIT.txt`.
