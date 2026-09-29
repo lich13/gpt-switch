@@ -32,6 +32,7 @@ impl Tokens {
 #[derive(Default, Clone, Debug)]
 pub struct Observation {
     pub tokens: Tokens,
+    pub response_id: Option<String>,
     pub model: Option<String>,
     pub service_tier: Option<String>,
     pub first_token_ms: Option<u64>,
@@ -77,6 +78,20 @@ impl Observation {
             .get("response")
             .or_else(|| outer.get("message"))
             .unwrap_or(outer);
+        // Only protocol envelopes may contribute an ID, never nested tool/output IDs.
+        if value.get("usage").is_some()
+            || value
+                .get("object")
+                .and_then(Value::as_str)
+                .is_some_and(|v| {
+                    matches!(v, "response" | "chat.completion" | "chat.completion.chunk")
+                })
+            || outer.get("response").is_some()
+        {
+            if let Some(id) = identifier(value.get("id")) {
+                self.response_id = Some(id);
+            }
+        }
         if let Some(model) = identifier(value.get("model")) {
             self.model = Some(model);
         }
@@ -435,6 +450,33 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn response_ids_come_from_bounded_protocol_envelopes() {
+        let mut o = Observation::default();
+        o.value(&serde_json::json!({"id":"tool-id","type":"response.output_item.added","item":{"id":"nested-tool"}}), 0);
+        assert_eq!(o.response_id, None);
+        o.value(&serde_json::json!({"type":"response.created","response":{"id":"resp-1","model":"fixture"}}), 1);
+        o.value(
+            &serde_json::json!({"type":"response.output_text.delta","id":"item-id","delta":"x"}),
+            2,
+        );
+        assert_eq!(o.response_id.as_deref(), Some("resp-1"));
+        o.value(
+            &serde_json::json!({"object":"response","id":"invalid\nheader"}),
+            3,
+        );
+        o.value(
+            &serde_json::json!({"object":"response","id":"x".repeat(257)}),
+            4,
+        );
+        assert_eq!(o.response_id.as_deref(), Some("resp-1"));
+        let mut next_round = Observation::default();
+        next_round.value(
+            &serde_json::json!({"object":"chat.completion.chunk","id":"completion-2"}),
+            0,
+        );
+        assert_eq!(next_round.response_id.as_deref(), Some("completion-2"));
+    }
     #[test]
     fn protocol_terminal_and_error_categories_are_idempotent() {
         for (value, expected) in [

@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ArrowDownRight,
   ArrowUpRight,
   ChevronRight,
   RefreshCw,
@@ -14,7 +13,7 @@ import type {
   UsageState,
   UsageSettings,
   LogPage,
-  LogicalRecord,
+  RequestLog,
   LogicalDetail,
   Group,
 } from "./usage-types";
@@ -26,7 +25,10 @@ import {
   compact,
   compactMoney,
   successRate,
-  outcomeLabel,
+  logMoney,
+  httpClass,
+  outputSpeed,
+  logPages,
 } from "./usage-types";
 import UsageDialog from "./UsageDialog";
 import UsageDrawer from "./UsageDrawer";
@@ -68,7 +70,6 @@ export default function Usage({
   const [provider, setProvider] = useState(""),
     [model, setModel] = useState(""),
     [status, setStatus] = useState(""),
-    [outcome, setOutcome] = useState(""),
     [tab, setTab] = useState("overview"),
     [page, setPage] = useState(0),
     [ranking, setRanking] = useState("providers");
@@ -92,7 +93,6 @@ export default function Usage({
       provider,
       model,
       status,
-      outcome,
       page,
     });
   latest.current = {
@@ -103,7 +103,6 @@ export default function Usage({
     provider,
     model,
     status,
-    outcome,
     page,
   };
   const load = useCallback(async () => {
@@ -115,8 +114,6 @@ export default function Usage({
         ? { providerId: p.provider === "__gateway" ? "" : p.provider }
         : {}),
       ...(p.model ? { model: p.model } : {}),
-      ...(p.status ? { status: Number(p.status) } : {}),
-      ...(p.outcome ? { outcome: p.outcome } : {}),
     };
     if (
       !Number.isFinite(f.start) ||
@@ -131,7 +128,10 @@ export default function Usage({
     try {
       const [d, l, s] = await Promise.all([
         command<Dashboard>("get_usage_dashboard", { filters: f }),
-        command<LogPage>("get_usage_logs", { filters: f, page: p.page }),
+        command<LogPage>("get_usage_logs", {
+          filters: { ...f, ...(p.status ? { status: Number(p.status) } : {}) },
+          page: p.page,
+        }),
         command<UsageState>("get_usage_state"),
       ]);
       if (n === generation.current) {
@@ -173,7 +173,6 @@ export default function Usage({
     provider,
     model,
     status,
-    outcome,
     page,
     tab,
     visible,
@@ -224,7 +223,7 @@ export default function Usage({
     setLive(false);
     reset();
   };
-  const openDetail = async (r: LogicalRecord) => {
+  const openDetail = async (r: RequestLog) => {
     const n = ++detailGeneration.current;
     try {
       const next = await command<LogicalDetail | null>("get_usage_detail", {
@@ -381,18 +380,6 @@ export default function Usage({
               </label>
             </div>
           )}
-          {(status || outcome) && tab !== "logs" && (
-            <button
-              className="text-button usage-filter-clear"
-              onClick={() => {
-                setStatus("");
-                setOutcome("");
-                reset();
-              }}
-            >
-              清除结果筛选 · {outcomeLabel(outcome)} {status}
-            </button>
-          )}
           {tab === "overview" && summary && (
             <>
               <div className="usage-kpis">
@@ -547,58 +534,38 @@ export default function Usage({
             <section className="usage-card usage-logs">
               <div className="usage-log-tools">
                 <label>
-                  结果
+                  状态码
                   <select
-                    value={outcome}
-                    onChange={(e) => setFilter(setOutcome, e.target.value)}
+                    aria-label="状态码"
+                    value={status}
+                    onChange={(e) => setFilter(setStatus, e.target.value)}
                   >
-                    <option value="">全部结果</option>
-                    {[
-                      "success",
-                      "failure",
-                      "rejected",
-                      "cancelled",
-                      "pending",
-                      "unknown",
-                    ].map((o) => (
-                      <option key={o} value={o}>
-                        {outcomeLabel(o)}
+                    <option value="">全部</option>
+                    {[200, 400, 401, 403, 429, 500, 502, 503, 504].map((v) => (
+                      <option key={v} value={v}>
+                        {v === 200 ? "200 OK" : v}
                       </option>
                     ))}
                   </select>
                 </label>
-                <label>
-                  状态码
-                  <input
-                    type="number"
-                    placeholder="全部"
-                    aria-label="状态码"
-                    min="100"
-                    max="599"
-                    value={status}
-                    onChange={(e) => setFilter(setStatus, e.target.value)}
-                  />
-                </label>
                 <span>{number(logs?.total ?? 0)} 条</span>
               </div>
               <div className="usage-table-scroll">
-                <table className="usage-table logs-table">
+                <table className="usage-table logs-table cc-logs">
                   <thead>
                     <tr>
                       {[
                         "时间",
-                        "最终供应商",
+                        "供应商",
                         "模型",
-                        "结果",
-                        "Token",
+                        "输入 Token",
+                        "输出 Token",
                         "费用",
-                      ].map((v, i) => (
-                        <th
-                          className={i === 4 ? "optional-column" : ""}
-                          key={v}
-                        >
-                          {v}
-                        </th>
+                        "耗时",
+                        "状态",
+                        "来源",
+                      ].map((v) => (
+                        <th key={v}>{v}</th>
                       ))}
                     </tr>
                   </thead>
@@ -611,41 +578,84 @@ export default function Usage({
                             aria-label={`请求详情 ${r.id}`}
                             title={date(r.createdAt)}
                           >
-                            {new Date(r.createdAt * 1000).toLocaleTimeString(
+                            {new Date(r.createdAt * 1000).toLocaleString(
                               "zh-CN",
-                              { hour12: false },
+                              {
+                                month: "2-digit",
+                                day: "2-digit",
+                                hour: "2-digit",
+                                minute: "2-digit",
+                                hour12: false,
+                              },
                             )}
                           </button>
                         </td>
-                        <td title={r.providerName}>{r.providerName}</td>
+                        <td title={r.providerName}>
+                          <span className="log-name">{r.providerName}</span>
+                        </td>
                         <td
-                          title={r.billingModel ?? r.requestModel ?? "未提供"}
+                          title={[r.requestModel, r.responseModel]
+                            .filter(Boolean)
+                            .join(" → ")}
                         >
-                          {r.billingModel ?? r.requestModel ?? "未提供"}
+                          <span className="log-model">
+                            {r.requestModel &&
+                            r.responseModel &&
+                            r.requestModel !== r.responseModel
+                              ? `${r.requestModel} → ${r.responseModel}`
+                              : (r.responseModel ?? r.requestModel ?? "未提供")}
+                          </span>
                         </td>
                         <td>
-                          <span className={`outcome-badge ${r.outcomeClass}`}>
-                            {outcomeLabel(r.outcomeClass)}
-                          </span>
-                          {r.attemptCount > 1 && (
-                            <span
-                              className="retry-count"
-                              title={`${r.attemptCount} 次上游尝试`}
-                            >
-                              <ArrowDownRight size={11} />
-                              {r.attemptCount}
+                          {number(r.tokens.input)}
+                          {((r.tokens.cacheRead ?? 0) > 0 ||
+                            (r.tokens.cacheWrite ?? 0) > 0) && (
+                            <span className="log-secondary">
+                              {[
+                                (r.tokens.cacheRead ?? 0) > 0
+                                  ? `R${number(r.tokens.cacheRead)}`
+                                  : null,
+                                (r.tokens.cacheWrite ?? 0) > 0
+                                  ? `W${number(r.tokens.cacheWrite)}`
+                                  : null,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ")}
                             </span>
                           )}
                         </td>
-                        <td
-                          className="optional-column"
-                          title={number(totalTokens(r.tokens))}
-                        >
-                          {compact(totalTokens(r.tokens))}
+                        <td>
+                          {number(r.tokens.output)}
+                          {outputSpeed(r) !== null && (
+                            <span className="log-secondary">
+                              {outputSpeed(r)} tps
+                            </span>
+                          )}
                         </td>
                         <td title={money(r.cost.total)}>
-                          {compactMoney(r.cost.total)}
+                          {logMoney(r)}
+                          {Number(r.multiplier) !== 1 && (
+                            <span className="log-secondary">
+                              ×{Number(r.multiplier).toFixed(2)}
+                            </span>
+                          )}
                         </td>
+                        <td>
+                          {(r.latencyMs / 1000).toFixed(1)}s
+                          {r.firstTokenMs !== null && (
+                            <span className="log-secondary">
+                              /{(r.firstTokenMs / 1000).toFixed(1)}s
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          <span
+                            className={`http-status ${httpClass(r.status)}`}
+                          >
+                            {r.status ?? "—"}
+                          </span>
+                        </td>
+                        <td>{r.dataSource}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -662,6 +672,23 @@ export default function Usage({
                 >
                   上一页
                 </button>
+                <div className="log-page-numbers">
+                  {logPages(page, logs?.total ?? 0).map((p) =>
+                    typeof p === "string" ? (
+                      <span key={p}>…</span>
+                    ) : (
+                      <button
+                        key={p}
+                        aria-label={`第 ${p + 1} 页`}
+                        aria-current={p === page ? "page" : undefined}
+                        disabled={busy}
+                        onClick={() => setPage(p)}
+                      >
+                        {p + 1}
+                      </button>
+                    ),
+                  )}
+                </div>
                 <label>
                   <input
                     aria-label="日志页码"

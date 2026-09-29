@@ -39,6 +39,7 @@ import {
 import { command, subscribe, preview } from "./bridge";
 import AuthSyncNotice from "./AuthSyncNotice";
 import StartupSettings from "./StartupSettings";
+import PowerSettings from "./PowerSettings";
 import {
   errorOf,
   type Account,
@@ -247,7 +248,7 @@ export default function App() {
         <div className="sidebar-bottom">
           <button className="nav-item" onClick={() => setDialog("settings")}>
             <Settings size={17} />
-            设置<span className="version">v0.6.1</span>
+            设置<span className="version">v0.6.2</span>
           </button>
         </div>
       </aside>
@@ -921,6 +922,7 @@ function SettingsForm({
         ))}
       </div>
       <StartupSettings />
+      <PowerSettings />
       {error && (
         <p className="form-error" role="alert">
           {error}

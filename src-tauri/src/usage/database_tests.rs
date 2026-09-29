@@ -3,6 +3,7 @@ use crate::pricing::Cost;
 
 fn record(id: &str, attempt: usize, provider: &str, outcome: &str, status: u16, at: u64) -> Record {
     Record {
+        response_id: None,
         id: format!("{id}-{attempt}"),
         logical_id: id.into(),
         attempt,
@@ -144,7 +145,7 @@ fn migration_preserves_historical_cancellation_and_marks_crash_unknown() {
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
             .unwrap(),
-        2
+        3
     );
     let d = dashboard(&path, Filters::default()).unwrap().summary;
     assert_eq!(
@@ -483,4 +484,97 @@ fn migration_of_explicitly_supplied_database_copy() {
             + d.summary.unknown
     );
     println!("isolated migration: {} attempts, {} logical requests, {} cancelled, {} service failures, semantics v{}",records.len(),d.summary.requests,d.summary.cancelled,d.summary.failures,d.semantics_version);
+}
+
+#[test]
+fn cc_logs_project_final_attempt_without_changing_logical_accounting() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("usage.sqlite");
+    let db = initialize(&path).unwrap();
+    let at = pricing::now();
+    let a = record("retry", 0, "p1", "HTTP", 429, at);
+    let mut b = record("retry", 1, "p2", "CANCELLED", 200, at + 1);
+    b.tokens.input = Some(100);
+    b.cost.total = Some("0.75".into());
+    b.response_id = Some("resp_same".into());
+    complete(&db, &[a, b.clone()]);
+    let page = logs(&path, Filters::default(), 0).unwrap();
+    assert_eq!(page.total, 1);
+    let row = &page.records[0];
+    assert_eq!(row.record.status, Some(200));
+    assert_eq!(row.record.provider_id, "p2");
+    assert_eq!(row.record.tokens.input, Some(100));
+    assert_eq!(row.record.cost.total.as_deref(), Some("0.75"));
+    assert_eq!(row.data_source, "proxy");
+    let detail = detail(&path, &row.record.id).unwrap().unwrap();
+    assert_eq!(detail.attempts.len(), 2);
+    assert_eq!(detail.summary.record.tokens.input, Some(110));
+    assert_eq!(detail.summary.record.cost.total.as_deref(), Some("1"));
+    assert_eq!(detail.summary.outcome_class, "cancelled");
+    let mut duplicate = b.clone();
+    duplicate.logical_id = "again".into();
+    duplicate.id = "again-0".into();
+    duplicate.attempt = 0;
+    complete(&db, &[duplicate]);
+    assert_eq!(logs(&path, Filters::default(), 0).unwrap().total, 1);
+    let d = dashboard(&path, Filters::default()).unwrap().summary;
+    assert_eq!((d.requests, d.cancelled, d.attempts), (2, 2, 3));
+    b.logical_id = "other-provider".into();
+    b.id = "other-provider-0".into();
+    b.provider_id = "p3".into();
+    complete(&db, &[b]);
+    assert_eq!(logs(&path, Filters::default(), 0).unwrap().total, 2);
+    let pending = record("pending", 0, "p1", "IN_PROGRESS", 200, at);
+    logical(&db, &pending, false).unwrap();
+    assert_eq!(logs(&path, Filters::default(), 0).unwrap().total, 2);
+    let before: Vec<String> = {
+        let mut q = db
+            .prepare("SELECT payload FROM requests ORDER BY id")
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+    drop(db);
+    let db = initialize(&path).unwrap();
+    let after: Vec<String> = {
+        let mut q = db
+            .prepare("SELECT payload FROM requests ORDER BY id")
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(before, after);
+}
+#[test]
+fn v2_log_migration_preserves_snapshots_and_unknowns() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("usage.sqlite");
+    let db = initialize(&path).unwrap();
+    let mut r = record("old", 0, "p1", "INTERRUPTED", 200, pricing::now());
+    r.status = None;
+    r.tokens = Tokens::default();
+    r.cost.total = None;
+    complete(&db, &[r]);
+    let original: String = db
+        .query_row("SELECT final_payload FROM logical_requests", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    db.execute_batch("DROP INDEX logical_log_key; ALTER TABLE logical_requests DROP COLUMN log_key; PRAGMA user_version=2;").unwrap();
+    drop(db);
+    let db = initialize(&path).unwrap();
+    let final_payload: String = db
+        .query_row("SELECT final_payload FROM logical_requests", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(original, final_payload);
+    let page = logs(&path, Filters::default(), 0).unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.records[0].record.status, None);
+    assert_eq!(page.records[0].record.tokens.input, None);
 }

@@ -22,7 +22,16 @@ vi.mock("./bridge", () => ({
 }));
 import Usage from "./Usage";
 import { usagePreview } from "./usage-preview";
-import { successRate, compactMoney, type Dashboard } from "./usage-types";
+import {
+  successRate,
+  compactMoney,
+  outputSpeed,
+  logMoney,
+  httpClass,
+  logPages,
+  type Dashboard,
+  type LogPage,
+} from "./usage-types";
 import { trendRows } from "./UsageChart";
 const dirty = vi.fn();
 const emit = (event: string, value: unknown) =>
@@ -58,17 +67,17 @@ describe("logical usage views", () => {
     expect(compactMoney(null)).toBe("未定价");
     expect(compactMoney("0")).toBe("$0.00");
   });
-  it("keeps result filters and page when opening attempts and closing the drawer", async () => {
+  it("keeps HTTP filters and page when opening attempts and closing the drawer", async () => {
     render(<Usage onDirtyChange={dirty} />);
     await screen.findByText("逻辑请求");
     fireEvent.change(screen.getByLabelText("时间范围"), {
       target: { value: "7" },
     });
     fireEvent.click(screen.getByRole("button", { name: "请求日志" }));
-    await screen.findByLabelText("结果");
+    await screen.findByLabelText("状态码");
     expect(screen.queryByText("逻辑请求")).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("结果"), {
-      target: { value: "success" },
+    fireEvent.change(screen.getByLabelText("状态码"), {
+      target: { value: "200" },
     });
     await waitFor(() =>
       expect(screen.getByRole("button", { name: "下一页" })).toBeEnabled(),
@@ -82,7 +91,7 @@ describe("logical usage views", () => {
         "get_usage_logs",
         expect.objectContaining({
           page: 1,
-          filters: expect.objectContaining({ outcome: "success" }),
+          filters: expect.objectContaining({ status: 200 }),
         }),
       ),
     );
@@ -94,10 +103,34 @@ describe("logical usage views", () => {
     fireEvent.click(trigger);
     const drawer = await screen.findByRole("dialog", { name: "请求详情" });
     expect(within(drawer).getByText("调度过程")).toBeInTheDocument();
-    expect(within(drawer).getAllByText("请求模型")).toHaveLength(2);
+    expect(
+      within(drawer).getByRole("region", { name: "最终记录" }),
+    ).toBeInTheDocument();
+    expect(
+      mock.command.mock.calls
+        .filter(([n]) => n === "get_usage_dashboard")
+        .every(([, a]) => !a.filters.status),
+    ).toBe(true);
+    expect(screen.queryByLabelText("结果")).not.toBeInTheDocument();
+    expect(
+      screen
+        .getAllByRole("columnheader")
+        .map((h) => h.textContent)
+        .slice(0, 9),
+    ).toEqual([
+      "时间",
+      "供应商",
+      "模型",
+      "输入 Token",
+      "输出 Token",
+      "费用",
+      "耗时",
+      "状态",
+      "来源",
+    ]);
     fireEvent(drawer, new Event("cancel", { bubbles: true, cancelable: true }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("结果")).toHaveValue("success");
+    expect(screen.getByLabelText("状态码")).toHaveValue("200");
     expect(screen.getByLabelText("日志页码")).toHaveValue(2);
     expect(trigger).toHaveFocus();
   });
@@ -163,4 +196,45 @@ describe("logical usage views", () => {
     expect(rows.map((r) => r.requests)).toEqual([1, 0, 2]);
     expect(rows[2].cost).toBeNull();
   });
+});
+
+it("matches CC Switch numeric, cache and HTTP display without rewriting outcomes", async () => {
+  const page = (await usagePreview(
+    "get_usage_logs",
+    { page: 0 },
+    emit,
+  )) as LogPage;
+  const r = page.records[0];
+  expect(httpClass(200)).toBe("success");
+  expect(httpClass(503)).toBe("failure");
+  expect(httpClass(null)).toBe("unknown");
+  expect(logMoney({ ...r, cost: { ...r.cost, total: "0" } })).toBe("$0.0000");
+  expect(
+    logMoney({ ...r, cost: { ...r.cost, total: null, status: "unpriced" } }),
+  ).toBe("未定价");
+  expect(
+    outputSpeed({
+      ...r,
+      tokens: { ...r.tokens, output: 100 },
+      durationMs: null,
+      latencyMs: 2000,
+      firstTokenMs: 1000,
+    }),
+  ).toBe("100");
+  expect(
+    outputSpeed({ ...r, tokens: { ...r.tokens, output: null } }),
+  ).toBeNull();
+  expect(logPages(8, 400)).toEqual([
+    0,
+    1,
+    2,
+    "gap-7",
+    7,
+    8,
+    9,
+    "gap-17",
+    17,
+    18,
+    19,
+  ]);
 });

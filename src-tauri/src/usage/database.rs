@@ -35,7 +35,7 @@ pub fn initialize(path: &Path) -> Result<Connection> {
     let version: u32 = db
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(error)?;
-    if version > 2 {
+    if version > 3 {
         return Err(AppError::new("USAGE_DB", "统计数据库版本较新，请升级应用"));
     }
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
@@ -59,6 +59,35 @@ pub fn initialize(path: &Path) -> Result<Connection> {
         CREATE TABLE IF NOT EXISTS logical_rollups(id TEXT PRIMARY KEY,at INTEGER NOT NULL,ends INTEGER NOT NULL,provider TEXT NOT NULL,
         model TEXT NOT NULL,status INTEGER,class TEXT NOT NULL,count INTEGER NOT NULL,latency INTEGER NOT NULL,payload TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS logical_rollup_time ON logical_rollups(at,ends);").map_err(error)?;
+    if version < 3 {
+        tx.execute_batch(
+            "ALTER TABLE logical_requests ADD COLUMN log_key TEXT NOT NULL DEFAULT '';",
+        )
+        .map_err(error)?;
+        let legacy: Vec<(String, String)> = {
+            let mut q = tx
+                .prepare("SELECT id,final_payload FROM logical_requests")
+                .map_err(error)?;
+            let rows = q
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(error)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(error)?;
+            rows
+        };
+        for (id, payload) in legacy {
+            let r: Record = parse(&payload)?;
+            tx.execute(
+                "UPDATE logical_requests SET log_key=? WHERE id=?",
+                params![log_key(&r), id],
+            )
+            .map_err(error)?;
+        }
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS logical_log_key ON logical_requests(log_key,finished);",
+    )
+    .map_err(error)?;
     let mut changed = BTreeSet::new();
     let rows: Vec<(String, String, bool)> = {
         let mut q = tx
@@ -117,7 +146,7 @@ pub fn initialize(path: &Path) -> Result<Connection> {
         r.incomplete = true;
         write_logical(&tx, &r, true)?;
     }
-    tx.execute_batch("PRAGMA user_version=2").map_err(error)?;
+    tx.execute_batch("PRAGMA user_version=3").map_err(error)?;
     tx.commit().map_err(error)?;
     Ok(db)
 }
@@ -209,6 +238,11 @@ fn rebuild(db: &Connection, id: &str) -> Result<()> {
         ON CONFLICT(id) DO UPDATE SET at=excluded.at,provider=excluded.provider,model=excluded.model,status=excluded.status,class=excluded.class,
         finished=excluded.finished,explicit=excluded.explicit,final_payload=excluded.final_payload,payload=excluded.payload",
         params![id,final_record.created_at,final_record.provider_id,final_record.model(),final_record.status,summary.outcome_class,finished,explicit,json(&final_record)?,json(&summary)?]).map_err(error)?;
+    db.execute(
+        "UPDATE logical_requests SET log_key=? WHERE id=?",
+        params![log_key(&final_record), id],
+    )
+    .map_err(error)?;
     Ok(())
 }
 pub fn insert(db: &Connection, r: &Record, finished: bool) -> Result<()> {
@@ -564,10 +598,38 @@ pub fn dashboard(path: &Path, mut filters: Filters) -> Result<Dashboard> {
         semantics_version: 2,
     })
 }
+fn log_key(r: &Record) -> String {
+    match r
+        .response_id
+        .as_deref()
+        .filter(|_| !r.provider_id.is_empty())
+    {
+        Some(id) => format!(
+            "response:{}",
+            storage::digest(&serde_json::to_vec(&(&r.provider_id, id)).unwrap())
+        ),
+        None => format!("request:{}", r.logical_id),
+    }
+}
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLog {
+    #[serde(flatten)]
+    pub record: Record,
+    pub data_source: &'static str,
+}
+impl From<Record> for RequestLog {
+    fn from(record: Record) -> Self {
+        Self {
+            record,
+            data_source: "proxy",
+        }
+    }
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogPage {
-    pub records: Vec<LogicalRecord>,
+    pub records: Vec<RequestLog>,
     pub total: u64,
     pub page: u32,
     pub page_size: u32,
@@ -575,19 +637,24 @@ pub struct LogPage {
 pub fn logs(path: &Path, filters: Filters, page: u32) -> Result<LogPage> {
     let db = reader(path)?;
     let (predicate, mut values) = predicates(&filters, false, "");
+    // Deduplicate completed records before filtering using provider-scoped response
+    // IDs. Raw attempts and logical totals remain intact, including older unknown IDs.
+    let source = "WITH completed AS (SELECT *, ROW_NUMBER() OVER(PARTITION BY log_key ORDER BY rowid) AS ordinal FROM logical_requests WHERE finished=1), logs AS (SELECT * FROM completed WHERE ordinal=1)";
     let total = db
         .query_row(
-            &format!("SELECT COUNT(*) FROM logical_requests WHERE {predicate}"),
+            &format!("{source} SELECT COUNT(*) FROM logs WHERE {predicate}"),
             params_from_iter(values.clone()),
             |r| r.get(0),
         )
         .map_err(error)?;
     values.push(Value::Integer(i64::from(page) * 20));
-    let mut q = db.prepare(&format!("SELECT payload FROM logical_requests WHERE {predicate} ORDER BY at DESC,rowid DESC LIMIT 20 OFFSET ?")).map_err(error)?;
+    let mut q = db.prepare(&format!("{source} SELECT final_payload FROM logs WHERE {predicate} ORDER BY at DESC,id DESC LIMIT 20 OFFSET ?")).map_err(error)?;
     let mut rows = q.query(params_from_iter(values)).map_err(error)?;
     let mut records = vec![];
     while let Some(row) = rows.next().map_err(error)? {
-        records.push(parse(&row.get::<_, String>(0).map_err(error)?)?);
+        records.push(RequestLog::from(parse::<Record>(
+            &row.get::<_, String>(0).map_err(error)?,
+        )?));
     }
     Ok(LogPage {
         records,
@@ -599,18 +666,19 @@ pub fn logs(path: &Path, filters: Filters, page: u32) -> Result<LogPage> {
 pub fn detail(path: &Path, id: &str) -> Result<Option<LogicalDetail>> {
     use rusqlite::OptionalExtension;
     let db = reader(path)?;
-    let payload: Option<String> = db
+    let payload: Option<(String, String)> = db
         .query_row(
-            "SELECT payload FROM logical_requests WHERE id=?",
+            "SELECT payload,final_payload FROM logical_requests WHERE id=?",
             [id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(error)?;
     payload
         .map(|p| {
             Ok(LogicalDetail {
-                summary: parse(&p)?,
+                summary: parse(&p.0)?,
+                log: RequestLog::from(parse::<Record>(&p.1)?),
                 attempts: attempts(&db, id)?,
             })
         })
@@ -717,6 +785,21 @@ pub fn backfill(db: &mut Connection, prices: &pricing::Snapshot) -> Result<()> {
         }
     }
     for id in changed {
+        let payload: String = tx
+            .query_row(
+                "SELECT final_payload FROM logical_requests WHERE id=?",
+                [&id],
+                |r| r.get(0),
+            )
+            .map_err(error)?;
+        let mut final_record: Record = parse(&payload)?;
+        if price(&mut final_record, prices) {
+            tx.execute(
+                "UPDATE logical_requests SET final_payload=? WHERE id=?",
+                params![json(&final_record)?, id],
+            )
+            .map_err(error)?;
+        }
         rebuild(&tx, &id)?;
     }
     let rows: Vec<(String, String)> = {

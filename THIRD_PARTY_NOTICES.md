@@ -58,3 +58,5 @@ https://github.com/Wei-Shaw/sub2api/tree/9a62841fd124d026cf3694fcf9b79e98addcdbd
 LiteLLM model price data is bundled from the public MIT-licensed repository at https://github.com/BerriAI/litellm . The bundled seed records its source URL, download timestamp and SHA-256; prices are used only for estimates.
 
 models.dev model metadata and pricing are read from https://models.dev/api.json . The models.dev project is MIT licensed; its data remains attributed to that source.
+
+The v0.6.2 final request log projection, nine-column display, HTTP status colors, final-attempt costs, response ID deduplication and pagination follow cc-switch commit `846de29c13ac4d65f164db8c15dd5fd58e29f972`, specifically `src/components/usage/RequestLogTable.tsx` and `src-tauri/src/proxy/response_processor.rs`. The MIT notice above applies. Logical overview statistics remain independent. The native power helper is an original implementation using public macOS XPC and Security APIs; no One Switch code or helper is used.

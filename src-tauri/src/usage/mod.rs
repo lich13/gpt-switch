@@ -9,7 +9,7 @@ use crate::{
     },
     storage::{self, AppError, Result},
 };
-pub use database::{Dashboard, Filters, LogPage};
+pub use database::{Dashboard, Filters, LogPage, RequestLog};
 pub use logical::{LogicalDetail, LogicalRecord, LogicalSpan, RoutingDecision, RoutingTrace};
 use parser::{Observation, Observer, Tokens};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,8 @@ impl Default for Settings {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Record {
+    #[serde(default)]
+    pub response_id: Option<String>,
     pub id: String,
     pub logical_id: String,
     pub attempt: usize,
@@ -278,6 +280,7 @@ impl Service {
     ) -> Span {
         let settings = self.0.settings.lock().unwrap().0.clone();
         let record = Record {
+            response_id: None,
             id: uuid::Uuid::new_v4().to_string(),
             logical_id: logical_id.into(),
             attempt,
@@ -431,6 +434,7 @@ impl Span {
             .first_token_ms
             .map(|n| self.record.latency_ms.saturating_sub(n));
         self.record.response_model = o.model.clone();
+        self.record.response_id = o.response_id.clone();
         self.record.tokens = o.tokens.clone();
         self.record.service_tier = o.service_tier.clone().or(self.record.service_tier.clone());
         self.record.incomplete =

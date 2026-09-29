@@ -68,6 +68,7 @@ pub struct LogicalRecord {
 pub struct LogicalDetail {
     #[serde(flatten)]
     pub summary: LogicalRecord,
+    pub log: super::RequestLog,
     pub attempts: Vec<Record>,
 }
 struct Context {
@@ -87,6 +88,7 @@ impl Service {
     pub fn logical(&self, id: &str, tracked: bool) -> LogicalSpan {
         let settings = self.0.settings.lock().unwrap().0.clone();
         let record = Record {
+            response_id: None,
             id: id.into(),
             logical_id: id.into(),
             attempt: 0,
@@ -147,6 +149,9 @@ impl LogicalSpan {
         state.record.id = record.logical_id.clone();
         state.record.created_at = created_at;
         state.record.latency_ms = self.0.started.elapsed().as_millis() as u64;
+        state.record.first_token_ms = record
+            .first_token_ms
+            .map(|n| n.saturating_add(state.record.latency_ms.saturating_sub(record.latency_ms)));
         state.record.routing = self.0.trace.snapshot();
         if final_attempt {
             self.0.finish(&mut state);

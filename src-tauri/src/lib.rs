@@ -3,6 +3,8 @@ mod core;
 mod gateway;
 mod login;
 mod power;
+#[cfg(target_os = "macos")]
+mod power_macos;
 mod pricing;
 mod process_control;
 mod quick;
@@ -1030,6 +1032,8 @@ pub fn run() {
             commands::open_pricing_folder,
             commands::get_clamshell_state,
             commands::set_clamshell_awake,
+            commands::install_power_helper,
+            commands::remove_power_helper,
             commands::force_quit_codex_clients,
             commands::get_startup_error,
             open_main,

@@ -124,6 +124,32 @@ pub async fn set_clamshell_awake(
     .map_err(|_| AppError::new("POWER", "电源设置失败"))?
 }
 #[tauri::command]
+pub async fn install_power_helper(app: tauri::AppHandle, r: R<'_>) -> Result<power::State> {
+    let r = r.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = r.power.install();
+        if let Ok(state) = r.power.state() {
+            let _ = app.emit("clamshell-state", state);
+        }
+        result
+    })
+    .await
+    .map_err(|_| AppError::new("POWER", "助手安装失败"))?
+}
+#[tauri::command]
+pub async fn remove_power_helper(app: tauri::AppHandle, r: R<'_>) -> Result<power::State> {
+    let r = r.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = r.power.remove();
+        if let Ok(state) = r.power.state() {
+            let _ = app.emit("clamshell-state", state);
+        }
+        result
+    })
+    .await
+    .map_err(|_| AppError::new("POWER", "助手移除失败"))?
+}
+#[tauri::command]
 pub async fn force_quit_codex_clients(r: R<'_>) -> Result<process_control::Outcome> {
     if r.force_quitting.swap(true, Ordering::AcqRel) {
         return Err(AppError::new("BUSY", "正在退出客户端"));

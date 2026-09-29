@@ -109,11 +109,7 @@ async fn incident_rate_limited_p1_waits_then_recovers_while_p2_is_open() {
         (2, 1, 1, 3)
     );
     let log = svc.logs(Filters::default(), 0).unwrap();
-    let recovered = log
-        .records
-        .iter()
-        .find(|r| r.outcome_class == "success")
-        .unwrap();
+    let recovered = log.records.iter().find(|r| r.record.successful()).unwrap();
     assert_eq!(recovered.record.provider_id, g.view().providers[0].id);
     assert!(recovered
         .record
@@ -215,9 +211,13 @@ async fn failover_is_one_logical_request_and_keeps_each_attempts_usage_and_cost(
     );
     assert_eq!(s.tokens.total(), 36);
     let row = svc.logs(Filters::default(), 0).unwrap().records.remove(0);
+    assert_eq!(row.record.tokens.total(), 25);
+    assert_eq!(row.record.status, Some(200));
+    assert_eq!(row.data_source, "proxy");
     let detail = svc.detail(&row.record.id).unwrap().unwrap();
     assert_eq!(detail.attempts.len(), 2);
     assert_eq!(detail.attempts[0].status, Some(502));
+    assert_eq!(row.record.cost.total, detail.attempts[1].cost.total);
     assert_eq!(detail.summary.record.provider_id, g.view().providers[1].id);
     let detail_cost: rust_decimal::Decimal = detail
         .attempts

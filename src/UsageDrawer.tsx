@@ -9,6 +9,8 @@ import {
   totalTokens,
   outcomeLabel,
   routingLabel,
+  httpClass,
+  logMoney,
 } from "./usage-types";
 export default function UsageDrawer({
   detail: r,
@@ -51,45 +53,58 @@ export default function UsageDrawer({
         </button>
       </header>
       <div className="drawer-body">
-        <div className="request-result">
-          <span className={`outcome-badge ${r.outcomeClass}`}>
-            {outcomeLabel(r.outcomeClass)}
-          </span>
-          <span>{r.status ?? "—"}</span>
-          <strong>{money(r.cost.total)}</strong>
-        </div>
-        <dl className="usage-detail">
-          <div className="detail-full">
-            <dt>逻辑请求 ID</dt>
-            <dd>{r.logicalId}</dd>
+        <section aria-label="最终记录">
+          <div className="request-result">
+            <strong>{r.log.providerName}</strong>
+            <span className={`http-status ${httpClass(r.log.status)}`}>
+              {r.log.status ?? "—"}
+            </span>
+            <strong>{logMoney(r.log)}</strong>
+            <span>{r.log.dataSource}</span>
           </div>
-          <div>
-            <dt>最终供应商</dt>
-            <dd>{r.providerName}</dd>
+          <Attempt record={r.log} />
+        </section>
+        <details className="logical-detail">
+          <summary>逻辑请求总消耗与真实终态</summary>
+          <div className="request-result">
+            <span className={`outcome-badge ${r.outcomeClass}`}>
+              {outcomeLabel(r.outcomeClass)}
+            </span>
+            <strong>{money(r.cost.total)}</strong>
           </div>
-          <div>
-            <dt>总耗时</dt>
-            <dd>{number(r.latencyMs)} ms</dd>
-          </div>
-          <div>
-            <dt>上游尝试</dt>
-            <dd>{r.attemptCount}</dd>
-          </div>
-          <div>
-            <dt>总 Token</dt>
-            <dd>{number(totalTokens(r.tokens))}</dd>
-          </div>
-          <div className="detail-full">
-            <dt>终态</dt>
-            <dd>
-              {r.outcome}
-              {r.terminalEvidence ? ` · ${r.terminalEvidence}` : ""}
-            </dd>
-          </div>
-        </dl>
+          <dl className="usage-detail">
+            <div className="detail-full">
+              <dt>逻辑请求 ID</dt>
+              <dd>{r.logicalId}</dd>
+            </div>
+            <div>
+              <dt>最终供应商</dt>
+              <dd>{r.providerName}</dd>
+            </div>
+            <div>
+              <dt>总耗时</dt>
+              <dd>{number(r.latencyMs)} ms</dd>
+            </div>
+            <div>
+              <dt>上游尝试</dt>
+              <dd>{r.attemptCount}</dd>
+            </div>
+            <div>
+              <dt>总 Token</dt>
+              <dd>{number(totalTokens(r.tokens))}</dd>
+            </div>
+            <div className="detail-full">
+              <dt>终态</dt>
+              <dd>
+                {r.outcome}
+                {r.terminalEvidence ? ` · ${r.terminalEvidence}` : ""}
+              </dd>
+            </div>
+          </dl>
+        </details>
         {r.routing.length > 0 && (
-          <section className="routing-section">
-            <h3>调度过程</h3>
+          <details className="routing-section">
+            <summary>调度过程</summary>
             <ol>
               {r.routing.map((d, i) => (
                 <li
@@ -112,17 +127,13 @@ export default function UsageDrawer({
                 </li>
               ))}
             </ol>
-          </section>
+          </details>
         )}
         <section className="attempts-section">
           <h3>上游尝试</h3>
           {r.attempts.length ? (
             r.attempts.map((a, i) => (
-              <details
-                className="attempt-detail"
-                key={a.id}
-                open={r.attempts.length === 1 || i === r.attempts.length - 1}
-              >
+              <details className="attempt-detail" key={a.id}>
                 <summary>
                   <span className="attempt-number">{i + 1}</span>
                   <strong title={a.providerName}>{a.providerName}</strong>

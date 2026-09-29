@@ -49,6 +49,7 @@ export type RoutingDecision = {
   at: number;
 };
 export type UsageRecord = {
+  responseId?: string | null;
   id: string;
   logicalId: string;
   attempt: number;
@@ -78,7 +79,11 @@ export type LogicalRecord = UsageRecord & {
   attemptCount: number;
   semanticsVersion: number;
 };
-export type LogicalDetail = LogicalRecord & { attempts: UsageRecord[] };
+export type RequestLog = UsageRecord & { dataSource: "proxy" };
+export type LogicalDetail = LogicalRecord & {
+  log: RequestLog;
+  attempts: UsageRecord[];
+};
 export type Aggregate = {
   requests: number;
   successes: number;
@@ -132,7 +137,7 @@ export type UsageState = {
   error: string | null;
 };
 export type LogPage = {
-  records: LogicalRecord[];
+  records: RequestLog[];
   total: number;
   page: number;
   pageSize: number;
@@ -197,10 +202,45 @@ export const totalTokens = (t: Tokens) =>
       (t.cacheRead ?? 0) +
       (t.cacheWrite ?? 0)
     : null;
+export const outputSpeed = (r: UsageRecord): string | null => {
+  const ms =
+    r.durationMs && r.durationMs > 0
+      ? r.durationMs
+      : r.firstTokenMs != null
+        ? r.latencyMs - r.firstTokenMs
+        : r.latencyMs;
+  if (r.tokens.output == null || r.tokens.output <= 0 || ms <= 0) return null;
+  const rate = (r.tokens.output / ms) * 1000;
+  return rate >= 1 ? Math.round(rate).toString() : rate.toFixed(1);
+};
 export const speed = (r: UsageRecord) =>
-  r.tokens.output !== null && r.durationMs && r.durationMs > 0
-    ? `${((r.tokens.output / r.durationMs) * 1000).toFixed(1)} t/s`
-    : "未提供";
+  outputSpeed(r) === null ? "未提供" : `${outputSpeed(r)} tps`;
+export const logMoney = (r: UsageRecord) =>
+  r.cost.total == null
+    ? r.cost.status === "unreported"
+      ? "未提供"
+      : "未定价"
+    : `$${Number(r.cost.total).toFixed(4)}`;
+export const httpClass = (status: number | null) =>
+  status == null
+    ? "unknown"
+    : status >= 200 && status < 300
+      ? "success"
+      : "failure";
+export function logPages(page: number, total: number): (number | string)[] {
+  const pages = Math.ceil(total / 20);
+  const keep = new Set<number>();
+  for (let i = 0; i < pages; i++)
+    if (pages <= 9 || i < 3 || i >= pages - 3 || Math.abs(i - page) <= 1)
+      keep.add(i);
+  const result: (number | string)[] = [];
+  for (const i of keep) {
+    const last = result.at(-1);
+    if (typeof last === "number" && i - last > 1) result.push(`gap-${i}`);
+    result.push(i);
+  }
+  return result;
+}
 
 export const compact = (n: number | null | undefined) =>
   n == null

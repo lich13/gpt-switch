@@ -1,4 +1,4 @@
-//! Battery clamshell control. Only the two pmset operations are elevated.
+//! Battery clamshell control through the narrowly scoped, authorized power helper.
 use crate::storage::{self, AppError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -9,6 +9,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
+    pub helper: String,
     pub supported: bool,
     pub enabled: bool,
     pub battery_sleep: u16,
@@ -17,6 +18,7 @@ pub struct State {
 impl State {
     fn new(supported: bool, enabled: bool, minutes: u16) -> Self {
         Self {
+            helper: if supported { "ready" } else { "unsupported" }.into(),
             supported,
             enabled,
             battery_sleep: minutes,
@@ -30,6 +32,12 @@ struct Restore {
     minutes: u16,
 }
 trait System: Send + Sync {
+    fn prepare(&self, _force: bool) -> Result<()> {
+        Ok(())
+    }
+    fn remove(&self) -> Result<()> {
+        Err(AppError::new("UNSUPPORTED", "此设备不支持电源助手"))
+    }
     fn read(&self) -> Result<State>;
     fn apply(&self, before: &State, enabled: bool, minutes: u16) -> Result<()>;
 }
@@ -54,8 +62,26 @@ impl Service {
     pub fn state(&self) -> Result<State> {
         self.system.read()
     }
+    pub fn install(&self) -> Result<State> {
+        let _lock = self.lock.lock().unwrap();
+        self.system.prepare(true)?;
+        self.state()
+    }
+    pub fn remove(&self) -> Result<State> {
+        let _lock = self.lock.lock().unwrap();
+        let before = self.state()?;
+        if before.enabled {
+            self.set_locked(false, &before.revision)?;
+        }
+        self.system.remove()?;
+        self.state()
+    }
+
     pub fn set(&self, enabled: bool, expected: &str) -> Result<State> {
         let _lock = self.lock.lock().unwrap();
+        self.set_locked(enabled, expected)
+    }
+    fn set_locked(&self, enabled: bool, expected: &str) -> Result<State> {
         let before = self.state()?;
         if !before.supported {
             return Err(AppError::new("UNSUPPORTED", "此设备不支持电池合盖控制"));
@@ -65,6 +91,11 @@ impl Service {
         }
         if before.enabled == enabled {
             return Ok(before);
+        }
+        self.system.prepare(false)?;
+        let before = self.state()?;
+        if before.revision != expected {
+            return Err(AppError::new("CONFLICT", "电源状态已变化，请重新操作"));
         }
         let old = storage::read_optional(&self.path)?;
         let restore = old
@@ -168,10 +199,38 @@ fn parse(general: &str, custom: &str) -> Result<State> {
     }
 }
 impl System for Native {
+    fn prepare(&self, force: bool) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::power_macos::ensure(force)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = force;
+            Err(AppError::new("UNSUPPORTED", "此设备不支持电源助手"))
+        }
+    }
+    fn remove(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            crate::power_macos::remove()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(AppError::new("UNSUPPORTED", "此设备不支持电源助手"))
+        }
+    }
     fn read(&self) -> Result<State> {
         #[cfg(target_os = "macos")]
         {
-            parse(&output(&["-g"])?, &output(&["-g", "custom"])?)
+            let mut state = parse(&output(&["-g"])?, &output(&["-g", "custom"])?)?;
+            state.helper = if state.supported {
+                crate::power_macos::status()
+            } else {
+                "unsupported"
+            }
+            .into();
+            Ok(state)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -181,48 +240,10 @@ impl System for Native {
     fn apply(&self, before: &State, enabled: bool, minutes: u16) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            // Only validated integers are substituted. Recheck inside the authorized
-            // operation because the system dialog may remain open for a long time.
-            let verify = format!(
-                r#"test "$(/usr/bin/pmset -g | /usr/bin/awk '$1=="SleepDisabled"{{print $2;exit}}')" = "{}" && test "$(/usr/bin/pmset -g custom | /usr/bin/awk '/^Battery Power:/{{b=1;next}} /^[^ \t]/{{b=0}} b && $1=="sleep"{{print $2;exit}}')" = "{}" || exit 73; "#,
-                u8::from(before.enabled),
-                before.battery_sleep
-            );
-            let commands = if enabled {
-                "/usr/bin/pmset -b sleep 0 && /usr/bin/pmset -b disablesleep 1".to_string()
-            } else {
-                format!("/usr/bin/pmset -b disablesleep 0 && /usr/bin/pmset -b sleep {minutes}")
-            };
-            let rollback = format!(
-                "/usr/bin/pmset -b disablesleep {} ; /usr/bin/pmset -b sleep {} ; exit 74",
-                u8::from(before.enabled),
-                before.battery_sleep
-            );
-            let shell = format!("{verify}if {commands}; then exit 0; else {rollback}; fi");
-            let script = format!(
-                "do shell script \"{}\" with administrator privileges",
-                shell.replace('\\', "\\\\").replace('"', "\\\"")
-            );
-            let result = std::process::Command::new("/usr/bin/osascript")
-                .args(["-e", &script])
-                .stdin(std::process::Stdio::null())
-                .output()
-                .map_err(storage::io_error)?;
-            if result.status.success() {
-                Ok(())
-            } else {
-                let message = String::from_utf8_lossy(&result.stderr);
-                Err(AppError::new(
-                    "POWER",
-                    if message.contains("-128") {
-                        "已取消系统授权"
-                    } else if message.contains("(73)") {
-                        "电源状态已变化，请重新操作"
-                    } else {
-                        "电源设置失败，请检查系统授权；原设置已尝试恢复"
-                    },
-                ))
-            }
+            crate::power_macos::request(
+                serde_json::json!({"op":"set", "enabled":enabled, "minutes":minutes, "beforeEnabled":before.enabled, "beforeSleep":before.battery_sleep}),
+            )?;
+            Ok(())
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -231,6 +252,7 @@ impl System for Native {
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +327,117 @@ mod tests {
                 .supported
         );
         assert!(parse("", "Battery Power:\n sleep 0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct MockHelper {
+        current: Mutex<State>,
+        ready: AtomicBool,
+        cancelled: AtomicBool,
+        approvals: AtomicUsize,
+        switches: AtomicUsize,
+    }
+    impl System for MockHelper {
+        fn read(&self) -> Result<State> {
+            Ok(self.current.lock().unwrap().clone())
+        }
+        fn prepare(&self, force: bool) -> Result<()> {
+            if force || !self.ready.load(Ordering::SeqCst) {
+                self.approvals.fetch_add(1, Ordering::SeqCst);
+                if self.cancelled.load(Ordering::SeqCst) {
+                    return Err(AppError::new("POWER_AUTH", "已取消系统授权"));
+                }
+                self.ready.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn apply(&self, before: &State, enabled: bool, minutes: u16) -> Result<()> {
+            let mut state = self.current.lock().unwrap();
+            if state.revision != before.revision {
+                return Err(AppError::new("CONFLICT", "外部状态变化"));
+            }
+            self.switches.fetch_add(1, Ordering::SeqCst);
+            *state = State::new(true, enabled, minutes);
+            Ok(())
+        }
+        fn remove(&self) -> Result<()> {
+            self.ready.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[test]
+    fn first_install_cancel_and_upgrade_do_not_elevate_each_toggle() {
+        let t = tempfile::tempdir().unwrap();
+        let mut service = Service::new(t.path());
+        let helper = Arc::new(MockHelper {
+            current: Mutex::new(State::new(true, false, 0)),
+            ready: AtomicBool::new(false),
+            cancelled: AtomicBool::new(true),
+            approvals: AtomicUsize::new(0),
+            switches: AtomicUsize::new(0),
+        });
+        service.system = helper.clone();
+        let original = service.state().unwrap();
+        assert!(service.set(true, &original.revision).is_err());
+        assert_eq!(service.state().unwrap(), original);
+        assert!(!service.path.exists());
+        helper.cancelled.store(false, Ordering::SeqCst);
+        for _ in 0..3 {
+            let on = service
+                .set(true, &service.state().unwrap().revision)
+                .unwrap();
+            service.set(false, &on.revision).unwrap();
+        }
+        assert_eq!(helper.approvals.load(Ordering::SeqCst), 2);
+        assert_eq!(helper.switches.load(Ordering::SeqCst), 6);
+        helper.ready.store(false, Ordering::SeqCst); // upgraded app has a new approved code identity
+        service
+            .set(true, &service.state().unwrap().revision)
+            .unwrap();
+        assert_eq!(helper.approvals.load(Ordering::SeqCst), 3);
+        service.remove().unwrap();
+        assert!(!service.state().unwrap().enabled);
+        assert!(!helper.ready.load(Ordering::SeqCst));
+        assert_eq!(service.state().unwrap().battery_sleep, 0);
+    }
+    #[test]
+    fn concurrent_toggles_reserve_one_state_revision() {
+        let t = tempfile::tempdir().unwrap();
+        let mut service = Service::new(t.path());
+        let helper = Arc::new(MockHelper {
+            current: Mutex::new(State::new(true, false, 9)),
+            ready: AtomicBool::new(true),
+            cancelled: AtomicBool::new(false),
+            approvals: AtomicUsize::new(0),
+            switches: AtomicUsize::new(0),
+        });
+        service.system = helper.clone();
+        let service = Arc::new(service);
+        let original = service.state().unwrap().revision;
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let joins: Vec<_> = (0..2)
+            .map(|_| {
+                let service = service.clone();
+                let revision = original.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    service.set(true, &revision).is_ok()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let count = joins
+            .into_iter()
+            .filter_map(|j| j.join().ok())
+            .filter(|v| *v)
+            .count();
+        assert_eq!(count, 1);
+        assert_eq!(helper.switches.load(Ordering::SeqCst), 1);
+        assert_eq!(helper.approvals.load(Ordering::SeqCst), 0);
     }
 }

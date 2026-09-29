@@ -91,6 +91,7 @@ let state: UsageState = {
   error: null,
 };
 let power = {
+  helper: "notInstalled",
   supported: true,
   enabled: false,
   batterySleep: 0,
@@ -201,6 +202,38 @@ const records: LogicalRecord[] = Array.from({ length: 38 }, (_, i) => {
     routing,
   };
 });
+// Keep the preview's final HTTP record, terminal evidence and retry timeline coherent.
+for (const r of records) {
+  const pair = attempts.filter((a) => a.logicalId === r.logicalId);
+  const [first, last] = pair;
+  first.status = 502;
+  first.outcome = "HTTP";
+  first.terminalEvidence = null;
+  first.incomplete = true;
+  last.status = r.status;
+  last.outcome = r.outcome;
+  last.terminalEvidence = r.outcomeClass === "success" ? "OK" : null;
+  last.incomplete = r.outcomeClass !== "success";
+  r.terminalEvidence = last.terminalEvidence;
+  r.tokens = { ...last.tokens };
+  for (const k of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+    r.tokens[k] = pair.every((a) => a.tokens[k] === null)
+      ? null
+      : pair.reduce((sum, a) => sum + (a.tokens[k] ?? 0), 0);
+  }
+  r.cost = {
+    ...last.cost,
+    total: pair.every((a) => a.cost.total === null)
+      ? null
+      : String(pair.reduce((sum, a) => sum + Number(a.cost.total ?? 0), 0)),
+  };
+}
+const finalLog = (r: LogicalRecord) => ({
+  ...attempts.filter((a) => a.logicalId === r.logicalId).at(-1)!,
+  id: r.id,
+  logicalId: r.logicalId,
+  dataSource: "proxy" as const,
+});
 const aggregate = (rows: LogicalRecord[]): Aggregate => ({
   requests: rows.length,
   successes: rows.filter((r) => r.outcomeClass === "success").length,
@@ -248,6 +281,8 @@ export const usageCommands = [
   "reload_pricing",
   "open_pricing_folder",
   "get_clamshell_state",
+  "install_power_helper",
+  "remove_power_helper",
   "set_clamshell_awake",
   "force_quit_codex_clients",
   "get_startup_error",
@@ -264,10 +299,19 @@ export async function usagePreview(
       return null;
     case "get_clamshell_state":
       return { ...power };
+    case "install_power_helper":
+      power = { ...power, helper: "ready" };
+      emit("clamshell-state", power);
+      return power;
+    case "remove_power_helper":
+      power = { ...power, helper: "notInstalled", enabled: false };
+      emit("clamshell-state", power);
+      return power;
     case "set_clamshell_awake":
       power = {
         ...power,
         enabled: !!args.enabled,
+        helper: "ready",
         revision: crypto.randomUUID(),
       };
       emit("clamshell-state", power);
@@ -316,10 +360,9 @@ export async function usagePreview(
     }
     case "get_usage_logs":
       return {
-        records: rows.slice(
-          Number(args.page) * 20,
-          (Number(args.page) + 1) * 20,
-        ),
+        records: rows
+          .slice(Number(args.page) * 20, (Number(args.page) + 1) * 20)
+          .map(finalLog),
         total: rows.length,
         page: args.page,
         pageSize: 20,
@@ -329,6 +372,7 @@ export async function usagePreview(
       return r
         ? {
             ...r,
+            log: finalLog(r),
             attempts: attempts.filter((a) => a.logicalId === r.logicalId),
           }
         : null;
