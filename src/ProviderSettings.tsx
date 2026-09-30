@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { confirmAction } from "./confirmation";
 import Modal from "./Modal";
 import { errorOf } from "./types";
 import { providerStatus } from "./provider-status";
@@ -12,6 +13,7 @@ export default function ProviderSettings({
   save,
   close,
   models,
+  onDirtyChange,
 }: {
   provider: Provider;
   runtime: Provider;
@@ -24,17 +26,33 @@ export default function ProviderSettings({
   ) => Promise<void>;
   close: () => void;
   models: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [supportsWebsocket, setSupportsWebsocket] = useState(
     provider.supportsWebsocket,
   );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [saved, setSaved] = useState(provider.supportsWebsocket);
+  const baseline = useRef(revision);
+  const [retry, setRetry] = useState(false);
+  const dirty = supportsWebsocket !== saved;
   useEffect(() => {
-    setSupportsWebsocket(provider.supportsWebsocket);
-  }, [provider.id]);
-  const changeWebsocket = async (next: boolean) => {
-    setSupportsWebsocket(next);
+    if (!dirty && !saving && !error) {
+      setSupportsWebsocket(runtime.supportsWebsocket);
+      setSaved(runtime.supportsWebsocket);
+      baseline.current = revision;
+    }
+  }, [runtime.supportsWebsocket, revision, dirty, saving, error]);
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+  const leave = async (action: () => void) => {
+    if (saving) return;
+    if (!dirty || (await confirmAction("放弃未保存的修改？"))) action();
+  };
+  const changeWebsocket = async () => {
     setSaving(true);
     setError("");
     try {
@@ -42,31 +60,46 @@ export default function ProviderSettings({
         {
           op: "websocketProvider",
           id: provider.id,
-          supportsWebsocket: next,
+          supportsWebsocket,
         },
-        revision,
+        retry ? revision : baseline.current,
       );
+      setSaved(supportsWebsocket);
+      setRetry(false);
     } catch (cause) {
       setError(errorOf(cause).message);
+      setRetry(true);
     } finally {
       setSaving(false);
     }
   };
   return (
-    <Modal title={provider.name} close={close}>
+    <Modal title={provider.name} close={() => void leave(close)} busy={saving}>
       <div className="provider-settings">
         {clientId === "codex" && (
-          <label className="settings-toggle">
-            <input
-              type="checkbox"
-              checked={supportsWebsocket}
-              disabled={disabled || saving}
-              onChange={(event) => {
-                void changeWebsocket(event.target.checked);
-              }}
-            />
-            <span>原生 WebSocket</span>
-          </label>
+          <div className="settings-toggle-row">
+            <label className="settings-toggle">
+              <input
+                type="checkbox"
+                checked={supportsWebsocket}
+                disabled={disabled || saving}
+                onChange={(event) => {
+                  setSupportsWebsocket(event.target.checked);
+                }}
+              />
+              <span>原生 WebSocket</span>
+            </label>
+            {(dirty || error) && (
+              <button
+                type="button"
+                className="primary small"
+                disabled={disabled || saving}
+                onClick={() => void changeWebsocket()}
+              >
+                {saving ? "保存中…" : retry ? "重试" : "保存"}
+              </button>
+            )}
+          </div>
         )}
         {error && (
           <div className="form-error" role="alert">
@@ -76,7 +109,8 @@ export default function ProviderSettings({
         <button
           type="button"
           className="secondary model-settings-entry"
-          onClick={models}
+          onClick={() => void leave(models)}
+          disabled={saving}
         >
           模型白名单 <span>{provider.allowedModels?.length ?? "不限"}</span>
         </button>

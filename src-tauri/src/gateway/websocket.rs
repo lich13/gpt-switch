@@ -1,5 +1,6 @@
 //! Responses uses per-generation slots, following Sub2API's BeforeTurn/AfterTurn
-//! behavior (a3eb7ef3). Payloads are observed, never rewritten or replayed after upgrade.
+//! behavior (a3eb7ef3). Native payloads stay unchanged; HTTP bridges adapt only
+//! the response.create envelope and never replay after downstream output.
 use super::{
     admission::{Admission, Budget, CapacitySource, Rejected},
     circuit, forward,
@@ -8,7 +9,7 @@ use super::{
     routing::Requirement,
     Active, Gateway, Route,
 };
-use async_compression::tokio::bufread::{DeflateDecoder, GzipDecoder, ZstdDecoder};
+use async_compression::tokio::bufread::{GzipDecoder, ZlibDecoder, ZstdDecoder};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -16,7 +17,7 @@ use http_body_util::BodyExt;
 use hyper::{body::Incoming, header, HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use sha1::{Digest, Sha1};
-use std::{collections::HashMap, io, time::Duration};
+use std::{collections::HashMap, future::Future, io, time::Duration};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader},
     sync::{mpsc, oneshot, watch},
@@ -27,6 +28,9 @@ type Failure = (u16, &'static str);
 type BoxReader = Box<dyn AsyncBufRead + Send + Unpin>;
 const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 const MAX_SSE_EVENT: usize = 2 * 1024 * 1024;
+const KEEPALIVE: Duration = Duration::from_secs(20);
+// Internal control result, consumed before writing a close frame.
+const TURN_CANCELLED: Failure = (0, "turn cancelled before output");
 fn options() -> Options {
     Options::default()
         .with_balanced_compression()
@@ -45,14 +49,24 @@ struct Peer {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 impl Peer {
-    fn new<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(socket: WebSocket<S>) -> Self {
+    fn new<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+        socket: WebSocket<S>,
+        keepalive: Option<Duration>,
+    ) -> Self {
         let (mut sink, mut stream) = socket.split();
         let (tx, incoming) = mpsc::channel(2);
         let (outgoing, mut rx) = mpsc::channel::<Outgoing>(1);
         let (closed_tx, closed) = watch::channel(false);
         let writer_closed = closed_tx.clone();
+        let ping = Bytes::from(format!("lich13-switch:{}", uuid::Uuid::new_v4()));
+        let pong = ping.clone();
         let reader = tokio::spawn(async move {
             while let Some(frame) = stream.next().await {
+                // Consume only replies to our own heartbeat; arbitrary control
+                // frames still pass through without touching the turn deadline.
+                if frame.opcode() == OpCode::Pong && frame.payload() == &pong {
+                    continue;
+                }
                 let close = frame.opcode() == OpCode::Close;
                 if tx.send(frame).await.is_err() || close {
                     break;
@@ -61,7 +75,20 @@ impl Peer {
             let _ = closed_tx.send(true);
         });
         let writer = tokio::spawn(async move {
-            while let Some(Outgoing { frame, ack }) = rx.recv().await {
+            loop {
+                let heartbeat = tokio::time::sleep(keepalive.unwrap_or(KEEPALIVE));
+                let outgoing = tokio::select! {
+                    outgoing = rx.recv() => outgoing,
+                    _ = heartbeat, if keepalive.is_some() => {
+                        if !matches!(tokio::time::timeout(Duration::from_secs(5), sink.send(Frame::ping(ping.clone()))).await, Ok(Ok(()))) {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Some(Outgoing { frame, ack }) = outgoing else {
+                    break;
+                };
                 let ok = matches!(
                     tokio::time::timeout(Duration::from_secs(120), sink.send(frame)).await,
                     Ok(Ok(()))
@@ -114,21 +141,30 @@ enum Upstream {
 struct BridgeTurn {
     first: Option<Result<Frame, Failure>>,
     incoming: mpsc::Receiver<Result<Frame, Failure>>,
-    cancel: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
 }
 impl BridgeTurn {
     fn cancel(&self) {
-        let _ = self.cancel.send(true);
+        self.task.abort();
     }
 }
 impl Drop for BridgeTurn {
     fn drop(&mut self) {
-        let _ = self.cancel.send(true);
+        self.task.abort();
     }
 }
 async fn next_upstream(upstream: &mut Upstream) -> Option<Result<Frame, Failure>> {
     match upstream {
-        Upstream::Native(peer) => peer.incoming.recv().await.map(Ok),
+        Upstream::Native(peer) => {
+            if *peer.closed.borrow() && peer.incoming.is_empty() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                frame = peer.incoming.recv() => frame.map(Ok),
+                _ = peer.closed.changed() => None,
+            }
+        }
         Upstream::Bridge(Some(turn)) => {
             if let Some(first) = turn.first.take() {
                 Some(first)
@@ -226,7 +262,10 @@ pub(super) fn accept(
         let Ok(socket) = future.await else {
             return;
         };
-        let mut client = Peer::new(socket);
+        let mut client = Peer::new(
+            socket,
+            (gateway.0.client == super::ClientId::Codex).then_some(KEEPALIVE),
+        );
         let Some(mut stop) = stop else {
             return;
         };
@@ -254,12 +293,56 @@ async fn take_slot(
     if *client.closed.borrow() {
         return Err((1000, "client closed"));
     }
-    tokio::select! {
-        admission = g.0.admission.acquire_for_immediate(routes, manual, settings.max_waiting, budget, requirement, immediate) => admission.map_err(|reason| {
-            if matches!(reason, Rejected::Model) { (1008, requirement.code()) } else { rejected(reason) }
-        }),
-        _ = client.closed.changed() => Err((1000, "client closed")),
+    while_connecting(
+        client,
+        g.0.admission.acquire_for_immediate(
+            routes,
+            manual,
+            settings.max_waiting,
+            budget,
+            requirement,
+            immediate,
+        ),
+    )
+    .await?
+    .map_err(|reason| {
+        if matches!(reason, Rejected::Model) {
+            (1008, requirement.code())
+        } else {
+            rejected(reason)
+        }
+    })
+}
+async fn while_connecting<T>(
+    client: &mut Peer,
+    operation: impl Future<Output = T>,
+) -> Result<T, Failure> {
+    if *client.closed.borrow() {
+        return Err((1000, "client closed"));
     }
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            biased;
+            incoming = client.incoming.recv() => {
+                let Some(frame) = incoming else { return Err((1000, "client closed")); };
+                match frame.opcode() {
+                    OpCode::Ping => client.send(Frame::pong(frame.payload().to_vec())).await?,
+                    OpCode::Pong => (),
+                    OpCode::Close => { client.send(frame).await?; return Err((1000, "client closed")); },
+                    _ if value(&frame).is_some_and(|v| v["type"] == "response.cancel") => return Err(TURN_CANCELLED),
+                    _ => return Err((1013, "too many pending turns")),
+                }
+            },
+            result = &mut operation => return Ok(result),
+            _ = client.closed.changed() => return Err((1000, "client closed")),
+        }
+    }
+}
+async fn cancellation(client: &Peer) -> Result<(), Failure> {
+    client
+        .send(Frame::text(r#"{"type":"response.cancelled"}"#))
+        .await
 }
 async fn upstream_native(
     route: &Route,
@@ -370,7 +453,8 @@ async fn upstream_native(
             status: Some(status.as_u16()),
             retry,
             capacity,
-            unsupported: unsupported_status(status.as_u16()),
+            unsupported: route.client_id == super::ClientId::Codex
+                && unsupported_status(status.as_u16()),
         });
     }
     let expected = STANDARD.encode(Sha1::digest(
@@ -414,7 +498,10 @@ async fn upstream_native(
         capacity: false,
         unsupported: false,
     })?;
-    Ok(Peer::new(socket))
+    Ok(Peer::new(
+        socket,
+        (route.client_id == super::ClientId::Codex).then_some(KEEPALIVE),
+    ))
 }
 fn bridge_payload(frame: &Frame) -> Result<Bytes, Failure> {
     let mut value = value(frame).ok_or((1008, "invalid response.create"))?;
@@ -447,11 +534,16 @@ fn decoded_reader(body: Incoming, encoding: &str) -> Result<BoxReader, AttemptFa
     let stream = body
         .into_data_stream()
         .map(|result| result.map_err(io::Error::other));
-    let reader = BufReader::new(StreamReader::new(stream));
+    decode_reader(
+        Box::new(BufReader::new(StreamReader::new(stream))),
+        encoding,
+    )
+}
+fn decode_reader(reader: BoxReader, encoding: &str) -> Result<BoxReader, AttemptFailure> {
     let reader: BoxReader = match encoding.trim().to_ascii_lowercase().as_str() {
         "" | "identity" => Box::new(reader),
         "gzip" => Box::new(BufReader::new(GzipDecoder::new(reader))),
-        "deflate" => Box::new(BufReader::new(DeflateDecoder::new(reader))),
+        "deflate" => Box::new(BufReader::new(ZlibDecoder::new(reader))),
         "zstd" => Box::new(BufReader::new(ZstdDecoder::new(reader))),
         _ => {
             return Err(AttemptFailure {
@@ -469,13 +561,10 @@ async fn send_bridge_event(
     sender: &mpsc::Sender<Result<Frame, Failure>>,
 ) -> Result<bool, Failure> {
     if data == b"[DONE]" {
-        return sender
-            .send(Ok(Frame::text(r#"{"type":"response.done"}"#.to_owned())))
-            .await
-            .map(|_| true)
-            .map_err(|_| (1000, "bridge client closed"));
+        // A transport sentinel is not a Responses completion event.
+        return Ok(true);
     }
-    if serde_json::from_slice::<serde_json::Value>(data).is_err() {
+    if !serde_json::from_slice::<serde_json::Value>(data).is_ok_and(|v| v.is_object()) {
         return Err((1011, "bridge returned invalid SSE JSON"));
     }
     let payload = std::str::from_utf8(data)
@@ -487,23 +576,14 @@ async fn send_bridge_event(
         .map(|_| false)
         .map_err(|_| (1000, "bridge client closed"))
 }
-async fn bridge_events(
-    mut reader: BoxReader,
-    sender: mpsc::Sender<Result<Frame, Failure>>,
-    mut cancel: watch::Receiver<bool>,
-) {
+async fn bridge_events(mut reader: BoxReader, sender: mpsc::Sender<Result<Frame, Failure>>) {
     let mut line = Vec::with_capacity(256);
     let mut data = Vec::new();
     loop {
         line.clear();
-        let read = tokio::select! {
-            _ = cancel.changed() => return,
-            result = reader.read_until(b'\n', &mut line) => result,
-        };
+        let read = bounded_line(&mut reader, &mut line).await;
         let Ok(size) = read else {
-            let _ = sender
-                .send(Err((1011, "bridge response read failed")))
-                .await;
+            let _ = sender.send(Err(read.unwrap_err())).await;
             return;
         };
         if size == 0 {
@@ -546,6 +626,83 @@ async fn bridge_events(
         }
     }
 }
+async fn bounded_line(reader: &mut BoxReader, line: &mut Vec<u8>) -> Result<usize, Failure> {
+    loop {
+        let bytes = reader
+            .fill_buf()
+            .await
+            .map_err(|_| (1013, "bridge response read failed"))?;
+        if bytes.is_empty() {
+            return Ok(line.len());
+        }
+        let count = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |n| n + 1);
+        if line.len() + count > MAX_SSE_EVENT {
+            return Err((1009, "bridge event too large"));
+        }
+        let end = bytes[count - 1] == b'\n';
+        line.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if end {
+            return Ok(line.len());
+        }
+    }
+}
+
+fn policy_rejection(frame: &Frame) -> bool {
+    value(frame).is_some_and(|v| {
+        v.pointer("/response/error/code")
+            .or_else(|| v.pointer("/error/code"))
+            .is_some_and(|code| code == "cyber_policy")
+    })
+}
+fn first_event_failure(frame: &Frame) -> Option<AttemptFailure> {
+    if policy_rejection(frame) {
+        return None;
+    }
+    let v = value(frame)?;
+    let mut observation = super::protocol::Observation::default();
+    observation.value(&v);
+    if observation.terminal != Some(super::protocol::Terminal::Failure) {
+        return None;
+    }
+    let error = v
+        .pointer("/response/error")
+        .or_else(|| v.get("error"))
+        .unwrap_or(&v);
+    let code = error
+        .get("code")
+        .or_else(|| error.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let status = v
+        .get("status")
+        .or_else(|| error.get("status"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u16::try_from(v).ok())
+        .unwrap_or(502);
+    let capacity = matches!(
+        code,
+        "rate_limit_exceeded"
+            | "rate_limit_error"
+            | "overloaded_error"
+            | "model_capacity_exceeded"
+            | "server_is_overloaded"
+            | "slow_down"
+            | "usage_limit_reached"
+    ) || forward::capacity_message(
+        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+        frame.payload(),
+    );
+    Some(AttemptFailure {
+        status: Some(if capacity { 429 } else { status }),
+        retry: None,
+        capacity,
+        unsupported: false,
+    })
+}
 async fn upstream_bridge(
     route: &Route,
     uri: &Uri,
@@ -553,6 +710,7 @@ async fn upstream_bridge(
     settings: &Settings,
     first: &Frame,
 ) -> Result<BridgeTurn, AttemptFailure> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(settings.first_byte_seconds);
     let payload = bridge_payload(first).map_err(|(status, _)| AttemptFailure {
         status: Some(status),
         retry: None,
@@ -573,6 +731,7 @@ async fn upstream_bridge(
     forward::clean_headers(headers, false);
     headers.remove(header::HOST);
     headers.remove(header::CONTENT_LENGTH);
+    headers.remove(header::CONTENT_ENCODING);
     headers.remove(header::UPGRADE);
     headers.remove("x-api-key");
     for name in [
@@ -603,15 +762,14 @@ async fn upstream_bridge(
         header::HeaderValue::from_static("text/event-stream"),
     );
     headers.insert(
+        header::ACCEPT_ENCODING,
+        header::HeaderValue::from_static("gzip, deflate, zstd"),
+    );
+    headers.insert(
         header::CONTENT_LENGTH,
         header::HeaderValue::from(payload.len() as u64),
     );
-    let response = match tokio::time::timeout(
-        Duration::from_secs(settings.first_byte_seconds),
-        route.client.request(request),
-    )
-    .await
-    {
+    let response = match tokio::time::timeout_at(deadline, route.client.request(request)).await {
         Ok(Ok(response)) => response,
         Ok(Err(_error)) => {
             return Err(AttemptFailure {
@@ -643,14 +801,20 @@ async fn upstream_bridge(
             .and_then(|h| h.to_str().ok())
             .unwrap_or("identity")
             .to_owned();
-        let prefix = response_prefix(response.into_body(), 128 * 1024).await;
+        let prefix = if status == StatusCode::TOO_MANY_REQUESTS {
+            Vec::new()
+        } else {
+            tokio::time::timeout_at(deadline, response_prefix(response.into_body(), 128 * 1024))
+                .await
+                .unwrap_or_default()
+        };
         let decoded = replay::decode_prefix(&prefix, &encoding, 128 * 1024).unwrap_or_default();
         return Err(AttemptFailure {
             status: Some(status.as_u16()),
             retry,
             capacity: route.client_id == super::ClientId::Codex
                 && forward::capacity_message(status, &decoded),
-            unsupported: unsupported_status(status.as_u16()),
+            unsupported: matches!(status.as_u16(), 404 | 405),
         });
     }
     let content_type = response
@@ -677,18 +841,18 @@ async fn upstream_bridge(
         .unwrap_or("identity")
         .to_owned();
     let reader = decoded_reader(response.into_body(), &encoding)?;
-    let (sender, mut incoming) = mpsc::channel(2);
-    let (cancel, cancel_rx) = watch::channel(false);
-    tokio::spawn(bridge_events(reader, sender, cancel_rx));
-    let first = match tokio::time::timeout(
-        Duration::from_secs(settings.first_byte_seconds),
-        incoming.recv(),
-    )
-    .await
-    {
+    let (sender, incoming) = mpsc::channel(2);
+    let task = tokio::spawn(bridge_events(reader, sender));
+    // Own the worker before awaiting: cancelling this future also drops the
+    // HTTP body, including while the worker is blocked by downstream pressure.
+    let mut turn = BridgeTurn {
+        first: None,
+        incoming,
+        task,
+    };
+    let first = match tokio::time::timeout_at(deadline, turn.incoming.recv()).await {
         Ok(Some(Ok(frame))) => Ok(frame),
         Ok(Some(Err(_error))) => {
-            let _ = cancel.send(true);
             return Err(AttemptFailure {
                 status: None,
                 retry: None,
@@ -697,7 +861,6 @@ async fn upstream_bridge(
             });
         }
         Ok(None) | Err(_) => {
-            let _ = cancel.send(true);
             return Err(AttemptFailure {
                 status: None,
                 retry: None,
@@ -706,11 +869,12 @@ async fn upstream_bridge(
             });
         }
     }?;
-    Ok(BridgeTurn {
-        first: Some(Ok(first)),
-        incoming,
-        cancel,
-    })
+    if let Some(mut failure) = first_event_failure(&first) {
+        failure.retry = retry;
+        return Err(failure);
+    }
+    turn.first = Some(Ok(first));
+    Ok(turn)
 }
 fn turn_model(
     g: &Gateway,
@@ -750,6 +914,35 @@ async fn session(
     client: &mut Peer,
     cfg: &Settings,
     manual: bool,
+    ids: Vec<String>,
+    routes: HashMap<String, Route>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Result<(), Failure> {
+    loop {
+        match session_once(
+            g,
+            client,
+            cfg,
+            manual,
+            ids.clone(),
+            routes.clone(),
+            headers.clone(),
+            uri.clone(),
+        )
+        .await
+        {
+            Err(TURN_CANCELLED) => cancellation(client).await?,
+            result => return result,
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)]
+async fn session_once(
+    g: &Gateway,
+    client: &mut Peer,
+    cfg: &Settings,
+    manual: bool,
     mut ids: Vec<String>,
     mut routes: HashMap<String, Route>,
     headers: HeaderMap,
@@ -764,7 +957,11 @@ async fn session(
         if frame.opcode() == OpCode::Close {
             return Ok(());
         }
-        if matches!(frame.opcode(), OpCode::Ping | OpCode::Pong) {
+        if frame.opcode() == OpCode::Ping {
+            client.send(Frame::pong(frame.payload().to_vec())).await?;
+            continue;
+        }
+        if frame.opcode() == OpCode::Pong {
             continue;
         }
         if !creates(&frame) {
@@ -820,10 +1017,16 @@ async fn session(
             if *client.closed.borrow() {
                 return Ok(());
             }
-            tokio::select! {
-                result = g.0.admission.wait_capacity(&capacity_sources, forward::capacity_delay(cfg, capacity_retry_after), cfg.max_waiting) => result.map_err(rejected)?,
-                _ = client.closed.changed() => return Ok(()),
-            }
+            while_connecting(
+                client,
+                g.0.admission.wait_capacity(
+                    &capacity_sources,
+                    forward::capacity_delay(cfg, capacity_retry_after),
+                    cfg.max_waiting,
+                ),
+            )
+            .await?
+            .map_err(rejected)?;
             ids = g.routing_ids(pinned.as_deref());
             routes = ids
                 .iter()
@@ -862,12 +1065,21 @@ async fn session(
         };
         ids.retain(|id| id != &admission.route.provider.id);
         attempts += 1;
-        let mut closed = client.closed.clone();
-        let result = tokio::select! {
-            result = async { upstream_native(&admission.route, &uri, &headers, cfg).await.map(Upstream::Native) }, if uses_native_websocket(admission.route.client_id, admission.route.provider.supports_websocket) => result,
-            result = async { upstream_bridge(&admission.route, &uri, &headers, cfg, &first).await.map(|turn| Upstream::Bridge(Some(turn))) }, if !uses_native_websocket(admission.route.client_id, admission.route.provider.supports_websocket) => result,
-            _ = closed.changed() => return Ok(()),
-        };
+        let result = while_connecting(client, async {
+            if uses_native_websocket(
+                admission.route.client_id,
+                admission.route.provider.supports_websocket,
+            ) {
+                upstream_native(&admission.route, &uri, &headers, cfg)
+                    .await
+                    .map(Upstream::Native)
+            } else {
+                upstream_bridge(&admission.route, &uri, &headers, cfg, &first)
+                    .await
+                    .map(|turn| Upstream::Bridge(Some(turn)))
+            }
+        })
+        .await?;
         match result {
             Ok(upstream) => {
                 break (upstream, admission, super::protocol::Protocol::new(true));
@@ -933,19 +1145,25 @@ async fn session(
                 )?;
                 let requirement = Requirement::model(model.as_deref());
                 let mut budget = Budget::new(cfg.queue_seconds);
-                turn = Some(
-                    take_slot(
-                        g,
-                        client,
-                        std::slice::from_ref(&route),
-                        manual,
-                        cfg,
-                        &mut budget,
-                        &requirement,
-                        false,
-                    )
-                    .await?,
-                );
+                let acquired = take_slot(
+                    g,
+                    client,
+                    std::slice::from_ref(&route),
+                    manual,
+                    cfg,
+                    &mut budget,
+                    &requirement,
+                    false,
+                )
+                .await;
+                match acquired {
+                    Ok(admission) => turn = Some(admission),
+                    Err(TURN_CANCELLED) => {
+                        cancellation(client).await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
                 current_model = model;
                 protocol = Some(super::protocol::Protocol::new(true));
                 received = false;
@@ -954,7 +1172,24 @@ async fn session(
                 if matches!(&upstream, Upstream::Bridge(_))
                     && route.client_id == super::ClientId::Codex
                 {
-                    match upstream_bridge(&route, &uri, &headers, cfg, &frame).await {
+                    let opened = while_connecting(
+                        client,
+                        upstream_bridge(&route, &uri, &headers, cfg, &frame),
+                    )
+                    .await;
+                    let opened = match opened {
+                        Ok(result) => result,
+                        Err(TURN_CANCELLED) => {
+                            if let Some(mut admission) = turn.take() {
+                                admission.permits.neutral(cfg);
+                            }
+                            protocol = None;
+                            cancellation(client).await?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    match opened {
                         Ok(bridge) => upstream = Upstream::Bridge(Some(bridge)),
                         Err(failure) => {
                             if let Some(u) = &mut protocol {
@@ -967,12 +1202,14 @@ async fn session(
                                     admission.permits.rate_limited(cfg, failure.retry);
                                 } else if failure.unsupported {
                                     admission.permits.neutral(cfg);
-                                } else {
+                                } else if failure.status.is_none_or(circuit::retryable) {
                                     admission.permits.failure(cfg, failure.retry);
+                                } else {
+                                    admission.permits.neutral(cfg);
                                 }
                             }
                             return Err(if failure.unsupported {
-                                (1008, "WS_BRIDGE_UNSUPPORTED")
+                                (1008, "WS_UNSUPPORTED")
                             } else {
                                 (1013, "bridge request failed")
                             });
@@ -991,17 +1228,32 @@ async fn session(
         }
         tokio::select! {
             biased;
-            event = next_upstream(&mut upstream), if turn.is_some() => {
+            event = next_upstream(&mut upstream), if turn.is_some() || matches!(upstream, Upstream::Native(_)) => {
                 let Some(event) = event else {
                     if let Some(mut u)=protocol.take(){u.finish(Some(101),"STREAM_INTERRUPTED");}
                     if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None);  }
-                    return Err((1011, "upstream disconnected"));
+                    return Err((1013, "upstream disconnected"));
                 };
-                let frame = event?;
+                let frame = match event {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None); }
+                        return Err(error);
+                    },
+                };
                 let closing = frame.opcode() == OpCode::Close;
                 if closing {
                     if let Some(mut u)=protocol.take(){u.finish(Some(101),"STREAM_INTERRUPTED");}
                     if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None);  }
+                }
+                // Native upstreams are pinned after Upgrade. Turn-local
+                // capacity errors before output close retryably instead of
+                // sending Codex a fatal overload event or replaying context.
+                if route.client_id == super::ClientId::Codex && turn.is_some() && !received {
+                    if let Some(failure) = first_event_failure(&frame).filter(|f| f.capacity) {
+                        if let Some(mut admission) = turn.take() { admission.permits.capacity_limited(cfg, failure.retry); }
+                        return Err((1013, "upstream capacity; reconnect to retry"));
+                    }
                 }
                 if !frame.opcode().is_control() {
                     received = true;
@@ -1016,7 +1268,13 @@ async fn session(
                         if let Some(mut admission) = turn.take() {
                             if let Some(mut u)=protocol.take() {
                                 u.finish(Some(101), "UPSTREAM_ERROR");
-                                forward::settle_protocol(&u, &mut admission.permits, cfg);
+                                if route.client_id == super::ClientId::Codex && policy_rejection(&frame) {
+                                    admission.permits.neutral(cfg);
+                                } else if route.client_id == super::ClientId::Codex && first_event_failure(&frame).is_some_and(|failure| failure.capacity) {
+                                    admission.permits.capacity_limited(cfg, None);
+                                } else {
+                                    forward::settle_protocol(&u, &mut admission.permits, cfg);
+                                }
                                 if u.succeeded() { g.successful_response(&route.provider); }
                             }
 
@@ -1032,11 +1290,12 @@ async fn session(
             frame = client.incoming.recv() => {
                 let Some(frame) = frame else { return Ok(()); };
                 let closing = frame.opcode() == OpCode::Close;
-                if frame.opcode() == OpCode::Ping {
+                if frame.opcode() == OpCode::Ping && matches!(upstream, Upstream::Bridge(_)) {
                     client.send(Frame::pong(frame.payload().to_vec())).await?;
-                } else if frame.opcode() == OpCode::Pong {
+                } else if frame.opcode() == OpCode::Pong && matches!(upstream, Upstream::Bridge(_)) {
                     continue;
                 } else if closing {
+                    if let Upstream::Native(peer) = &upstream { peer.send(frame.clone()).await?; }
                     if let Upstream::Bridge(Some(bridge)) = &upstream {
                         bridge.cancel();
                     }
@@ -1051,14 +1310,12 @@ async fn session(
                     if pending.is_some() { return Err((1013, "too many pending turns")); }
                     pending = Some(frame);
                 } else if value(&frame).is_some_and(|v| v["type"] == "response.cancel")
-                    && matches!(&upstream, Upstream::Bridge(Some(_)))
+                    && matches!(&upstream, Upstream::Bridge(_))
                 {
                     if let Upstream::Bridge(Some(bridge)) = &upstream {
                         bridge.cancel();
                     }
-                    let _ = client
-                        .send(Frame::text(r#"{"type":"response.cancelled"}"#.to_owned()))
-                        .await;
+                    cancellation(client).await?;
                     if let Some(mut admission) = turn.take() {
                         if let Some(mut u) = protocol.take() {
                             u.finish(Some(101), "CANCELLED");
@@ -1070,10 +1327,13 @@ async fn session(
                     }
                 } else if let Err(e) = send_to_upstream(&mut upstream, frame).await {
                     if let Some(mut u) = protocol.take() { u.finish(Some(101), "NETWORK"); }
-                    if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None); }
+                    if let Some(mut admission) = turn.take() {
+                        if e.0 == 1008 { admission.permits.neutral(cfg); } else { admission.permits.failure(cfg, None); }
+                    }
                     return Err(e);
                 }
             },
+            _ = client.closed.changed() => return Ok(()),
             _ = tokio::time::sleep_until(deadline), if turn.is_some() => {
                 if let Some(mut u)=protocol.take(){u.finish(Some(101),if received {"STREAM_TIMEOUT"}else{"FIRST_BYTE_TIMEOUT"});}
                 if let Some(mut admission) = turn.take() { admission.permits.failure(cfg, None); }
@@ -1083,7 +1343,7 @@ async fn session(
                 } else if let Upstream::Bridge(Some(bridge)) = &upstream {
                     bridge.cancel();
                 }
-                return Err((1011, "upstream timeout"));
+                return Err((1013, "upstream timeout"));
             },
         }
     }
@@ -1111,15 +1371,12 @@ mod tests {
         let input = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\r\ndata: \"delta\"}\r\n\r\ndata: [DONE]\r\n\r\n";
         let reader: BoxReader = Box::new(BufReader::new(std::io::Cursor::new(input.to_vec())));
         let (sender, mut receiver) = mpsc::channel(4);
-        let (_cancel, cancel_rx) = watch::channel(false);
-        bridge_events(reader, sender, cancel_rx).await;
+        bridge_events(reader, sender).await;
         let first = receiver.recv().await.unwrap().unwrap();
         assert_eq!(
             first.payload().as_ref(),
             b"{\"type\":\"response.output_text.delta\",\"delta\":\n\"delta\"}"
         );
-        let done = receiver.recv().await.unwrap().unwrap();
-        assert_eq!(done.payload().as_ref(), br#"{"type":"response.done"}"#);
         assert!(receiver.recv().await.is_none());
     }
 
@@ -1128,5 +1385,91 @@ mod tests {
         assert!(uses_native_websocket(super::super::ClientId::Claude, false));
         assert!(uses_native_websocket(super::super::ClientId::Codex, true));
         assert!(!uses_native_websocket(super::super::ClientId::Codex, false));
+    }
+
+    #[tokio::test]
+    async fn bridge_event_limit_applies_before_newline_and_after_decompression() {
+        use std::io::Write;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&vec![b'x'; MAX_SSE_EVENT + 100]).unwrap();
+        let reader: BoxReader =
+            Box::new(BufReader::new(std::io::Cursor::new(gzip.finish().unwrap())));
+        let (sender, mut incoming) = mpsc::channel(2);
+        bridge_events(decode_reader(reader, "gzip").unwrap(), sender).await;
+        assert!(matches!(incoming.recv().await, Some(Err((1009, _)))));
+        assert!(incoming.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_backpressure_is_bounded_and_dropping_turn_aborts_reader() {
+        struct ReadGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ReadGuard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_ended = ended.clone();
+        let input =
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n".repeat(100);
+        let reader: BoxReader = Box::new(BufReader::new(std::io::Cursor::new(input.into_bytes())));
+        let (sender, incoming) = mpsc::channel(2);
+        let task = tokio::spawn(async move {
+            let _guard = ReadGuard(worker_ended);
+            bridge_events(reader, sender).await;
+        });
+        let turn = BridgeTurn {
+            first: None,
+            incoming,
+            task,
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while turn.incoming.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!turn.task.is_finished());
+        drop(turn);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !ended.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn keepalive_preserves_control_frames_and_does_not_leak_its_own_pong() {
+        let (a, b) = tokio::io::duplex(4096);
+        let peer = WebSocket::from_stream(a, yawc::Role::Server, Options::default()).unwrap();
+        let mut peer = Peer::new(peer, Some(Duration::from_millis(20)));
+        let mut client = WebSocket::from_stream(b, yawc::Role::Client, Options::default()).unwrap();
+        let ping = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ping.opcode(), OpCode::Ping);
+        client
+            .send(Frame::pong(ping.payload().clone()))
+            .await
+            .unwrap();
+        client.send(Frame::pong("unrelated-control")).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(1), peer.incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.opcode(), OpCode::Pong);
+        assert_eq!(got.payload().as_ref(), b"unrelated-control");
+        // Data writes and heartbeat share one writer rather than racing sinks.
+        peer.send(Frame::text("unchanged")).await.unwrap();
+        loop {
+            let got = client.next().await.unwrap();
+            if got.opcode() == OpCode::Text {
+                assert_eq!(got.payload().as_ref(), b"unchanged");
+                break;
+            }
+        }
     }
 }

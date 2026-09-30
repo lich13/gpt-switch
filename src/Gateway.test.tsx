@@ -86,6 +86,7 @@ describe("gateway controls", () => {
     const checkbox = screen.getByRole("checkbox", { name: "原生 WebSocket" });
     expect(checkbox).not.toBeChecked();
     await user.click(checkbox);
+    await user.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() =>
       expect(mock.command).toHaveBeenCalledWith("update_gateway", {
         clientId: "codex",

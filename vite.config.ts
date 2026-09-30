@@ -6,6 +6,7 @@ export default defineConfig({
   clearScreen: false,
   test: {
     environment: "jsdom",
+    maxWorkers: process.env.CI ? 2 : undefined,
     setupFiles: ["./src/test-setup.ts"],
     restoreMocks: true,
   },

@@ -490,6 +490,7 @@ function GatewayContent({
       {dialog?.kind === "settings" && (
         <ProviderSettings
           provider={dialog.item}
+          onDirtyChange={onDirtyChange}
           clientId={clientId}
           revision={state.revision}
           disabled={busy}

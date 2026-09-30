@@ -39,6 +39,11 @@ The native Responses WebSocket scheduling boundary follows the lifecycle describ
 
 https://platform.openai.com/docs/api-reference/responses-streaming
 
+Additional behavioral regression references: Sub2API PRs #5469 (large first frame), #5453 (per-turn admission), #6708 (turn-local quota errors), #6417 (Codex capacity errors), #6293 (request-level policy attribution), #3172 (Ping keepalive), and #4895 (early upstream failure). Tests and fixes are independently written in Rust; no code or tests from these PRs are copied. Native connections remain pinned after Upgrade, and output payloads are not rewritten.
+
+https://github.com/Wei-Shaw/sub2api/pull/6417
+https://github.com/Wei-Shaw/sub2api/pull/3172
+
 ## yawc 0.4.2
 
 Unmodified WebSocket/deflate dependency, MPL-2.0. The full license is bundled in licenses/yawc-MPL-2.0.txt. Source is available at https://crates.io/api/v1/crates/yawc/0.4.2/download and https://github.com/infinitefield/yawc .

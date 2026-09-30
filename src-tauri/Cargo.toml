@@ -34,7 +34,7 @@ http-body-util = "0.1"
 bytes = "1"
 futures-util = "0.3"
 async-stream = "0.3"
-async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "zstd"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "zstd"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"

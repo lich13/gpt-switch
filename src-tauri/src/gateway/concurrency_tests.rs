@@ -781,7 +781,7 @@ async fn websocket_waiting_disconnect_and_timeout_release_capacity() {
     drop(waiting);
     until(|| g.view().waiting_requests == 0).await;
     let frame = ws_next(&mut ws).await;
-    assert_eq!(frame.close_code().map(u16::from), Some(1011));
+    assert_eq!(frame.close_code().map(u16::from), Some(1013));
     until(|| g.view().providers[0].active_requests == 0).await;
     g.stop().await.unwrap();
 }

@@ -106,7 +106,9 @@ it("keeps provider naming separate from selection and exposes reset in the quick
     expectedRevision: gatewayDemo.revision,
   });
   await user.click(
-    screen.getByRole("button", { name: `${gatewayDemo.providers[0].name} 重置熔断` }),
+    screen.getByRole("button", {
+      name: `${gatewayDemo.providers[0].name} 重置熔断`,
+    }),
   );
   expect(mock.command).toHaveBeenCalledWith("update_gateway", {
     clientId: "codex",
@@ -138,6 +140,32 @@ it("can restore a newer saved credential without auto-writing the auth file", as
     id: "personal",
     expectedRevision: demo.authRevision,
   });
+});
+it("syncs the bridge badge and opens the shared provider settings without selecting it", async () => {
+  const user = userEvent.setup();
+  render(<QuickPanel />);
+  await screen.findByText("api.example.com");
+  act(() =>
+    mock.listeners.get("gateway-state")!({
+      ...gatewayDemo,
+      providers: gatewayDemo.providers.map((p) => ({
+        ...p,
+        supportsWebsocket: false,
+      })),
+    }),
+  );
+  expect(screen.getAllByText("HTTP 桥接").length).toBeGreaterThan(0);
+  await user.click(
+    screen.getByRole("button", { name: "api.example.com 设置" }),
+  );
+  expect(mock.command).toHaveBeenCalledWith("open_main", {
+    page: "gateway",
+    clientId: "codex",
+    providerId: "primary",
+  });
+  expect(
+    mock.command.mock.calls.some(([name]) => name === "update_gateway"),
+  ).toBe(false);
 });
 it("quick concurrency editing keeps drafts during events and consumes Escape before the panel", async () => {
   const user = userEvent.setup();

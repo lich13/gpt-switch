@@ -1782,6 +1782,12 @@ select:focus-visible {
   display: grid;
   gap: 18px;
 }
+.settings-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
 .settings-toggle {
   display: flex;
   align-items: center;
