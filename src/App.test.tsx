@@ -4,6 +4,7 @@ import {
   waitFor,
   fireEvent,
   act,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, it, expect, vi } from "vitest";
@@ -164,21 +165,33 @@ describe("user workflows", () => {
     expect(screen.getByLabelText("experimental_bearer_token")).toHaveValue(
       "draft-fixture-key",
     );
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    act(() => mocks.listeners.get("navigate")?.("accounts"));
-    expect(confirm).toHaveBeenCalledOnce();
+    await act(async () => {
+      void mocks.listeners.get("navigate")?.("accounts");
+    });
+    await u.click(
+      within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+        "button",
+        { name: "取消" },
+      ),
+    );
     expect(screen.getByLabelText("base_url")).toHaveValue(
       "https://draft.example.invalid/v1",
     );
-    confirm.mockReturnValue(true);
-    act(() => mocks.listeners.get("navigate")?.("accounts"));
+    await act(async () => {
+      void mocks.listeners.get("navigate")?.("accounts");
+    });
+    await u.click(
+      within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+        "button",
+        { name: "放弃修改" },
+      ),
+    );
     expect(
       screen.queryByLabelText("experimental_bearer_token"),
     ).not.toBeInTheDocument();
     await u.click(screen.getByRole("button", { name: "网关" }));
     await u.click(await screen.findByRole("button", { name: "添加" }));
     expect(screen.getByLabelText("experimental_bearer_token")).toHaveValue("");
-    confirm.mockRestore();
   });
   it("queues a provider import behind the active API draft without replacing it", async () => {
     const u = userEvent.setup();
@@ -344,7 +357,6 @@ describe("user workflows", () => {
   });
   it("asks before abandoning a config draft", async () => {
     const u = userEvent.setup();
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     render(<App />);
     await screen.findByRole("heading", { name: "账号", level: 1 });
     await u.click(screen.getByRole("button", { name: "配置" }));
@@ -352,7 +364,12 @@ describe("user workflows", () => {
       target: { value: 'model="draft"' },
     });
     await u.click(screen.getByRole("button", { name: "账号" }));
-    expect(confirm).toHaveBeenCalled();
+    await u.click(
+      within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+        "button",
+        { name: "取消" },
+      ),
+    );
     expect(screen.getByLabelText("TOML 编辑器")).toHaveValue('model="draft"');
   });
 });

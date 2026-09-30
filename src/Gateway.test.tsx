@@ -301,10 +301,6 @@ describe("client isolation", () => {
 
   it("keeps an unsaved settings draft when switching is refused and discards it only after confirmation", async () => {
     const user = userEvent.setup();
-    const confirm = vi
-      .spyOn(window, "confirm")
-      .mockReturnValueOnce(false)
-      .mockReturnValueOnce(true);
     render(<Gateway notify={() => {}} />);
     await screen.findByLabelText(`${state.providers[0].name} 操作`);
     await user.click(screen.getByText("高级设置", { selector: "summary" }));
@@ -312,7 +308,12 @@ describe("client isolation", () => {
     await user.clear(port);
     await user.type(port, "23456");
     await user.click(screen.getByRole("button", { name: "Claude Code" }));
-    expect(confirm).toHaveBeenCalledTimes(1);
+    await user.click(
+      within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+        "button",
+        { name: "取消" },
+      ),
+    );
     expect(port).toHaveValue(23456);
     expect(screen.getByRole("button", { name: "Codex" })).toHaveAttribute(
       "aria-pressed",
@@ -323,8 +324,13 @@ describe("client isolation", () => {
     });
 
     await user.click(screen.getByRole("button", { name: "Claude Code" }));
+    await user.click(
+      within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+        "button",
+        { name: "放弃修改" },
+      ),
+    );
     await screen.findByLabelText(`${claudeState.providers[0].name} 操作`);
-    expect(confirm).toHaveBeenCalledTimes(2);
     await user.click(screen.getByText("高级设置", { selector: "summary" }));
     expect(screen.getByRole("spinbutton", { name: "本地端口" })).toHaveValue(
       claudeState.settings.port,
@@ -334,7 +340,9 @@ describe("client isolation", () => {
     ).toBe(false);
     await user.click(screen.getByRole("button", { name: "Codex" }));
     await screen.findByLabelText(`${state.providers[0].name} 操作`);
-    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(
+      screen.queryByRole("dialog", { name: "确认操作" }),
+    ).not.toBeInTheDocument();
     await user.click(screen.getByText("高级设置", { selector: "summary" }));
     expect(screen.getByRole("spinbutton", { name: "本地端口" })).toHaveValue(
       state.settings.port,

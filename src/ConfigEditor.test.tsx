@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, it, expect, vi } from "vitest";
@@ -155,7 +156,6 @@ it("locks managed connection fields and keeps preferences editable", async () =>
 });
 it("restores previous configuration only into the draft and confirms client changes", async () => {
   const u = userEvent.setup();
-  const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
   mount();
   await screen.findByLabelText("默认模型");
   await u.click(screen.getByLabelText("恢复上次配置"));
@@ -164,7 +164,29 @@ it("restores previous configuration only into the draft and confirms client chan
     mocks.command.mock.calls.some(([name]) => name === "save_config"),
   ).toBe(false);
   await u.click(screen.getByRole("button", { name: "Codex" }));
-  expect(confirm).toHaveBeenCalled();
+  const dialog = await screen.findByRole("dialog", { name: "确认操作" });
+  await u.click(within(dialog).getByRole("button", { name: "取消" }));
   expect(screen.getByText("settings.json")).toBeInTheDocument();
-  confirm.mockRestore();
+  expect(screen.getByText("未保存")).toBeInTheDocument();
+  await u.click(screen.getByLabelText("撤销草稿并重新读取"));
+  await u.click(
+    within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+      "button",
+      { name: "取消" },
+    ),
+  );
+  expect(screen.getByText("未保存")).toBeInTheDocument();
+  await u.click(screen.getByLabelText("撤销草稿并重新读取"));
+  await u.click(
+    within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+      "button",
+      { name: "放弃修改" },
+    ),
+  );
+  await waitFor(() =>
+    expect(screen.queryByText("未保存")).not.toBeInTheDocument(),
+  );
+  expect(
+    mocks.command.mock.calls.some(([name]) => name === "save_config"),
+  ).toBe(false);
 });

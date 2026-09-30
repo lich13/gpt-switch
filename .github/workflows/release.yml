@@ -71,7 +71,7 @@ jobs:
           if (Test-Path "$installDir/gpt-switch.exe") { throw 'Legacy binary remains' }
           $uninstall = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
           $entry = Get-ItemProperty "$uninstall/gpt-Switch"
-          if ($entry.DisplayName -ne 'lich13-switch' -or $entry.DisplayVersion -ne '0.9.0' -or (Test-Path "$uninstall/lich13-switch")) { throw 'Duplicate or invalid upgrade registration' }
+          if ($entry.DisplayName -ne 'lich13-switch' -or $entry.DisplayVersion -ne '0.9.1' -or (Test-Path "$uninstall/lich13-switch")) { throw 'Duplicate or invalid upgrade registration' }
           if ((Get-Content $marker).Trim() -ne 'preserve-user-data' -or (Get-Item $protocol).GetValue('') -ne $beforeProtocol) { throw 'Upgrade changed user data or default protocol' }
           $notice = Get-Content (Join-Path $installDir 'THIRD_PARTY_NOTICES.md') -Raw
           if (!$notice.Contains('Copyright (c) 2025 Jason Young')) { throw 'Third-party notice missing' }

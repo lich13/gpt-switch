@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import type { ClientId } from "./types";
+import { confirmAction } from "./confirmation";
 
 export const clientName = (client: ClientId) =>
   client === "claude" ? "Claude Code" : "Codex";
@@ -13,11 +14,11 @@ export function useClientSelection(surface: "main" | "quick" | "config") {
     }
   });
   const select = useCallback(
-    (next: ClientId, dirty = false) => {
+    async (next: ClientId, dirty = false) => {
       if (next === client) return true;
       if (
         (dirty || document.querySelector("[data-provider-draft]")) &&
-        !windowConfirm()
+        !(await confirmAction("切换客户端会丢弃未保存的修改。"))
       )
         return false;
       try {
@@ -32,8 +33,6 @@ export function useClientSelection(surface: "main" | "quick" | "config") {
   );
   return [client, select] as const;
 }
-const windowConfirm = () =>
-  window.confirm("切换客户端会丢弃未保存的表单，是否继续？");
 export default function ClientSelection({
   client,
   select,

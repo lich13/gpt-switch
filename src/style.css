@@ -1164,6 +1164,11 @@ select:focus-visible {
   min-width: 72px;
   min-height: 34px;
 }
+.confirmation-message {
+  margin: 0;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
 .modal-body > .form-error {
   margin: 16px 0 0;
 }

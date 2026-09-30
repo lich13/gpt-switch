@@ -199,18 +199,15 @@ it("switches and remembers the quick client independently and routes actions usi
   view.unmount();
   render(<QuickPanel />);
   await screen.findByText(claudeGatewayDemo.providers[0].name);
-  expect(
-    screen.getByRole("button", { name: "Claude Code" }),
-  ).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "Claude Code" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
   expect(localStorage.getItem("lich13-switch.main.client")).toBe("codex");
 });
 
 it("protects an unsaved quick concurrency draft until a client switch is confirmed", async () => {
   const user = userEvent.setup();
-  const confirm = vi
-    .spyOn(window, "confirm")
-    .mockReturnValueOnce(false)
-    .mockReturnValueOnce(true);
   render(<QuickPanel />);
   await user.click(
     await screen.findByRole("button", { name: "api.example.com 并发上限" }),
@@ -224,7 +221,12 @@ it("protects an unsaved quick concurrency draft until a client switch is confirm
       { name: "Claude Code" },
     ),
   );
-  expect(confirm).toHaveBeenCalledTimes(1);
+  await user.click(
+    within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+      "button",
+      { name: "取消" },
+    ),
+  );
   expect(cap).toHaveValue(12);
   expect(
     screen.getByRole("dialog", { name: "api.example.com 并发上限" }),
@@ -238,8 +240,13 @@ it("protects an unsaved quick concurrency draft until a client switch is confirm
       { name: "Claude Code" },
     ),
   );
+  await user.click(
+    within(await screen.findByRole("dialog", { name: "确认操作" })).getByRole(
+      "button",
+      { name: "放弃修改" },
+    ),
+  );
   await screen.findByText(claudeGatewayDemo.providers[0].name);
-  expect(confirm).toHaveBeenCalledTimes(2);
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   expect(
     mock.command.mock.calls.some(([name]) => name === "update_gateway"),

@@ -33,6 +33,7 @@ import ClientSelection, { useClientSelection } from "./ClientSelection";
 import ClaudeSettings from "./ClaudeSettings";
 import { changes, get, sensitive } from "./claude-settings";
 import Modal from "./Modal";
+import { confirmAction } from "./confirmation";
 
 class Secret extends WidgetType {
   toDOM() {
@@ -421,8 +422,12 @@ function EditorContent({
             aria-label="恢复上次配置"
             title="恢复上次配置"
             disabled={!doc?.canRestore || busy}
-            onClick={() => {
-              if (dirty && !confirm("恢复会替换当前草稿，是否继续？")) return;
+            onClick={async () => {
+              if (
+                dirty &&
+                !(await confirmAction("恢复上次配置会替换当前草稿。", "恢复"))
+              )
+                return;
               void command<string>("read_previous_config", { clientId })
                 .then(update)
                 .catch((e) => setError(errorOf(e)));
@@ -435,8 +440,11 @@ function EditorContent({
             aria-label={dirty ? "撤销草稿并重新读取" : "重新读取配置"}
             title={dirty ? "撤销草稿并重新读取" : "重新读取配置"}
             disabled={busy}
-            onClick={() => {
-              if (!dirty || confirm("重新读取会丢弃未保存的草稿，是否继续？"))
+            onClick={async () => {
+              if (
+                !dirty ||
+                (await confirmAction("重新读取会丢弃未保存的草稿。"))
+              )
                 void load();
             }}
           >

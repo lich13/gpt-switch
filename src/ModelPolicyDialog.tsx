@@ -1,4 +1,5 @@
 import type { ClientId } from "./types";
+import { confirmAction } from "./confirmation";
 import { useEffect, useRef, useState } from "react";
 import { RefreshCw, Search, X } from "lucide-react";
 import { command } from "./bridge";
@@ -67,8 +68,8 @@ export default function ModelPolicyDialog({
     onDirtyChange?.(dirty);
     return () => onDirtyChange?.(false);
   }, [dirty, onDirtyChange]);
-  const cancel = () => {
-    if (!dirty || confirm("丢弃未保存的模型白名单？")) close();
+  const cancel = async () => {
+    if (!dirty || (await confirmAction("丢弃未保存的模型白名单？"))) close();
   };
   const models = [...new Set([...selected, ...(catalog?.models ?? [])])].filter(
     (m) => m.toLowerCase().includes(query.toLowerCase()),

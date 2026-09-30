@@ -1,3 +1,4 @@
+import { confirmAction } from "./confirmation";
 import {
   Suspense,
   lazy,
@@ -90,23 +91,26 @@ export default function App() {
   dirtyRef.current = dirty;
   pageRef.current = page;
   const notify = useCallback((s: string) => setMessage(s), []);
-  const navigate = useCallback((next: "accounts" | "config" | "gateway") => {
-    if (next === pageRef.current) return;
-    if (
-      gatewayDirty.current &&
-      !window.confirm("离开当前页面会丢弃未保存的表单，是否继续？")
-    )
-      return;
-    if (
-      pageRef.current === "config" &&
-      next !== "config" &&
-      dirtyRef.current &&
-      !window.confirm("离开配置页会丢弃未保存的草稿，是否继续？")
-    )
-      return;
-    setPage(next);
-    if (next !== "config") setDirty(false);
-  }, []);
+  const navigate = useCallback(
+    async (next: "accounts" | "config" | "gateway") => {
+      if (next === pageRef.current) return;
+      if (
+        gatewayDirty.current &&
+        !(await confirmAction("离开当前页面会丢弃未保存的表单。"))
+      )
+        return;
+      if (
+        pageRef.current === "config" &&
+        next !== "config" &&
+        dirtyRef.current &&
+        !(await confirmAction("离开配置页会丢弃未保存的草稿。"))
+      )
+        return;
+      setPage(next);
+      if (next !== "config") setDirty(false);
+    },
+    [],
+  );
   useEffect(() => {
     const menus = () =>
       document.querySelectorAll<HTMLDetailsElement>(
@@ -156,10 +160,10 @@ export default function App() {
         "navigate",
         (p) =>
           p === "settings"
-            ? (() => {
+            ? (async () => {
                 if (
                   (gatewayDirty.current || dirtyRef.current) &&
-                  !window.confirm("打开设置会丢弃当前未保存的草稿，是否继续？")
+                  !(await confirmAction("打开设置会丢弃未保存的草稿。"))
                 )
                   return;
                 setPage("accounts");
@@ -170,10 +174,10 @@ export default function App() {
       ],
       [
         "provider-settings",
-        (p) => {
+        async (p) => {
           if (
             (gatewayDirty.current || dirtyRef.current) &&
-            !window.confirm("打开供应商设置会丢弃未保存的草稿，是否继续？")
+            !(await confirmAction("打开供应商设置会丢弃未保存的草稿。"))
           )
             return;
           setPage("gateway");

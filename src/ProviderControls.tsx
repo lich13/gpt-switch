@@ -50,7 +50,12 @@ export default function ProviderControls({
     input.current?.focus();
     input.current?.select();
     const outside = (event: PointerEvent) => {
-      if ((event.target as Element)?.closest?.("[data-client-switch]")) return;
+      if (
+        (event.target as Element)?.closest?.(
+          "[data-client-switch], [data-confirmation]",
+        )
+      )
+        return;
       if (
         !pending.current &&
         !popover.current?.contains(event.target as Node) &&

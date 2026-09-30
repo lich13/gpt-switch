@@ -124,6 +124,7 @@ function QuickContent({
       if (
         event.key === "Escape" &&
         !event.isComposing &&
+        !document.querySelector("[data-confirmation] dialog[open]") &&
         !event.defaultPrevented
       )
         void command("hide_quick");

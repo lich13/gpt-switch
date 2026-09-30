@@ -3,6 +3,7 @@ import ClientSelection, {
   clientName,
 } from "./ClientSelection";
 import type { ClientId } from "./types";
+import { confirmAction } from "./confirmation";
 import ProviderSettings from "./ProviderSettings";
 import ProviderControls from "./ProviderControls";
 import SortableProviders, { type ProviderCommit } from "./SortableProviders";
@@ -398,8 +399,13 @@ function GatewayContent({
                         <button
                           className="danger"
                           disabled={busy}
-                          onClick={() => {
-                            if (confirm(`删除供应商“${p.name}”？`))
+                          onClick={async () => {
+                            if (
+                              await confirmAction(
+                                `删除供应商“${p.name}”？`,
+                                "删除",
+                              )
+                            )
                               run(() =>
                                 edit({ op: "deleteProvider", id: p.id }),
                               );
