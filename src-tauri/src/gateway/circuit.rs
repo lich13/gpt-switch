@@ -23,6 +23,7 @@ pub struct Health {
     pub requests: u32,
     pub retry_in: u64,
     pub cooldown_reason: Option<String>,
+    pub protected_single_provider: bool,
     pub probe_in_flight: bool,
     pub available: bool,
     pub revision: u64,
@@ -40,6 +41,7 @@ struct State {
     retry_reason: Option<&'static str>,
     retry_probe: bool,
     retry_generation: u64,
+    protected_single_provider: bool,
     revision: u64,
 }
 impl Default for State {
@@ -57,6 +59,7 @@ impl Default for State {
             retry_reason: None,
             retry_probe: false,
             retry_generation: 0,
+            protected_single_provider: false,
             revision: 0,
         }
     }
@@ -83,6 +86,7 @@ pub enum Outcome {
     Success,
     Failure(Option<Duration>),
     RateLimited(Option<Duration>),
+    CapacityLimited(Option<Duration>),
     Neutral,
 }
 pub struct Permit {
@@ -91,6 +95,7 @@ pub struct Permit {
     half_open: bool,
     retry_generation: u64,
     retry_probe: bool,
+    protected_single_provider: bool,
     complete: bool,
 }
 impl Circuit {
@@ -116,12 +121,21 @@ impl Circuit {
             } else {
                 s.retry_reason.map(str::to_owned)
             },
+            protected_single_provider: s.protected_single_provider,
             probe_in_flight: s.probe || s.retry_probe,
             available: s.available(),
             revision: s.revision,
         }
     }
-    pub fn acquire(&self, _manual: bool) -> Option<Permit> {
+    #[cfg(test)]
+    pub fn acquire(&self, manual: bool) -> Option<Permit> {
+        self.acquire_with_protection(manual, false)
+    }
+    pub fn acquire_with_protection(
+        &self,
+        _manual: bool,
+        protected_single_provider: bool,
+    ) -> Option<Permit> {
         let mut s = self.0.lock().unwrap();
         if !s.available() {
             return None;
@@ -142,8 +156,29 @@ impl Circuit {
             half_open,
             retry_generation: s.retry_generation,
             retry_probe,
+            protected_single_provider,
             complete: false,
         })
+    }
+    pub fn set_single_provider_protection(&self, enabled: bool, cooldown: Duration) {
+        let mut s = self.0.lock().unwrap();
+        if enabled {
+            if s.phase == CircuitState::Open {
+                let remaining = s
+                    .until
+                    .take()
+                    .map(|until| until.saturating_duration_since(Instant::now()))
+                    .unwrap_or_default();
+                s.phase = CircuitState::Closed;
+                s.probe = false;
+                s.generation += 1;
+                s.cooldown(remaining.max(cooldown), "single_provider_protected");
+            }
+            s.protected_single_provider = true;
+        } else {
+            s.protected_single_provider = false;
+        }
+        s.revision += 1;
     }
     pub fn reset(&self) {
         let mut s = self.0.lock().unwrap();
@@ -156,7 +191,17 @@ impl Circuit {
     }
 }
 impl Permit {
-    pub fn finish(mut self, outcome: Outcome, cfg: &Settings) {
+    #[cfg(test)]
+    pub fn finish(self, outcome: Outcome, cfg: &Settings) {
+        self.finish_with_policy(outcome, cfg, false);
+    }
+    pub fn finish_with_policy(
+        mut self,
+        outcome: Outcome,
+        cfg: &Settings,
+        protected_single_provider: bool,
+    ) {
+        let protected_single_provider = protected_single_provider || self.protected_single_provider;
         let mut s = self.circuit.0.lock().unwrap();
         self.complete = true;
         if self.retry_probe && self.retry_generation == s.retry_generation {
@@ -171,16 +216,41 @@ impl Permit {
         s.revision += 1;
         match outcome {
             Outcome::Neutral => (),
-            Outcome::RateLimited(retry) => s.cooldown(
-                retry.unwrap_or(Duration::from_secs(cfg.rate_limit_seconds)),
-                "rate_limit",
-            ),
+            Outcome::RateLimited(retry) => {
+                let base = retry.unwrap_or(Duration::from_secs(cfg.rate_limit_seconds));
+                let delay = if protected_single_provider {
+                    base.max(Duration::from_secs(cfg.capacity_retry_seconds))
+                } else {
+                    base
+                };
+                s.cooldown(
+                    delay,
+                    if protected_single_provider {
+                        "capacity_retry"
+                    } else {
+                        "rate_limit"
+                    },
+                );
+                s.protected_single_provider |= protected_single_provider;
+            }
+            Outcome::CapacityLimited(retry) => {
+                // Capacity cooldown is separate from the normal 429/fault
+                // policy. Even when the upstream sends a shorter hint, keep
+                // the Codex capacity retry floor so another request does not
+                // immediately stampede the same unavailable model.
+                let delay = retry
+                    .unwrap_or_else(|| Duration::from_secs(cfg.rate_limit_seconds))
+                    .max(Duration::from_secs(cfg.capacity_retry_seconds));
+                s.cooldown(delay, "capacity_retry");
+                s.protected_single_provider |= protected_single_provider;
+            }
             Outcome::Success => {
                 if self.retry_probe && self.retry_generation == s.retry_generation {
                     s.retry_until = None;
                     s.retry_reason = None;
                 }
                 s.failures = 0;
+                s.protected_single_provider = false;
                 s.total = s.total.saturating_add(1);
                 if s.phase == CircuitState::HalfOpen {
                     s.successes += 1;
@@ -194,16 +264,23 @@ impl Permit {
                 }
             }
             Outcome::Failure(retry) => {
-                if let Some(retry) = retry {
+                if protected_single_provider {
+                    let delay = retry
+                        .unwrap_or_else(|| Duration::from_secs(cfg.cooldown_seconds))
+                        .max(Duration::from_secs(cfg.capacity_retry_seconds));
+                    s.cooldown(delay, "single_provider_protected");
+                    s.protected_single_provider = true;
+                } else if let Some(retry) = retry {
                     s.cooldown(retry, "retry_after");
                 }
                 s.failures = s.failures.saturating_add(1);
                 s.failed = s.failed.saturating_add(1);
                 s.total = s.total.saturating_add(1);
-                if s.phase != CircuitState::Closed
-                    || s.failures >= cfg.failure_threshold
-                    || (s.total >= cfg.min_requests
-                        && f64::from(s.failed) / f64::from(s.total) >= cfg.error_rate)
+                if !protected_single_provider
+                    && (s.phase != CircuitState::Closed
+                        || s.failures >= cfg.failure_threshold
+                        || (s.total >= cfg.min_requests
+                            && f64::from(s.failed) / f64::from(s.total) >= cfg.error_rate))
                 {
                     s.phase = CircuitState::Open;
                     s.probe = false;
@@ -367,5 +444,28 @@ mod cooldown_tests {
             .finish(Outcome::Failure(None), &cfg);
         assert_eq!(c.health().state, CircuitState::Open);
         assert_eq!(c.health().retry_in, 60);
+    }
+
+    #[test]
+    fn protected_single_provider_never_opens_after_repeated_failures() {
+        let c = Circuit::default();
+        let cfg = Settings {
+            capacity_retry_seconds: 1,
+            ..Settings::default()
+        };
+        for _ in 0..8 {
+            c.set_single_provider_protection(true, Duration::from_secs(1));
+            c.0.lock().unwrap().retry_until = Some(Instant::now());
+            c.acquire_with_protection(false, true)
+                .unwrap()
+                .finish_with_policy(Outcome::Failure(None), &cfg, true);
+            assert_eq!(c.health().state, CircuitState::Closed);
+            c.0.lock().unwrap().retry_until = Some(Instant::now());
+        }
+        assert!(c.health().protected_single_provider);
+        assert_eq!(
+            c.health().cooldown_reason.as_deref(),
+            Some("single_provider_protected")
+        );
     }
 }

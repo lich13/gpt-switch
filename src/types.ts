@@ -72,6 +72,7 @@ export type GatewaySettings = {
   successThreshold: number;
   cooldownSeconds: number;
   rateLimitSeconds: number;
+  capacityRetrySeconds: number;
   errorRate: number;
   minRequests: number;
   firstByteSeconds: number;
@@ -87,6 +88,7 @@ export type Health = {
   requests: number;
   retryIn: number;
   cooldownReason?: string | null;
+  protectedSingleProvider?: boolean;
   probeInFlight?: boolean;
   available?: boolean;
 };

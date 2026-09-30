@@ -10,6 +10,7 @@ use super::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
+use http_body_util::BodyExt;
 use hyper::{body::Incoming, header, HeaderMap, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use sha1::{Digest, Sha1};
@@ -169,6 +170,7 @@ pub(super) fn accept(
     });
     response.map(|_| replay::empty())
 }
+#[allow(clippy::too_many_arguments)]
 async fn take_slot(
     g: &Gateway,
     client: &mut Peer,
@@ -177,12 +179,13 @@ async fn take_slot(
     settings: &Settings,
     budget: &mut Budget,
     requirement: &Requirement,
+    protect_single_provider: bool,
 ) -> Result<Admission, Failure> {
     if *client.closed.borrow() {
         return Err((1000, "client closed"));
     }
     tokio::select! {
-        admission = g.0.admission.acquire_for(routes, manual, settings.max_waiting, budget, requirement) => admission.map_err(|reason| {
+        admission = g.0.admission.acquire_for_with_policy(routes, manual, settings.max_waiting, budget, requirement, protect_single_provider, settings.capacity_retry_seconds) => admission.map_err(|reason| {
             if matches!(reason, Rejected::Model) { (1008, requirement.code()) } else { rejected(reason) }
         }),
         _ = client.closed.changed() => Err((1000, "client closed")),
@@ -193,11 +196,11 @@ async fn upstream(
     uri: &Uri,
     original: &HeaderMap,
     settings: &Settings,
-) -> Result<Peer, (Option<u16>, Option<Duration>)> {
+) -> Result<Peer, (Option<u16>, Option<Duration>, bool)> {
     let mut request = Request::new(replay::empty());
     *request.method_mut() = hyper::Method::GET;
     *request.uri_mut() = forward::target_for(route.client_id, &route.provider.base_url, uri)
-        .map_err(|_| (None, None))?;
+        .map_err(|_| (None, None, false))?;
     *request.headers_mut() = original.clone();
     let headers = request.headers_mut();
     forward::clean_headers(headers, true);
@@ -208,7 +211,7 @@ async fn upstream(
         header::AUTHORIZATION,
         format!("Bearer {}", route.provider.token)
             .parse()
-            .map_err(|_| (None, None))?,
+            .map_err(|_| (None, None, false))?,
     );
     let key = STANDARD.encode(uuid::Uuid::new_v4().as_bytes());
     headers.insert(header::SEC_WEBSOCKET_KEY, key.parse().unwrap());
@@ -225,16 +228,27 @@ async fn upstream(
     .await
     {
         Ok(Ok(response)) => response,
-        Ok(Err(_)) => return Err((None, None)),
-        Err(_) => return Err((None, None)),
+        Ok(Err(_)) => return Err((None, None, false)),
+        Err(_) => return Err((None, None, false)),
     };
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let status = response.status();
         let retry = response
             .headers()
             .get(header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(circuit::retry_after);
-        return Err((Some(response.status().as_u16()), retry));
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map(|b| b.to_bytes())
+            .unwrap_or_default();
+        return Err((
+            Some(status.as_u16()),
+            retry,
+            forward::capacity_message(status, &body),
+        ));
     }
     let expected = STANDARD.encode(Sha1::digest(
         format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
@@ -245,7 +259,7 @@ async fn upstream(
         .and_then(|v| v.to_str().ok())
         != Some(&expected)
     {
-        return Err((Some(502), None));
+        return Err((Some(502), None, false));
     }
     let extensions = response
         .headers()
@@ -254,14 +268,14 @@ async fn upstream(
         .map(str::to_owned);
     let io = hyper::upgrade::on(&mut response)
         .await
-        .map_err(|_| (None, None))?;
+        .map_err(|_| (None, None, false))?;
     let socket = WebSocket::from_stream_with_extensions(
         TokioIo::new(io),
         yawc::Role::Client,
         extensions.as_deref(),
         options(),
     )
-    .map_err(|_| (None, None))?;
+    .map_err(|_| (None, None, false))?;
     Ok(Peer::new(socket))
 }
 fn turn_model(
@@ -324,6 +338,9 @@ async fn session(
         }
         break frame;
     };
+    // Compute protection before affinity pinning. A known previous response
+    // can narrow one request to its owner without changing the queue size.
+    let auto_single_provider = !manual && ids.len() == 1;
     if let Some(previous) = value(&first).and_then(|v| {
         v.get("previous_response_id")
             .and_then(|v| v.as_str())
@@ -344,15 +361,33 @@ async fn session(
     let requirement = Requirement::model(current_model.as_deref());
     let mut budget = Budget::new(cfg.queue_seconds);
     let mut attempts = 0;
+    let initial_ids = ids.clone();
+    let mut capacity_pending = false;
+    let mut capacity_retry_after: Option<Duration> = None;
     let (mut upstream_peer, admission, initial_protocol) = loop {
-        if ids.is_empty() || attempts > cfg.max_retries {
+        if ids.is_empty() {
+            if capacity_pending && !initial_ids.is_empty() && attempts < cfg.max_retries {
+                let mut retry_cfg = cfg.clone();
+                if let Some(retry) = capacity_retry_after {
+                    retry_cfg.capacity_retry_seconds =
+                        retry.as_secs().max(retry_cfg.capacity_retry_seconds);
+                }
+                forward::wait_capacity(&retry_cfg).await;
+                ids = initial_ids.clone();
+                capacity_pending = false;
+                capacity_retry_after = None;
+                continue;
+            }
+            return Err((1013, "all providers failed"));
+        }
+        if attempts > cfg.max_retries {
             return Err((1013, "all providers failed"));
         }
         let candidates: Vec<_> = ids
             .iter()
             .filter_map(|id| routes.get(id).cloned())
             .collect();
-        let mut admission = take_slot(
+        let mut admission = match take_slot(
             g,
             client,
             &candidates,
@@ -360,8 +395,25 @@ async fn session(
             cfg,
             &mut budget,
             &requirement,
+            auto_single_provider,
         )
-        .await?;
+        .await
+        {
+            Ok(admission) => admission,
+            Err(_error) if capacity_pending && attempts < cfg.max_retries => {
+                let mut retry_cfg = cfg.clone();
+                if let Some(retry) = capacity_retry_after {
+                    retry_cfg.capacity_retry_seconds =
+                        retry.as_secs().max(retry_cfg.capacity_retry_seconds);
+                }
+                forward::wait_capacity(&retry_cfg).await;
+                ids = initial_ids.clone();
+                capacity_pending = false;
+                capacity_retry_after = None;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         ids.retain(|id| id != &admission.route.provider.id);
         attempts += 1;
         let mut closed = client.closed.clone();
@@ -373,9 +425,11 @@ async fn session(
             Ok(peer) => {
                 break (peer, admission, super::protocol::Protocol::new(true));
             }
-            Err((status, retry)) => {
+            Err((status, retry, capacity)) => {
                 let retryable = status.is_none_or(circuit::retryable);
-                if status == Some(429) {
+                if capacity {
+                    admission.permits.capacity_limited(cfg, retry);
+                } else if status == Some(429) {
                     admission.permits.rate_limited(cfg, retry);
                 } else if retryable {
                     admission.permits.failure(cfg, retry);
@@ -385,6 +439,10 @@ async fn session(
 
                 if !retryable {
                     return Err((1008, "upstream rejected websocket handshake"));
+                }
+                if capacity {
+                    capacity_pending = true;
+                    capacity_retry_after = retry;
                 }
             }
         }
@@ -425,6 +483,7 @@ async fn session(
                         cfg,
                         &mut budget,
                         &requirement,
+                        false,
                     )
                     .await?,
                 );

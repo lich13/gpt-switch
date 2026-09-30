@@ -24,6 +24,7 @@ export const gatewayDemo: GatewayState = {
     successThreshold: 2,
     cooldownSeconds: 60,
     rateLimitSeconds: 5,
+    capacityRetrySeconds: 60,
     errorRate: 0.6,
     minRequests: 10,
     firstByteSeconds: 60,

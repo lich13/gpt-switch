@@ -8,7 +8,7 @@ use hyper::{
     HeaderMap,
 };
 use std::{io, path::Path, sync::Arc};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub type WireBody = UnsyncBoxBody<Bytes, BoxError>;
 const MEMORY_LIMIT: usize = 2 * 1024 * 1024;
 const MAX_BODY: u64 = 1024 * 1024 * 1024;
@@ -212,5 +212,16 @@ impl Replay {
     }
     pub fn has_trailers(&self) -> bool {
         self.trailers.is_some()
+    }
+    pub async fn prefix(&self, limit: usize) -> Result<Vec<u8>, BoxError> {
+        match &self.payload {
+            Payload::Memory(bytes) => Ok(bytes[..bytes.len().min(limit)].to_vec()),
+            Payload::Disk(file) => {
+                let reader = tokio::fs::File::open(file.path()).await?;
+                let mut bytes = Vec::new();
+                reader.take(limit as u64).read_to_end(&mut bytes).await?;
+                Ok(bytes)
+            }
+        }
     }
 }

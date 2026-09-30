@@ -137,6 +137,33 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
             .fold(0u8, |v, (a, b)| v | (a ^ b))
             == 0
 }
+pub(super) fn capacity_message(status: StatusCode, body: &[u8]) -> bool {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+    if !circuit::retryable(status.as_u16()) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    [
+        "too many requests",
+        "selected model is at capacity",
+        "model is at capacity",
+        "at capacity",
+        "容量",
+        "限流",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+fn capacity_delay(settings: &Settings, retry: Option<Duration>) -> Duration {
+    retry
+        .unwrap_or_default()
+        .max(Duration::from_secs(settings.capacity_retry_seconds))
+}
+pub(super) async fn wait_capacity(settings: &Settings) {
+    tokio::time::sleep(capacity_delay(settings, None)).await;
+}
 async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<WireBody> {
     let began = Instant::now();
     let (settings, mode, mut ids, token, running) = {
@@ -246,7 +273,12 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             .get(header::ACCEPT)
             .is_some_and(|h| h.as_bytes().windows(17).any(|w| w == b"text/event-stream"));
     let mut model = hints.as_ref().ok().and_then(|h| h.model.clone());
-    let pinned = match hints {
+    // Decide this before previous_response_id affinity pinning. Pinning a
+    // request to its owner must not turn a multi-provider queue into a
+    // single-provider protected circuit.
+    let auto_single_provider = mode == "auto" && ids.len() == 1;
+    let mut unknown_affinity = false;
+    let _pinned = match hints {
         Ok(hints) if hints.previous_response_id.is_some() => {
             let previous = hints.previous_response_id.unwrap();
             let owner = gateway
@@ -265,12 +297,16 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 }
             } else {
                 ids.truncate(1);
+                unknown_affinity = true;
             }
             true
         }
         // The original bytes may contain an uninspectable continuation. Try only
         // one eligible (unrestricted) route, without cutting off earlier filters.
-        Err(_) => true,
+        Err(_) => {
+            unknown_affinity = true;
+            true
+        }
         _ => false,
     };
     let requirement = if !websocket && routing::resource(&parts.method, parts.uri.path()) {
@@ -278,11 +314,39 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
     } else {
         Requirement::model(model.as_deref())
     };
+    let initial_ids = ids.clone();
     let mut last = None;
     let mut attempted = 0usize;
     let mut last_category = "NO_PROVIDER";
     let mut wait_budget = Budget::new(settings.queue_seconds);
-    while !ids.is_empty() && attempted <= settings.max_retries && (!pinned || attempted == 0) {
+    let mut capacity_pending = false;
+    let mut capacity_retry_after: Option<Duration> = None;
+    while attempted <= settings.max_retries {
+        // An unknown previous_response_id has no safe owner to replay against;
+        // preserve the existing one-attempt rule instead of silently
+        // repeating the request on an arbitrary provider.
+        if unknown_affinity && attempted > 0 {
+            break;
+        }
+        if ids.is_empty() {
+            if capacity_pending
+                && !unknown_affinity
+                && !initial_ids.is_empty()
+                && attempted < settings.max_retries
+            {
+                let mut retry_settings = settings.clone();
+                if let Some(retry) = capacity_retry_after {
+                    retry_settings.capacity_retry_seconds =
+                        retry.as_secs().max(retry_settings.capacity_retry_seconds);
+                }
+                wait_capacity(&retry_settings).await;
+                ids = initial_ids.clone();
+                capacity_pending = false;
+                capacity_retry_after = None;
+                continue;
+            }
+            break;
+        }
         let candidates: Vec<_> = ids
             .iter()
             .filter_map(|id| routes.get(id).cloned())
@@ -294,18 +358,26 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         } = match gateway
             .0
             .admission
-            .acquire_for(
+            .acquire_for_with_policy(
                 &candidates,
                 mode == "manual",
                 settings.max_waiting,
                 &mut wait_budget,
                 &requirement,
+                gateway.client_id() == super::ClientId::Codex
+                    && mode == "auto"
+                    && auto_single_provider,
+                settings.capacity_retry_seconds,
             )
             .await
         {
             Ok(value) => value,
             Err(Rejected::Full | Rejected::Timeout) => {
                 if attempted > 0 {
+                    if capacity_pending {
+                        ids.clear();
+                        continue;
+                    }
                     break;
                 }
                 let mut response = error(
@@ -320,6 +392,11 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             }
             Err(Rejected::Cooling(seconds)) => {
                 if attempted > 0 {
+                    if capacity_pending {
+                        capacity_retry_after = Some(Duration::from_secs(seconds));
+                        ids.clear();
+                        continue;
+                    }
                     break;
                 }
                 let mut response = error(
@@ -459,7 +536,16 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 Replay::capture(body, gateway.0.spool.path()),
             )
             .await;
-            if status == StatusCode::TOO_MANY_REQUESTS {
+            let capacity = route.client_id == super::ClientId::Codex
+                && match &captured {
+                    Ok(Ok(body)) => {
+                        capacity_message(status, &body.prefix(128 * 1024).await.unwrap_or_default())
+                    }
+                    _ => capacity_message(status, &[]),
+                };
+            if capacity {
+                permits.capacity_limited(&settings, cooldown);
+            } else if status == StatusCode::TOO_MANY_REQUESTS {
                 permits.rate_limited(&settings, cooldown);
             } else {
                 permits.failure(&settings, cooldown);
@@ -472,6 +558,10 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 protocol.finish(Some(status.as_u16()), "STREAM_INTERRUPTED");
             }
             last_category = "HTTP";
+            if capacity {
+                capacity_pending = true;
+                capacity_retry_after = cooldown;
+            }
             continue;
         }
         let stream = response
@@ -577,31 +667,54 @@ pub(super) fn settle_protocol(
 }
 pub(super) struct Permits {
     provider: Option<Permit>,
+    protected_single_provider: bool,
 }
 impl Permits {
-    pub(super) fn rate_limited(&mut self, cfg: &Settings, retry: Option<Duration>) {
+    pub(super) fn capacity_limited(&mut self, cfg: &Settings, retry: Option<Duration>) {
         if let Some(p) = self.provider.take() {
-            p.finish(Outcome::RateLimited(retry), cfg);
+            p.finish_with_policy(
+                Outcome::CapacityLimited(retry),
+                cfg,
+                self.protected_single_provider,
+            );
         }
     }
-    pub(super) fn acquire(route: &Route, manual: bool) -> Option<Self> {
+    pub(super) fn rate_limited(&mut self, cfg: &Settings, retry: Option<Duration>) {
+        if let Some(p) = self.provider.take() {
+            p.finish_with_policy(
+                Outcome::RateLimited(retry),
+                cfg,
+                self.protected_single_provider,
+            );
+        }
+    }
+    pub(super) fn acquire(
+        route: &Route,
+        manual: bool,
+        protected_single_provider: bool,
+    ) -> Option<Self> {
         Some(Self {
-            provider: Some(route.provider_circuit.acquire(manual)?),
+            provider: Some(
+                route
+                    .provider_circuit
+                    .acquire_with_protection(manual, protected_single_provider)?,
+            ),
+            protected_single_provider,
         })
     }
     pub(super) fn success(&mut self, cfg: &Settings) {
         if let Some(p) = self.provider.take() {
-            p.finish(Outcome::Success, cfg);
+            p.finish_with_policy(Outcome::Success, cfg, self.protected_single_provider);
         }
     }
     pub(super) fn neutral(&mut self, cfg: &Settings) {
         if let Some(p) = self.provider.take() {
-            p.finish(Outcome::Neutral, cfg);
+            p.finish_with_policy(Outcome::Neutral, cfg, self.protected_single_provider);
         }
     }
     pub(super) fn failure(&mut self, cfg: &Settings, retry: Option<Duration>) {
         if let Some(p) = self.provider.take() {
-            p.finish(Outcome::Failure(retry), cfg);
+            p.finish_with_policy(Outcome::Failure(retry), cfg, self.protected_single_provider);
         }
     }
 }

@@ -51,6 +51,7 @@ async fn incident_rate_limited_p1_waits_then_recovers_while_p2_is_open() {
     .await;
     let mut cfg = g.view().settings;
     cfg.failure_threshold = 1;
+    cfg.capacity_retry_seconds = 1;
     cfg.queue_seconds = 3;
     update(&g, &t, Edit::Settings { settings: cfg });
     update(
@@ -69,35 +70,26 @@ async fn incident_rate_limited_p1_waits_then_recovers_while_p2_is_open() {
         vec![("content-type", "application/json")],
     )
     .await;
-    assert_eq!(first.status(), 502);
+    assert_eq!(first.status(), 200);
     assert_eq!(
         first.into_body().collect().await.unwrap().to_bytes(),
-        "P2 unavailable"
+        "P1 recovered"
     );
     settle(&g).await;
     let view = g.view();
     assert_eq!(view.providers[0].health.failures, 0);
-    assert_eq!(
-        view.providers[0].health.cooldown_reason.as_deref(),
-        Some("rate_limit")
-    );
+    assert_eq!(view.providers[0].health.cooldown_reason, None);
     assert_eq!(
         view.providers[1].health.state,
         super::super::circuit::CircuitState::Open
     );
-    let g2 = g.clone();
-    let queued = tokio::spawn(async move {
-        request(
-            &g2,
-            "/v1/responses",
-            br#"{"model":"gpt-test"}"#.to_vec(),
-            vec![("content-type", "application/json")],
-        )
-        .await
-    });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(g.view().waiting_requests, 1);
-    let response = queued.await.unwrap();
+    let response = request(
+        &g,
+        "/v1/responses",
+        br#"{"model":"gpt-test"}"#.to_vec(),
+        vec![("content-type", "application/json")],
+    )
+    .await;
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.into_body().collect().await.unwrap().to_bytes(),
@@ -107,7 +99,7 @@ async fn incident_rate_limited_p1_waits_then_recovers_while_p2_is_open() {
     let view = g.view();
     let recovered = &view.providers[0];
     assert_eq!(recovered.health.failures, 0);
-    assert_eq!(recovered.health.requests, 1);
+    assert_eq!(recovered.health.requests, 2);
     assert_eq!(recovered.health.cooldown_reason, None);
     assert!(recovered.health.available);
     assert!(!recovered.health.probe_in_flight);
@@ -118,7 +110,7 @@ async fn incident_rate_limited_p1_waits_then_recovers_while_p2_is_open() {
     );
     assert_eq!(view.providers[1].health.failures, 1);
     assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
     assert_eq!(
         std::fs::read(t.path().join("auth.json")).unwrap(),
         original_auth
@@ -142,6 +134,7 @@ async fn cooldown_timeout_returns_503_without_another_upstream_attempt() {
     .await;
     let (t, g) = fixture(vec![format!("http://127.0.0.1:{p1}/v1")]).await;
     let mut settings = g.view().settings;
+    settings.max_retries = 1;
     settings.queue_seconds = 1;
     update(&g, &t, Edit::Settings { settings });
     start(&g, &t).await;
@@ -164,7 +157,7 @@ async fn cooldown_timeout_returns_503_without_another_upstream_attempt() {
     assert_eq!(health.failures, 0);
     assert_eq!(health.requests, 0);
     assert_eq!(health.state, super::super::circuit::CircuitState::Closed);
-    assert_eq!(health.cooldown_reason.as_deref(), Some("rate_limit"));
+    assert_eq!(health.cooldown_reason.as_deref(), Some("capacity_retry"));
     assert!(!health.available);
     assert!(!health.probe_in_flight);
     g.stop().await.unwrap();

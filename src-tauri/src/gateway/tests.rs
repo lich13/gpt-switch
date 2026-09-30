@@ -1,6 +1,26 @@
 // End-to-end transport and configuration tests live here; all credentials are fixtures.
 use super::*;
 #[test]
+fn codex_capacity_messages_are_detected_without_matching_normal_errors() {
+    assert!(forward::capacity_message(
+        hyper::StatusCode::TOO_MANY_REQUESTS,
+        b"any body"
+    ));
+    assert!(forward::capacity_message(
+        hyper::StatusCode::SERVICE_UNAVAILABLE,
+        b"Selected model is at capacity. Please try a different model."
+    ));
+    assert!(forward::capacity_message(
+        hyper::StatusCode::BAD_GATEWAY,
+        "模型当前限流".as_bytes()
+    ));
+    assert!(!forward::capacity_message(
+        hyper::StatusCode::BAD_REQUEST,
+        b"model is at capacity"
+    ));
+}
+
+#[test]
 fn provider_secrets_never_appear_in_view() {
     let temp = tempfile::tempdir().unwrap();
     let g = Gateway::new(temp.path().to_path_buf()).unwrap();
@@ -130,6 +150,106 @@ async fn stopping_releases_listener_before_restart_returns_to_caller() {
         assert_eq!(std::fs::read(t.path().join("auth.json")).ok(), auth);
     }
 }
+
+#[tokio::test]
+async fn codex_capacity_429_fails_over_to_next_provider_before_returning() {
+    let first_hits = Arc::new(AtomicUsize::new(0));
+    let first_counter = first_hits.clone();
+    let first = server(move |_| {
+        first_counter.fetch_add(1, Ordering::SeqCst);
+        async {
+            Response::builder()
+                .status(429)
+                .body(full("Selected model is at capacity"))
+                .unwrap()
+        }
+    })
+    .await;
+    let second = server(|_| async { Response::new(full("backup-ok")) }).await;
+    let (t, g) = fixture(vec![
+        format!("http://127.0.0.1:{first}/v1"),
+        format!("http://127.0.0.1:{second}/v1"),
+    ])
+    .await;
+    update(
+        &g,
+        &t,
+        Edit::Mode {
+            mode: "auto".into(),
+        },
+    );
+    start(&g, &t).await;
+    let body = br#"{"model":"gpt-test","input":"preserve"}"#.to_vec();
+    let response = request(
+        &g,
+        "/v1/responses",
+        body,
+        vec![("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "backup-ok"
+    );
+    assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        g.view().providers[0].health.cooldown_reason.as_deref(),
+        Some("capacity_retry")
+    );
+    g.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn codex_single_provider_capacity_waits_and_never_opens() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let upstream = server(move |_| {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if n == 0 {
+                Response::builder()
+                    .status(429)
+                    .body(full("Selected model is at capacity"))
+                    .unwrap()
+            } else {
+                Response::new(full("recovered"))
+            }
+        }
+    })
+    .await;
+    let (t, g) = fixture(vec![format!("http://127.0.0.1:{upstream}/v1")]).await;
+    let mut settings = g.view().settings;
+    settings.capacity_retry_seconds = 1;
+    settings.max_retries = 2;
+    update(&g, &t, Edit::Settings { settings });
+    update(
+        &g,
+        &t,
+        Edit::Mode {
+            mode: "auto".into(),
+        },
+    );
+    start(&g, &t).await;
+    let response = request(
+        &g,
+        "/v1/responses",
+        br#"{"model":"gpt-test"}"#.to_vec(),
+        vec![("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "recovered"
+    );
+    let provider = &g.view().providers[0];
+    assert_eq!(provider.health.state, super::circuit::CircuitState::Closed);
+    assert!(!provider.health.protected_single_provider);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    g.stop().await.unwrap();
+}
+
 fn update(g: &Gateway, t: &tempfile::TempDir, edit: Edit) {
     g.edit(edit, &g.view().revision, t.path()).unwrap();
 }
@@ -359,6 +479,7 @@ async fn port_conflict_startup_recovery_and_single_candidate_breaker() {
     .await;
     let (t, g) = fixture(vec![format!("http://127.0.0.1:{port}")]).await;
     let mut settings = g.view().settings;
+    settings.max_retries = 1;
     settings.queue_seconds = 1;
     update(&g, &t, Edit::Settings { settings });
     let occupied = tokio::net::TcpListener::bind(("127.0.0.1", g.view().settings.port))

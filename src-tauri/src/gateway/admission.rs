@@ -101,6 +101,7 @@ impl Scheduler {
         self.acquire_for(routes, manual, max_waiting, budget, &Requirement::Resource)
             .await
     }
+    #[cfg(test)]
     pub async fn acquire_for(
         &self,
         routes: &[Route],
@@ -109,7 +110,27 @@ impl Scheduler {
         budget: &mut Budget,
         requirement: &Requirement,
     ) -> Result<Admission, Rejected> {
+        self.acquire_for_with_policy(routes, manual, max_waiting, budget, requirement, false, 60)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_for_with_policy(
+        &self,
+        routes: &[Route],
+        manual: bool,
+        max_waiting: usize,
+        budget: &mut Budget,
+        requirement: &Requirement,
+        protect_single_provider: bool,
+        protection_seconds: u64,
+    ) -> Result<Admission, Rejected> {
         let started = Instant::now();
+        for route in routes {
+            route.provider_circuit.set_single_provider_protection(
+                protect_single_provider,
+                Duration::from_secs(protection_seconds),
+            );
+        }
         let epoch = self.0.state.lock().unwrap().epoch;
         let mut waiting: Option<Waiting> = None;
         let deadline = tokio::time::Instant::now() + budget.remaining;
@@ -191,7 +212,9 @@ impl Scheduler {
                             retry_selection = false;
                             continue 'selection;
                         }
-                        if let Some(permits) = Permits::acquire(route, manual) {
+                        if let Some(permits) =
+                            Permits::acquire(route, manual, protect_single_provider)
+                        {
                             *s.active.entry(id.clone()).or_default() += 1;
                             accepted = Some(Admission {
                                 route: (**route).clone(),

@@ -456,6 +456,7 @@ function GatewayContent({
             </span>
           </div>
           <Advanced
+            clientId={clientId}
             onDirtyChange={onDirtyChange}
             settings={state.settings}
             revision={state.revision}
@@ -525,12 +526,14 @@ function GatewayContent({
   );
 }
 function Advanced({
+  clientId,
   onDirtyChange,
   settings,
   revision,
   busy,
   save,
 }: {
+  clientId: ClientId;
   onDirtyChange?: (dirty: boolean) => void;
   settings: GatewaySettings;
   revision: string;
@@ -555,6 +558,9 @@ function Advanced({
     ["successThreshold", "恢复成功次数"],
     ["cooldownSeconds", "熔断等待 / 秒"],
     ["rateLimitSeconds", "429 默认冷却 / 秒"],
+    ...(clientId === "codex"
+      ? [["capacityRetrySeconds", "容量错误等待 / 秒"] as [keyof GatewaySettings, string]]
+      : []),
     ["errorRate", "错误率阈值 (0–1)"],
     ["minRequests", "最小请求数"],
     ["firstByteSeconds", "首字节 / 秒"],
