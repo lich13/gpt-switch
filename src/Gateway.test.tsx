@@ -100,6 +100,35 @@ describe("gateway controls", () => {
     );
   });
 
+  it("starts a fresh transport draft after explicit navigation has confirmed discarding it", async () => {
+    const user = userEvent.setup();
+    const providerId = state.providers[0].id;
+    const { rerender } = render(
+      <Gateway
+        notify={() => {}}
+        focusProvider={{ id: providerId, sequence: 1 }}
+      />,
+    );
+    const checkbox = await screen.findByRole("checkbox", {
+      name: "原生 WebSocket",
+    });
+    await user.click(checkbox);
+    expect(checkbox).not.toBeChecked();
+    // App confirms discarding before emitting this new navigation sequence.
+    rerender(
+      <Gateway
+        notify={() => {}}
+        focusProvider={{ id: providerId, sequence: 2 }}
+      />,
+    );
+    expect(
+      await screen.findByRole("checkbox", { name: "原生 WebSocket" }),
+    ).toBeChecked();
+    expect(
+      mock.command.mock.calls.some(([name]) => name === "update_gateway"),
+    ).toBe(false);
+  });
+
   it("keeps the provider API form to two fields and sends no guessed model settings", async () => {
     const user = userEvent.setup();
     render(<Gateway notify={() => {}} />);

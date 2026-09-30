@@ -489,6 +489,7 @@ function GatewayContent({
       </>
       {dialog?.kind === "settings" && (
         <ProviderSettings
+          key={`${dialog.item.id}:${focusProvider?.sequence ?? 0}`}
           provider={dialog.item}
           onDirtyChange={onDirtyChange}
           clientId={clientId}
