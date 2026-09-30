@@ -1,4 +1,11 @@
-# lich13-switch v0.9.3
+# lich13-switch v0.10.0
+
+- Codex 供应商新增“原生 WebSocket”能力开关；旧数据和新供应商默认开启，Claude Code 不显示该控件。
+- 未勾选原生能力的 Codex 供应商使用 HTTP/SSE 兼容桥接：保留请求字段和模型内容，只去除 `response.create` 的 WebSocket 外壳并强制流式；SSE 事件按原 JSON 字节转为下游 WebSocket 文本帧。
+- 桥接支持 CRLF/LF、多行 `data`、gzip／deflate／zstd、有界事件缓冲、取消、背压和响应完成释放；首个上游事件前失败可按队列换商，开始输出后固定供应商。
+- 原生握手和桥接的明确不支持状态不计入熔断；全部候选不兼容时返回 `WS_UNSUPPORTED`，网络、容量和服务错误沿用现有重试、冷却及单供应商保护。
+- 首次从 Codex `custom` 导入时读取 `supports_websockets` 作为初始能力值；之后能力只由供应商设置维护，不写回 Codex TOML。
+- 保留账号、Claude Code、额度、模型白名单、并发、队列、故障转移、托盘、电源助手及两字段配置契约。
 
 - 主面板与快捷面板增加供应商行内“重置熔断”按钮；重置会立即唤醒相关容量等待并重新检查队列、白名单、健康和并发，不增加重试次数。
 - 供应商名称支持双击或 Enter/F2 就地编辑，Enter 保存、Escape 取消；快捷面板名称与供应商选择操作分离。

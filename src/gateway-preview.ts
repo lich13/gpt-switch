@@ -46,6 +46,7 @@ export const gatewayDemo: GatewayState = {
       maxConcurrency: 4,
       activeRequests: 0,
       allowedModels: null,
+      supportsWebsocket: true,
     },
     {
       id: "backup",
@@ -58,6 +59,7 @@ export const gatewayDemo: GatewayState = {
       maxConcurrency: 0,
       activeRequests: 0,
       allowedModels: null,
+      supportsWebsocket: true,
     },
   ],
   activeConnections: 0,
@@ -165,10 +167,13 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
           maxConcurrency: 0,
           activeRequests: 0,
           allowedModels: null,
+          supportsWebsocket: true,
         });
     }
     if (e.op === "modelsProvider" && p)
       p.allowedModels = e.allowedModels as string[] | null;
+    if (e.op === "websocketProvider" && p)
+      p.supportsWebsocket = Boolean(e.supportsWebsocket);
     if (e.op === "settings") s.settings = e.settings as GatewaySettings;
     if (e.op === "import") throw new Error("预览模式无法读取真实客户端配置");
     s.revision = crypto.randomUUID();

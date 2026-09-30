@@ -33,6 +33,12 @@ Provider slot accounting, bounded waiting and Responses WebSocket turn lifecycle
 
 https://github.com/Wei-Shaw/sub2api/tree/a3eb7ef302961cba716dc78b39b93b60c467db0e/backend/internal
 
+## Codex Responses WebSocket compatibility
+
+The native Responses WebSocket scheduling boundary follows the lifecycle described by Wei-Shaw/sub2api at the reference above. The HTTP/SSE compatibility bridge is an independent Rust adapter: it keeps the client WebSocket and converts only the `response.create` envelope and SSE event transport. Event names and field semantics follow the public OpenAI Responses streaming event documentation.
+
+https://platform.openai.com/docs/api-reference/responses-streaming
+
 ## yawc 0.4.2
 
 Unmodified WebSocket/deflate dependency, MPL-2.0. The full license is bundled in licenses/yawc-MPL-2.0.txt. Source is available at https://crates.io/api/v1/crates/yawc/0.4.2/download and https://github.com/infinitefield/yawc .

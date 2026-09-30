@@ -103,6 +103,7 @@ export type Provider = {
   maxConcurrency: number;
   activeRequests: number;
   allowedModels: string[] | null;
+  supportsWebsocket: boolean;
 };
 export type GatewayState = {
   clientId: ClientId;

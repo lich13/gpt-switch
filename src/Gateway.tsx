@@ -89,7 +89,10 @@ function GatewayContent({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<Dialog>(null);
-  const [renameRequest, setRenameRequest] = useState<{ id: string; sequence: number } | null>(null);
+  const [renameRequest, setRenameRequest] = useState<{
+    id: string;
+    sequence: number;
+  } | null>(null);
   const quota = useProviderQuota(
     state?.providers ?? [],
     true,
@@ -199,8 +202,10 @@ function GatewayContent({
       await edit({ op: "reset", id: p.id });
       notify("已重置熔断");
     });
-  const renameProvider = (payload: { op: "renameProvider"; id: string; name: string }, revision: string) =>
-    edit(payload, revision);
+  const renameProvider = (
+    payload: { op: "renameProvider"; id: string; name: string },
+    revision: string,
+  ) => edit(payload, revision);
   const menuClose = (e: React.MouseEvent) =>
     e.currentTarget.closest("details")?.removeAttribute("open");
   return (
@@ -326,7 +331,11 @@ function GatewayContent({
                       disabled={rowBusy}
                       commit={renameProvider}
                       report={setError}
-                      request={renameRequest?.id === p.id ? renameRequest.sequence : undefined}
+                      request={
+                        renameRequest?.id === p.id
+                          ? renameRequest.sequence
+                          : undefined
+                      }
                     />
                     {status && (
                       <button
@@ -341,6 +350,9 @@ function GatewayContent({
                     )}
                     {state.mode === "auto" && state.lastSuccessful === p.id && (
                       <span className="provider-binding">最近使用</span>
+                    )}
+                    {clientId === "codex" && !p.supportsWebsocket && (
+                      <span className="provider-transport">HTTP 桥接</span>
                     )}
                     <button
                       className="secondary compact"
@@ -478,11 +490,22 @@ function GatewayContent({
       {dialog?.kind === "settings" && (
         <ProviderSettings
           provider={dialog.item}
+          clientId={clientId}
+          revision={state.revision}
+          disabled={busy}
           runtime={
             state.providers.find((p) => p.id === dialog.item.id) ?? dialog.item
           }
           close={() => setDialog(null)}
           models={() => setDialog({ kind: "models", item: dialog.item })}
+          save={async (payload, revision) => {
+            await edit(payload, revision);
+            notify(
+              payload.supportsWebsocket
+                ? "已启用原生 WebSocket"
+                : "已启用 HTTP 桥接",
+            );
+          }}
         />
       )}
       {dialog?.kind === "quota" && (
@@ -566,7 +589,12 @@ function Advanced({
     ["cooldownSeconds", "熔断等待 / 秒"],
     ["rateLimitSeconds", "429 默认冷却 / 秒"],
     ...(clientId === "codex"
-      ? [["capacityRetrySeconds", "容量错误等待 / 秒"] as [keyof GatewaySettings, string]]
+      ? [
+          ["capacityRetrySeconds", "容量错误等待 / 秒"] as [
+            keyof GatewaySettings,
+            string,
+          ],
+        ]
       : []),
     ["errorRate", "错误率阈值 (0–1)"],
     ["minRequests", "最小请求数"],
@@ -638,15 +666,11 @@ function GatewayDialog({
   const initialSave = useRef(save);
   const [busy, setBusy] = useState(false),
     [error, setError] = useState("");
-  const [baseUrl, setBaseUrl] = useState(
-      dialog.item?.baseUrl ?? "",
-    ),
+  const [baseUrl, setBaseUrl] = useState(dialog.item?.baseUrl ?? ""),
     [token, setToken] = useState("");
   const initialDraft = useRef(JSON.stringify([baseUrl, token]));
   useEffect(() => {
-    onDirtyChange?.(
-      JSON.stringify([baseUrl, token]) !== initialDraft.current,
-    );
+    onDirtyChange?.(JSON.stringify([baseUrl, token]) !== initialDraft.current);
   }, [baseUrl, token, onDirtyChange]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
   const title = `${dialog.item ? "编辑" : "添加"}供应商`;
@@ -672,32 +696,32 @@ function GatewayDialog({
       >
         <>
           <label>
-              {clientId === "claude" ? "ANTHROPIC_BASE_URL" : "base_url"}
-              <input
-                required
-                type="url"
-                autoFocus
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder={
-                  clientId === "claude"
-                    ? "https://api.example.com"
-                    : "https://api.example.com/v1"
-                }
-              />
+            {clientId === "claude" ? "ANTHROPIC_BASE_URL" : "base_url"}
+            <input
+              required
+              type="url"
+              autoFocus
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder={
+                clientId === "claude"
+                  ? "https://api.example.com"
+                  : "https://api.example.com/v1"
+              }
+            />
           </label>
           <label>
-              {clientId === "claude"
-                ? "ANTHROPIC_AUTH_TOKEN"
-                : "experimental_bearer_token"}
-              <input
-                required={!dialog.item}
-                type="password"
-                autoComplete="new-password"
-                value={token}
-                onChange={(e) => setToken(e.target.value)}
-                placeholder={dialog.item ? "留空保留当前 Token" : "输入 Token"}
-              />
+            {clientId === "claude"
+              ? "ANTHROPIC_AUTH_TOKEN"
+              : "experimental_bearer_token"}
+            <input
+              required={!dialog.item}
+              type="password"
+              autoComplete="new-password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder={dialog.item ? "留空保留当前 Token" : "输入 Token"}
+            />
           </label>
         </>
         {error && (

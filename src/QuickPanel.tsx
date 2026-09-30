@@ -383,16 +383,26 @@ function QuickContent({
                         >
                           {gateway.mode === "manual" &&
                             gateway.selected === p.id && <Check size={15} />}
-                          <span>{gateway.mode === "manual" && gateway.selected === p.id ? "已选择" : "选择"}</span>
+                          <span>
+                            {gateway.mode === "manual" &&
+                            gateway.selected === p.id
+                              ? "已选择"
+                              : "选择"}
+                          </span>
                         </button>
                         <ProviderNameEditor
                           provider={p}
                           revision={gateway.revision}
                           disabled={rowBusy}
-                          commit={(payload, revision) => edit(payload, revision)}
+                          commit={(payload, revision) =>
+                            edit(payload, revision)
+                          }
                           report={setError}
                           className="quick-name"
                         />
+                        {clientId === "codex" && !p.supportsWebsocket && (
+                          <span className="provider-transport">HTTP 桥接</span>
+                        )}
                         <button
                           type="button"
                           className="icon-button compact quick-provider-reset"

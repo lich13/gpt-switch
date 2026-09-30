@@ -1782,6 +1782,22 @@ select:focus-visible {
   display: grid;
   gap: 18px;
 }
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 30px;
+  color: var(--ink);
+  font-size: 13px;
+}
+.settings-toggle input {
+  accent-color: var(--accent);
+}
+.provider-transport {
+  color: var(--accent);
+  font-size: 11px;
+  white-space: nowrap;
+}
 .provider-settings > label:not(.check-label) {
   display: grid;
   gap: 7px;

@@ -1,6 +1,6 @@
 [package]
 name = "lich13-switch"
-version = "0.9.3"
+version = "0.10.0"
 description = "Independent Codex and Claude Code providers and local gateways"
 edition = "2021"
 rust-version = "1.85"
@@ -34,6 +34,7 @@ http-body-util = "0.1"
 bytes = "1"
 futures-util = "0.3"
 async-stream = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "zstd"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1"

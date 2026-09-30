@@ -52,6 +52,7 @@ pub struct ProviderView {
     pub max_concurrency: u32,
     pub active_requests: usize,
     pub allowed_models: Option<Vec<String>>,
+    pub supports_websocket: bool,
 }
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -297,6 +298,7 @@ impl Gateway {
                     quota_version: Self::quota_version(&s.store, p),
                     max_concurrency: p.max_concurrency,
                     allowed_models: p.allowed_models.clone(),
+                    supports_websocket: p.supports_websocket,
                     active_requests: occupied.get(&p.id).copied().unwrap_or(0),
                     quota: self
                         .0
@@ -418,6 +420,8 @@ impl Gateway {
         let mut next = s.store.clone();
         match edit {
             Edit::Import => {
+                let supports_websocket =
+                    takeover::websocket_support_for(self.0.client, home)?.unwrap_or(true);
                 let (base_url, token) = takeover::import_for(self.0.client, home)?;
                 next.edit(
                     Edit::SaveProvider {
@@ -427,6 +431,9 @@ impl Gateway {
                     },
                     s.running,
                 )?;
+                if let Some(provider) = next.providers.last_mut() {
+                    provider.supports_websocket = supports_websocket;
+                }
             }
             edit => next.edit(edit, s.running)?,
         }

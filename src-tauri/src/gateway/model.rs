@@ -15,6 +15,11 @@ pub struct Provider {
     pub max_concurrency: u32,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    #[serde(default = "default_websocket_support")]
+    pub supports_websocket: bool,
+}
+fn default_websocket_support() -> bool {
+    true
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,6 +177,10 @@ pub enum Edit {
         id: String,
         allowed_models: Option<Vec<String>>,
     },
+    WebsocketProvider {
+        id: String,
+        supports_websocket: bool,
+    },
     Reorder {
         ids: Vec<String>,
     },
@@ -308,6 +317,7 @@ impl Store {
                         version: uuid::Uuid::new_v4().to_string(),
                         max_concurrency: 0,
                         allowed_models: None,
+                        supports_websocket: default_websocket_support(),
                     });
                     if self.selected.is_none() {
                         self.selected = Some(id);
@@ -363,6 +373,12 @@ impl Store {
                     })
                     .transpose()?;
                 self.provider_mut(&id)?.allowed_models = allowed;
+            }
+            Edit::WebsocketProvider {
+                id,
+                supports_websocket,
+            } => {
+                self.provider_mut(&id)?.supports_websocket = supports_websocket;
             }
             Edit::Reorder { ids } => {
                 let mut sorted = ids.clone();

@@ -22,6 +22,7 @@
 - 两面板共用手柄排序，移动超过 8px 开始；纵向插入，边缘滚动。键盘空格拾取、上下移动、空格确认，Escape 取消；排序期间不触发选择。列表顺序即队列优先级，未入队项不自动入队。
 - 排序提交携带拾取时的版本号；配置变化、失焦或隐藏取消未提交排序，运行状态刷新保留基线。失败恢复真实顺序。并发草稿保留至明确保存或取消，失败保留输入与错误，重新提交使用最新状态。
 - Codex API 表单只有 base_url 和 experimental_bearer_token；Claude 使用 ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN；密码编辑留空保留，不回填秘密值。
+- Codex 供应商设置提供“原生 WebSocket”开关。开启时透明转发 Responses WebSocket；关闭时列表只显示“HTTP 桥接”，将每轮 response.create 转为同一 `/responses` 的 HTTP/SSE 请求。Claude 不显示该控件。
 - 额度详情独立打开，保留来源、窗口、重置、到期和统计。失败保留旧值并标记过期；未知不显示为零。隐藏窗口后停止查询轮询。
 - 白名单精确匹配；查询模型失败不清空选择，手填始终可用。关闭网关时在模型设置中明确标识规则未生效。
 - Codex 网关写入只涉及现有 custom 的两个字段，Claude 只涉及 settings.json 的 env 两字段。文件修改提示重新打开对应客户端，运行中路由切换提示新请求生效。

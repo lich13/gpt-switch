@@ -50,12 +50,18 @@ describe("gateway controls", () => {
     await waitFor(() =>
       expect(mock.command).toHaveBeenCalledWith("update_gateway", {
         clientId: "codex",
-        edit: { op: "renameProvider", id: state.providers[0].id, name: "新的供应商" },
+        edit: {
+          op: "renameProvider",
+          id: state.providers[0].id,
+          name: "新的供应商",
+        },
         expectedRevision: state.revision,
       }),
     );
     await user.click(
-      screen.getByRole("button", { name: `${state.providers[0].name} 重置熔断` }),
+      screen.getByRole("button", {
+        name: `${state.providers[0].name} 重置熔断`,
+      }),
     );
     expect(mock.command).toHaveBeenCalledWith("update_gateway", {
       clientId: "codex",
@@ -63,6 +69,34 @@ describe("gateway controls", () => {
       expectedRevision: state.revision,
     });
     expect(screen.queryByText("测试连接")).not.toBeInTheDocument();
+  });
+
+  it("edits the Codex websocket transport", async () => {
+    const user = userEvent.setup();
+    state.providers[0].supportsWebsocket = false;
+    render(<Gateway notify={() => {}} />);
+    expect(await screen.findByText("HTTP 桥接")).toBeInTheDocument();
+    const operations = screen.getByLabelText(`${state.providers[0].name} 操作`);
+    await user.click(operations);
+    await user.click(
+      within(operations.closest("details")!).getByRole("button", {
+        name: "供应商设置",
+      }),
+    );
+    const checkbox = screen.getByRole("checkbox", { name: "原生 WebSocket" });
+    expect(checkbox).not.toBeChecked();
+    await user.click(checkbox);
+    await waitFor(() =>
+      expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+        clientId: "codex",
+        edit: {
+          op: "websocketProvider",
+          id: state.providers[0].id,
+          supportsWebsocket: true,
+        },
+        expectedRevision: state.revision,
+      }),
+    );
   });
 
   it("keeps the provider API form to two fields and sends no guessed model settings", async () => {
@@ -255,16 +289,27 @@ describe("client isolation", () => {
     expect(input).toHaveAttribute("max", "86400");
     await user.clear(input);
     await user.type(input, "120");
-    act(() => mock.listeners.get("gateway-state")!({ ...state, activeConnections: 3 }));
+    act(() =>
+      mock.listeners.get("gateway-state")!({ ...state, activeConnections: 3 }),
+    );
     expect(input).toHaveValue(120);
     await user.click(screen.getByRole("button", { name: "保存参数" }));
-    await waitFor(() => expect(mock.command).toHaveBeenCalledWith("update_gateway", {
-      clientId: "codex", edit: { op: "settings", settings: { ...state.settings, capacityRetrySeconds: 120 } }, expectedRevision: state.revision,
-    }));
+    await waitFor(() =>
+      expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+        clientId: "codex",
+        edit: {
+          op: "settings",
+          settings: { ...state.settings, capacityRetrySeconds: 120 },
+        },
+        expectedRevision: state.revision,
+      }),
+    );
     await user.click(screen.getByRole("button", { name: "Claude Code" }));
     await screen.findByLabelText(`${claudeState.providers[0].name} 操作`);
     await user.click(screen.getByText("高级设置", { selector: "summary" }));
-    expect(screen.queryByRole("spinbutton", { name: "容量错误等待 / 秒" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("spinbutton", { name: "容量错误等待 / 秒" }),
+    ).not.toBeInTheDocument();
   });
   it("queries each selected client and ignores the other client's gateway events", async () => {
     const user = userEvent.setup();
