@@ -214,6 +214,28 @@ it("refreshes authoritative configuration after a cap conflict, preserves input 
 });
 
 describe("client isolation", () => {
+  it("edits bounded capacity waiting only for Codex and preserves the draft during events", async () => {
+    const user = userEvent.setup();
+    render(<Gateway notify={() => {}} />);
+    await screen.findByLabelText(`${state.providers[0].name} 操作`);
+    await user.click(screen.getByText("高级设置", { selector: "summary" }));
+    const input = screen.getByRole("spinbutton", { name: "容量错误等待 / 秒" });
+    expect(input).toHaveValue(60);
+    expect(input).toHaveAttribute("min", "1");
+    expect(input).toHaveAttribute("max", "86400");
+    await user.clear(input);
+    await user.type(input, "120");
+    act(() => mock.listeners.get("gateway-state")!({ ...state, activeConnections: 3 }));
+    expect(input).toHaveValue(120);
+    await user.click(screen.getByRole("button", { name: "保存参数" }));
+    await waitFor(() => expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+      clientId: "codex", edit: { op: "settings", settings: { ...state.settings, capacityRetrySeconds: 120 } }, expectedRevision: state.revision,
+    }));
+    await user.click(screen.getByRole("button", { name: "Claude Code" }));
+    await screen.findByLabelText(`${claudeState.providers[0].name} 操作`);
+    await user.click(screen.getByText("高级设置", { selector: "summary" }));
+    expect(screen.queryByRole("spinbutton", { name: "容量错误等待 / 秒" })).not.toBeInTheDocument();
+  });
   it("queries each selected client and ignores the other client's gateway events", async () => {
     const user = userEvent.setup();
     render(<Gateway notify={() => {}} />);

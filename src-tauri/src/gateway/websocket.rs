@@ -179,13 +179,13 @@ async fn take_slot(
     settings: &Settings,
     budget: &mut Budget,
     requirement: &Requirement,
-    protect_single_provider: bool,
+    immediate: bool,
 ) -> Result<Admission, Failure> {
     if *client.closed.borrow() {
         return Err((1000, "client closed"));
     }
     tokio::select! {
-        admission = g.0.admission.acquire_for_with_policy(routes, manual, settings.max_waiting, budget, requirement, protect_single_provider, settings.capacity_retry_seconds) => admission.map_err(|reason| {
+        admission = g.0.admission.acquire_for_immediate(routes, manual, settings.max_waiting, budget, requirement, immediate) => admission.map_err(|reason| {
             if matches!(reason, Rejected::Model) { (1008, requirement.code()) } else { rejected(reason) }
         }),
         _ = client.closed.changed() => Err((1000, "client closed")),
@@ -238,17 +238,41 @@ async fn upstream(
             .get(header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(circuit::retry_after);
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map(|b| b.to_bytes())
-            .unwrap_or_default();
-        return Err((
-            Some(status.as_u16()),
-            retry,
-            forward::capacity_message(status, &body),
-        ));
+        let capacity = if route.client_id == super::ClientId::Codex {
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                true
+            } else {
+                let encoding = response
+                    .headers()
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("identity")
+                    .to_owned();
+                let mut body = response.into_body();
+                let prefix =
+                    tokio::time::timeout(Duration::from_secs(settings.first_byte_seconds), async {
+                        let mut bytes = Vec::new();
+                        while bytes.len() < 128 * 1024 {
+                            let Some(Ok(frame)) = body.frame().await else {
+                                break;
+                            };
+                            if let Ok(data) = frame.into_data() {
+                                let count = data.len().min(128 * 1024 - bytes.len());
+                                bytes.extend_from_slice(&data[..count]);
+                            }
+                        }
+                        bytes
+                    })
+                    .await
+                    .unwrap_or_default();
+                let decoded =
+                    replay::decode_prefix(&prefix, &encoding, 128 * 1024).unwrap_or_default();
+                forward::capacity_message(status, &decoded)
+            }
+        } else {
+            false
+        };
+        return Err((Some(status.as_u16()), retry, capacity));
     }
     let expected = STANDARD.encode(Sha1::digest(
         format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
@@ -317,7 +341,7 @@ async fn session(
     cfg: &Settings,
     manual: bool,
     mut ids: Vec<String>,
-    routes: HashMap<String, Route>,
+    mut routes: HashMap<String, Route>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Result<(), Failure> {
@@ -338,9 +362,8 @@ async fn session(
         }
         break frame;
     };
-    // Compute protection before affinity pinning. A known previous response
-    // can narrow one request to its owner without changing the queue size.
-    let auto_single_provider = !manual && ids.len() == 1;
+    let mut pinned = manual.then(|| ids.first().cloned()).flatten();
+    let mut unknown_affinity = false;
     if let Some(previous) = value(&first).and_then(|v| {
         v.get("previous_response_id")
             .and_then(|v| v.as_str())
@@ -352,36 +375,43 @@ async fn session(
             .get(&previous)
             .filter(|(_, _, at)| at.elapsed() < Duration::from_secs(3600))
         {
+            pinned = Some(owner.clone());
             ids = vec![owner.clone()];
         } else {
             ids.truncate(1);
+            unknown_affinity = true;
         }
     }
     let mut current_model = turn_model(g, &first, None, None)?;
     let requirement = Requirement::model(current_model.as_deref());
     let mut budget = Budget::new(cfg.queue_seconds);
     let mut attempts = 0;
-    let initial_ids = ids.clone();
     let mut capacity_pending = false;
     let mut capacity_retry_after: Option<Duration> = None;
+    let mut capacity_provider = String::new();
     let (mut upstream_peer, admission, initial_protocol) = loop {
-        if ids.is_empty() {
-            if capacity_pending && !initial_ids.is_empty() && attempts < cfg.max_retries {
-                let mut retry_cfg = cfg.clone();
-                if let Some(retry) = capacity_retry_after {
-                    retry_cfg.capacity_retry_seconds =
-                        retry.as_secs().max(retry_cfg.capacity_retry_seconds);
-                }
-                forward::wait_capacity(&retry_cfg).await;
-                ids = initial_ids.clone();
-                capacity_pending = false;
-                capacity_retry_after = None;
-                continue;
-            }
+        if attempts > cfg.max_retries || (unknown_affinity && attempts > 0) {
             return Err((1013, "all providers failed"));
         }
-        if attempts > cfg.max_retries {
-            return Err((1013, "all providers failed"));
+        if ids.is_empty() {
+            if !capacity_pending {
+                return Err((1013, "all providers failed"));
+            }
+            if *client.closed.borrow() {
+                return Ok(());
+            }
+            tokio::select! {
+                result = g.0.admission.wait_capacity(&capacity_provider, forward::capacity_delay(cfg, capacity_retry_after), cfg.max_waiting) => result.map_err(rejected)?,
+                _ = client.closed.changed() => return Ok(()),
+            }
+            ids = g.routing_ids(pinned.as_deref());
+            routes = ids
+                .iter()
+                .filter_map(|id| g.route(id).map(|r| (id.clone(), r)))
+                .collect();
+            capacity_pending = false;
+            capacity_retry_after = None;
+            continue;
         }
         let candidates: Vec<_> = ids
             .iter()
@@ -395,21 +425,16 @@ async fn session(
             cfg,
             &mut budget,
             &requirement,
-            auto_single_provider,
+            capacity_pending,
         )
         .await
         {
             Ok(admission) => admission,
-            Err(_error) if capacity_pending && attempts < cfg.max_retries => {
-                let mut retry_cfg = cfg.clone();
-                if let Some(retry) = capacity_retry_after {
-                    retry_cfg.capacity_retry_seconds =
-                        retry.as_secs().max(retry_cfg.capacity_retry_seconds);
-                }
-                forward::wait_capacity(&retry_cfg).await;
-                ids = initial_ids.clone();
-                capacity_pending = false;
-                capacity_retry_after = None;
+            Err((code, reason))
+                if capacity_pending
+                    && (code == 1013 || (code == 1008 && reason == requirement.code())) =>
+            {
+                ids.clear();
                 continue;
             }
             Err(error) => return Err(error),
@@ -442,7 +467,8 @@ async fn session(
                 }
                 if capacity {
                     capacity_pending = true;
-                    capacity_retry_after = retry;
+                    capacity_provider = admission.route.provider.id.clone();
+                    capacity_retry_after = capacity_retry_after.max(retry);
                 }
             }
         }

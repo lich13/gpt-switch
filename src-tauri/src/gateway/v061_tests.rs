@@ -134,7 +134,7 @@ async fn cooldown_timeout_returns_503_without_another_upstream_attempt() {
     .await;
     let (t, g) = fixture(vec![format!("http://127.0.0.1:{p1}/v1")]).await;
     let mut settings = g.view().settings;
-    settings.max_retries = 1;
+    settings.max_retries = 0;
     settings.queue_seconds = 1;
     update(&g, &t, Edit::Settings { settings });
     start(&g, &t).await;

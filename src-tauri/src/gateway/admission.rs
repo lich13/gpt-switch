@@ -24,12 +24,23 @@ struct State {
     models: HashMap<String, Option<Vec<String>>>,
     active: HashMap<String, usize>,
     waiting: VecDeque<(u64, Vec<String>)>,
+    capacity_waits: HashMap<u64, (String, Instant)>,
+}
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityRetry {
+    pub provider_id: String,
+    pub retry_in: u64,
 }
 pub struct Slot {
     scheduler: Scheduler,
     id: String,
 }
 struct Waiting {
+    scheduler: Scheduler,
+    ticket: u64,
+}
+struct CapacityWait {
     scheduler: Scheduler,
     ticket: u64,
 }
@@ -84,7 +95,69 @@ impl Scheduler {
     }
     pub fn counts(&self) -> (HashMap<String, usize>, usize) {
         let s = self.0.state.lock().unwrap();
-        (s.active.clone(), s.waiting.len())
+        (s.active.clone(), s.waiting.len() + s.capacity_waits.len())
+    }
+    pub fn capacity_retries(&self) -> Vec<CapacityRetry> {
+        let s = self.0.state.lock().unwrap();
+        let mut result: Vec<_> = s
+            .capacity_waits
+            .values()
+            .map(|(id, until)| CapacityRetry {
+                provider_id: id.clone(),
+                retry_in: until
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .div_ceil(1000) as u64,
+            })
+            .collect();
+        result.sort_by(|a, b| {
+            a.provider_id
+                .cmp(&b.provider_id)
+                .then(a.retry_in.cmp(&b.retry_in))
+        });
+        result
+    }
+    pub async fn wait_capacity(
+        &self,
+        provider: &str,
+        delay: Duration,
+        max_waiting: usize,
+    ) -> Result<(), Rejected> {
+        let until = Instant::now() + delay;
+        let (ticket, epoch) = {
+            let mut s = self.0.state.lock().unwrap();
+            if !s.running {
+                return Err(Rejected::Stopped);
+            }
+            if s.waiting.len() + s.capacity_waits.len() >= max_waiting {
+                return Err(Rejected::Full);
+            }
+            s.next += 1;
+            let ticket = s.next;
+            s.capacity_waits
+                .insert(ticket, (provider.to_owned(), until));
+            (ticket, s.epoch)
+        };
+        let _wait = CapacityWait {
+            scheduler: self.clone(),
+            ticket,
+        };
+        self.signal();
+        loop {
+            let notified = self.0.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let s = self.0.state.lock().unwrap();
+                if !s.running || s.epoch != epoch {
+                    return Err(Rejected::Stopped);
+                }
+            }
+            tokio::select! {
+                _ = notified => {},
+                _ = tokio::time::sleep_until(until.into()) => return Ok(()),
+            }
+        }
     }
     pub fn signal(&self) {
         self.0.wake.notify_waiters();
@@ -110,27 +183,19 @@ impl Scheduler {
         budget: &mut Budget,
         requirement: &Requirement,
     ) -> Result<Admission, Rejected> {
-        self.acquire_for_with_policy(routes, manual, max_waiting, budget, requirement, false, 60)
+        self.acquire_for_immediate(routes, manual, max_waiting, budget, requirement, false)
             .await
     }
-    #[allow(clippy::too_many_arguments)]
-    pub async fn acquire_for_with_policy(
+    pub async fn acquire_for_immediate(
         &self,
         routes: &[Route],
         manual: bool,
         max_waiting: usize,
         budget: &mut Budget,
         requirement: &Requirement,
-        protect_single_provider: bool,
-        protection_seconds: u64,
+        immediate: bool,
     ) -> Result<Admission, Rejected> {
         let started = Instant::now();
-        for route in routes {
-            route.provider_circuit.set_single_provider_protection(
-                protect_single_provider,
-                Duration::from_secs(protection_seconds),
-            );
-        }
         let epoch = self.0.state.lock().unwrap().epoch;
         let mut waiting: Option<Waiting> = None;
         let deadline = tokio::time::Instant::now() + budget.remaining;
@@ -212,9 +277,7 @@ impl Scheduler {
                             retry_selection = false;
                             continue 'selection;
                         }
-                        if let Some(permits) =
-                            Permits::acquire(route, manual, protect_single_provider)
-                        {
+                        if let Some(permits) = Permits::acquire(route, manual) {
                             *s.active.entry(id.clone()).or_default() += 1;
                             accepted = Some(Admission {
                                 route: (**route).clone(),
@@ -240,8 +303,11 @@ impl Scheduler {
                 if let Some(admission) = accepted {
                     break Ok(admission);
                 }
+                if immediate {
+                    break Err(cooling.map_or(Rejected::Timeout, Rejected::Cooling));
+                }
                 if waiting.is_none() {
-                    if s.waiting.len() >= max_waiting {
+                    if s.waiting.len() + s.capacity_waits.len() >= max_waiting {
                         break Err(Rejected::Full);
                     }
                     s.next += 1;
@@ -291,6 +357,18 @@ impl Drop for Waiting {
             .unwrap()
             .waiting
             .retain(|(id, _)| *id != self.ticket);
+        self.scheduler.signal();
+    }
+}
+impl Drop for CapacityWait {
+    fn drop(&mut self) {
+        self.scheduler
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .capacity_waits
+            .remove(&self.ticket);
         self.scheduler.signal();
     }
 }

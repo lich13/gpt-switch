@@ -72,6 +72,7 @@ pub struct View {
     pub settings: Settings,
     pub active_connections: usize,
     pub waiting_requests: usize,
+    pub capacity_retries: Vec<admission::CapacityRetry>,
     pub error: Option<String>,
     pub recovery_pending: bool,
 }
@@ -305,6 +306,7 @@ impl Gateway {
                 .collect(),
             active_connections: self.0.active.load(Ordering::Relaxed),
             waiting_requests: waiting,
+            capacity_retries: self.0.admission.capacity_retries(),
             error: s.error.clone(),
             recovery_pending: s.upgrade_pending
                 || self.0.data.join("gateway-recovery.json").exists(),
@@ -482,6 +484,7 @@ impl Gateway {
         }
         s.store = next;
         s.revision = revision;
+        self.sync_single_protection(&s);
         self.0.admission.configure(&s.store.providers, s.running);
         self.0.quota.retain(
             &s.store
@@ -872,10 +875,51 @@ impl Gateway {
             .map_err(|e| AppError::new("CONNECT", &e.to_string()))?;
         Ok(began.elapsed().as_millis() as u64)
     }
+    fn sync_single_protection(&self, state: &Inner) {
+        let mut queue = state.store.providers.iter().filter(|p| p.queued);
+        let first = queue.next();
+        let single = if self.0.client == ClientId::Codex
+            && state.store.mode == "auto"
+            && queue.next().is_none()
+        {
+            first.map(|p| format!("provider:{}:", p.id))
+        } else {
+            None
+        };
+        for (key, circuit) in &state.circuits {
+            circuit.set_single_provider_protection(
+                single
+                    .as_ref()
+                    .filter(|prefix| key.starts_with(prefix.as_str()))
+                    .map(|_| Duration::from_secs(state.store.settings.capacity_retry_seconds)),
+            );
+        }
+    }
+    fn routing_ids(&self, pinned: Option<&str>) -> Vec<String> {
+        let s = self.0.inner.lock().unwrap();
+        if let Some(id) = pinned {
+            s.store
+                .providers
+                .iter()
+                .filter(|p| p.id == id)
+                .map(|p| p.id.clone())
+                .collect()
+        } else if s.store.mode == "auto" {
+            s.store
+                .providers
+                .iter()
+                .filter(|p| p.queued)
+                .map(|p| p.id.clone())
+                .collect()
+        } else {
+            s.store.selected.iter().cloned().collect()
+        }
+    }
     fn route(&self, id: &str) -> Option<Route> {
         let mut s = self.0.inner.lock().unwrap();
         let provider = s.store.providers.iter().find(|p| p.id == id)?.clone();
         let provider_circuit = s.circuits.entry(pkey(&provider)).or_default().clone();
+        self.sync_single_protection(&s);
         let key = format!("{}:{}", pkey(&provider), s.store.settings.connect_seconds);
         let mut clients = self.0.clients.lock().unwrap();
         let client = clients

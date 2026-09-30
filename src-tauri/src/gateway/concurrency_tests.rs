@@ -446,7 +446,8 @@ async fn crash_recovery_keeps_auto_mode_last_success_as_resume_fingerprint() {
     next.stop().await.unwrap();
 }
 
-async fn response_ws_server() -> (u16, Arc<tokio::sync::Semaphore>, Arc<Mutex<Vec<Vec<u8>>>>) {
+pub(super) async fn response_ws_server(
+) -> (u16, Arc<tokio::sync::Semaphore>, Arc<Mutex<Vec<Vec<u8>>>>) {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let seen = Arc::new(Mutex::new(vec![]));
     let permits = release.clone();
@@ -477,7 +478,7 @@ async fn response_ws_server() -> (u16, Arc<tokio::sync::Semaphore>, Arc<Mutex<Ve
     }).await;
     (port, release, seen)
 }
-async fn responses_client(g: &Gateway) -> yawc::TcpWebSocket {
+pub(super) async fn responses_client(g: &Gateway) -> yawc::TcpWebSocket {
     let token = g.0.inner.lock().unwrap().store.local_token.clone();
     yawc::WebSocket::connect(
         format!(

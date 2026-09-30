@@ -221,7 +221,7 @@ async fn codex_single_provider_capacity_waits_and_never_opens() {
     let (t, g) = fixture(vec![format!("http://127.0.0.1:{upstream}/v1")]).await;
     let mut settings = g.view().settings;
     settings.capacity_retry_seconds = 1;
-    settings.max_retries = 2;
+    settings.max_retries = 1;
     update(&g, &t, Edit::Settings { settings });
     update(
         &g,
@@ -479,7 +479,7 @@ async fn port_conflict_startup_recovery_and_single_candidate_breaker() {
     .await;
     let (t, g) = fixture(vec![format!("http://127.0.0.1:{port}")]).await;
     let mut settings = g.view().settings;
-    settings.max_retries = 1;
+    settings.max_retries = 0;
     settings.queue_seconds = 1;
     update(&g, &t, Edit::Settings { settings });
     let occupied = tokio::net::TcpListener::bind(("127.0.0.1", g.view().settings.port))
@@ -1139,5 +1139,7 @@ mod imports;
 #[path = "v080_tests.rs"]
 mod v080;
 
+#[path = "capacity_tests.rs"]
+mod capacity;
 #[path = "claude_tests.rs"]
 mod claude_v080;

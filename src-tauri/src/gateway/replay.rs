@@ -12,6 +12,30 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub type WireBody = UnsyncBoxBody<Bytes, BoxError>;
 const MEMORY_LIMIT: usize = 2 * 1024 * 1024;
 const MAX_BODY: u64 = 1024 * 1024 * 1024;
+pub(super) fn decode_prefix(
+    bytes: &[u8],
+    encoding: &str,
+    limit: usize,
+) -> Result<Vec<u8>, BoxError> {
+    use std::io::Read;
+    let reader = std::io::Cursor::new(bytes);
+    let decoded: Box<dyn Read + '_> = match encoding.trim().to_ascii_lowercase().as_str() {
+        "" | "identity" => Box::new(reader),
+        "gzip" => Box::new(flate2::read::GzDecoder::new(reader)),
+        "deflate" => Box::new(flate2::read::ZlibDecoder::new(reader)),
+        "zstd" => Box::new(zstd::stream::read::Decoder::new(reader)?),
+        _ => return Err(io::Error::other("unsupported inspection encoding").into()),
+    };
+    let mut text = Vec::new();
+    if let Err(error) = decoded.take(limit as u64).read_to_end(&mut text) {
+        // Inspection may receive only a compressed prefix. Keep successfully
+        // decoded bytes when the remainder was deliberately cut off.
+        if text.is_empty() || error.kind() != io::ErrorKind::UnexpectedEof {
+            return Err(error.into());
+        }
+    }
+    Ok(text)
+}
 pub fn empty() -> WireBody {
     Full::new(Bytes::new())
         .map_err(|e| match e {})

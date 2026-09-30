@@ -1,6 +1,9 @@
 use super::*;
 
-async fn claude_fixture(base: &str, token: &str) -> (tempfile::TempDir, Gateway, Gateway, PathBuf) {
+pub(super) async fn claude_fixture(
+    base: &str,
+    token: &str,
+) -> (tempfile::TempDir, Gateway, Gateway, PathBuf) {
     let t = tempfile::tempdir().unwrap();
     let codex = Gateway::new(t.path().join("data")).unwrap();
     let claude = codex.companion(t.path().join("data/claude")).unwrap();

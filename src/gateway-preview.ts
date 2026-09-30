@@ -62,6 +62,7 @@ export const gatewayDemo: GatewayState = {
   ],
   activeConnections: 0,
   waitingRequests: 0,
+  capacityRetries: [],
   error: null,
   recoveryPending: false,
 };

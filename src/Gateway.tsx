@@ -591,6 +591,7 @@ function Advanced({
               type="number"
               required
               min={key === "maxRetries" ? 0 : key === "errorRate" ? 0.01 : 1}
+              max={key === "capacityRetrySeconds" ? 86400 : undefined}
               step={key === "errorRate" ? 0.01 : 1}
               value={draft[key]}
               onChange={(e) => {

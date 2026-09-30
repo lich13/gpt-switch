@@ -121,6 +121,7 @@ export type GatewayState = {
   settings: GatewaySettings;
   activeConnections: number;
   waitingRequests: number;
+  capacityRetries: { providerId: string; retryIn: number }[];
   error: string | null;
   recoveryPending: boolean;
 };

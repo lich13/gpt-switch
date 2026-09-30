@@ -152,17 +152,18 @@ pub(super) fn capacity_message(status: StatusCode, body: &[u8]) -> bool {
         "at capacity",
         "容量",
         "限流",
+        "请求过多",
+        "请求太多",
+        "请求频率过高",
+        "模型繁忙",
     ]
     .iter()
     .any(|needle| text.contains(needle))
 }
-fn capacity_delay(settings: &Settings, retry: Option<Duration>) -> Duration {
+pub(super) fn capacity_delay(settings: &Settings, retry: Option<Duration>) -> Duration {
     retry
         .unwrap_or_default()
         .max(Duration::from_secs(settings.capacity_retry_seconds))
-}
-pub(super) async fn wait_capacity(settings: &Settings) {
-    tokio::time::sleep(capacity_delay(settings, None)).await;
 }
 async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<WireBody> {
     let began = Instant::now();
@@ -203,7 +204,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         .iter()
         .map(|p| p.id.clone())
         .collect();
-    let routes: std::collections::HashMap<_, _> = provider_ids
+    let mut routes: std::collections::HashMap<_, _> = provider_ids
         .into_iter()
         .filter_map(|id| gateway.route(&id).map(|r| (id, r)))
         .collect();
@@ -273,12 +274,9 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             .get(header::ACCEPT)
             .is_some_and(|h| h.as_bytes().windows(17).any(|w| w == b"text/event-stream"));
     let mut model = hints.as_ref().ok().and_then(|h| h.model.clone());
-    // Decide this before previous_response_id affinity pinning. Pinning a
-    // request to its owner must not turn a multi-provider queue into a
-    // single-provider protected circuit.
-    let auto_single_provider = mode == "auto" && ids.len() == 1;
+    let mut pinned = (mode == "manual").then(|| ids.first().cloned()).flatten();
     let mut unknown_affinity = false;
-    let _pinned = match hints {
+    let continuation = match hints {
         Ok(hints) if hints.previous_response_id.is_some() => {
             let previous = hints.previous_response_id.unwrap();
             let owner = gateway
@@ -291,6 +289,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 .filter(|(_, _, at)| at.elapsed() < Duration::from_secs(3600))
                 .cloned();
             if let Some((owner, previous_model, _)) = owner {
+                pinned = Some(owner.clone());
                 ids = vec![owner];
                 if model.is_none() {
                     model = previous_model;
@@ -314,33 +313,45 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
     } else {
         Requirement::model(model.as_deref())
     };
-    let initial_ids = ids.clone();
     let mut last = None;
     let mut attempted = 0usize;
     let mut last_category = "NO_PROVIDER";
     let mut wait_budget = Budget::new(settings.queue_seconds);
     let mut capacity_pending = false;
     let mut capacity_retry_after: Option<Duration> = None;
+    let mut capacity_provider = String::new();
+    let mut capacity_waited = Duration::ZERO;
     while attempted <= settings.max_retries {
         // An unknown previous_response_id has no safe owner to replay against;
         // preserve the existing one-attempt rule instead of silently
         // repeating the request on an arbitrary provider.
-        if unknown_affinity && attempted > 0 {
+        if (unknown_affinity || (gateway.client_id() == super::ClientId::Claude && continuation))
+            && attempted > 0
+        {
             break;
         }
         if ids.is_empty() {
-            if capacity_pending
-                && !unknown_affinity
-                && !initial_ids.is_empty()
-                && attempted < settings.max_retries
-            {
-                let mut retry_settings = settings.clone();
-                if let Some(retry) = capacity_retry_after {
-                    retry_settings.capacity_retry_seconds =
-                        retry.as_secs().max(retry_settings.capacity_retry_seconds);
+            if capacity_pending && attempted <= settings.max_retries {
+                let delay = capacity_delay(&settings, capacity_retry_after);
+                let waiting_since = Instant::now();
+                match gateway
+                    .0
+                    .admission
+                    .wait_capacity(&capacity_provider, delay, settings.max_waiting)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(Rejected::Stopped) => {
+                        return error(StatusCode::SERVICE_UNAVAILABLE, "STOPPED", "网关已停止")
+                    }
+                    Err(_) => break,
                 }
-                wait_capacity(&retry_settings).await;
-                ids = initial_ids.clone();
+                capacity_waited += waiting_since.elapsed();
+                ids = gateway.routing_ids(pinned.as_deref());
+                routes = ids
+                    .iter()
+                    .filter_map(|id| gateway.route(id).map(|r| (id.clone(), r)))
+                    .collect();
                 capacity_pending = false;
                 capacity_retry_after = None;
                 continue;
@@ -358,16 +369,13 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         } = match gateway
             .0
             .admission
-            .acquire_for_with_policy(
+            .acquire_for_immediate(
                 &candidates,
                 mode == "manual",
                 settings.max_waiting,
                 &mut wait_budget,
                 &requirement,
-                gateway.client_id() == super::ClientId::Codex
-                    && mode == "auto"
-                    && auto_single_provider,
-                settings.capacity_retry_seconds,
+                capacity_pending,
             )
             .await
         {
@@ -393,7 +401,6 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             Err(Rejected::Cooling(seconds)) => {
                 if attempted > 0 {
                     if capacity_pending {
-                        capacity_retry_after = Some(Duration::from_secs(seconds));
                         ids.clear();
                         continue;
                     }
@@ -409,8 +416,15 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     .insert(header::RETRY_AFTER, seconds.max(1).into());
                 return response;
             }
+            Err(Rejected::Stopped) => {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "STOPPED", "网关已停止")
+            }
             Err(Rejected::Model) => {
                 if attempted > 0 {
+                    if capacity_pending {
+                        ids.clear();
+                        continue;
+                    }
                     break;
                 }
                 return error(
@@ -419,7 +433,13 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     requirement.message(),
                 );
             }
-            Err(_) => break,
+            Err(Rejected::Unavailable) => {
+                if capacity_pending {
+                    ids.clear();
+                    continue;
+                }
+                break;
+            }
         };
         ids.retain(|id| id != &route.provider.id);
         let uri = match target_for(route.client_id, &route.provider.base_url, &parts.uri) {
@@ -539,7 +559,15 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             let capacity = route.client_id == super::ClientId::Codex
                 && match &captured {
                     Ok(Ok(body)) => {
-                        capacity_message(status, &body.prefix(128 * 1024).await.unwrap_or_default())
+                        let encoded = body.prefix(128 * 1024).await.unwrap_or_default();
+                        let encoding = response_parts
+                            .headers
+                            .get(header::CONTENT_ENCODING)
+                            .and_then(|h| h.to_str().ok())
+                            .unwrap_or("identity");
+                        let decoded = replay::decode_prefix(&encoded, encoding, 128 * 1024)
+                            .unwrap_or_default();
+                        capacity_message(status, &decoded)
                     }
                     _ => capacity_message(status, &[]),
                 };
@@ -560,7 +588,8 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             last_category = "HTTP";
             if capacity {
                 capacity_pending = true;
-                capacity_retry_after = cooldown;
+                capacity_provider = route.provider.id.clone();
+                capacity_retry_after = capacity_retry_after.max(cooldown);
             }
             continue;
         }
@@ -590,7 +619,8 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             }
         };
         let total_deadline = tokio::time::Instant::now()
-            + Duration::from_secs(settings.total_seconds).saturating_sub(began.elapsed());
+            + Duration::from_secs(settings.total_seconds)
+                .saturating_sub(began.elapsed().saturating_sub(capacity_waited));
         let g = gateway.clone();
         let cfg = settings.clone();
         let neutral = status.as_u16() >= 400;
@@ -667,54 +697,36 @@ pub(super) fn settle_protocol(
 }
 pub(super) struct Permits {
     provider: Option<Permit>,
-    protected_single_provider: bool,
 }
 impl Permits {
     pub(super) fn capacity_limited(&mut self, cfg: &Settings, retry: Option<Duration>) {
         if let Some(p) = self.provider.take() {
-            p.finish_with_policy(
-                Outcome::CapacityLimited(retry),
-                cfg,
-                self.protected_single_provider,
-            );
+            p.finish(Outcome::CapacityLimited(retry), cfg);
         }
     }
     pub(super) fn rate_limited(&mut self, cfg: &Settings, retry: Option<Duration>) {
         if let Some(p) = self.provider.take() {
-            p.finish_with_policy(
-                Outcome::RateLimited(retry),
-                cfg,
-                self.protected_single_provider,
-            );
+            p.finish(Outcome::RateLimited(retry), cfg);
         }
     }
-    pub(super) fn acquire(
-        route: &Route,
-        manual: bool,
-        protected_single_provider: bool,
-    ) -> Option<Self> {
+    pub(super) fn acquire(route: &Route, manual: bool) -> Option<Self> {
         Some(Self {
-            provider: Some(
-                route
-                    .provider_circuit
-                    .acquire_with_protection(manual, protected_single_provider)?,
-            ),
-            protected_single_provider,
+            provider: Some(route.provider_circuit.acquire(manual)?),
         })
     }
     pub(super) fn success(&mut self, cfg: &Settings) {
         if let Some(p) = self.provider.take() {
-            p.finish_with_policy(Outcome::Success, cfg, self.protected_single_provider);
+            p.finish(Outcome::Success, cfg);
         }
     }
     pub(super) fn neutral(&mut self, cfg: &Settings) {
         if let Some(p) = self.provider.take() {
-            p.finish_with_policy(Outcome::Neutral, cfg, self.protected_single_provider);
+            p.finish(Outcome::Neutral, cfg);
         }
     }
     pub(super) fn failure(&mut self, cfg: &Settings, retry: Option<Duration>) {
         if let Some(p) = self.provider.take() {
-            p.finish_with_policy(Outcome::Failure(retry), cfg, self.protected_single_provider);
+            p.finish(Outcome::Failure(retry), cfg);
         }
     }
 }
