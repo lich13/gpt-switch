@@ -12,6 +12,7 @@ import {
   Search,
   X,
   Settings2,
+  RotateCcw,
 } from "lucide-react";
 import { command, preview, subscribe } from "./bridge";
 import { errorOf, type GatewayState, type ViewState } from "./types";
@@ -20,6 +21,7 @@ import { providerStatus } from "./provider-status";
 import QuickControls from "./QuickControls";
 import AuthSyncNotice from "./AuthSyncNotice";
 import ProviderControls from "./ProviderControls";
+import ProviderNameEditor from "./ProviderNameEditor";
 import SortableProviders, { type ProviderCommit } from "./SortableProviders";
 type Preferences = {
   pinned: boolean;
@@ -200,6 +202,11 @@ function QuickContent({
   };
   const providerEdit: ProviderCommit = (payload, expected) =>
     action(() => edit(payload, expected), false);
+  const resetProvider = (provider: GatewayState["providers"][number]) =>
+    run(async () => {
+      await edit({ op: "reset", id: provider.id });
+      setNotice("已重置熔断");
+    });
   const account = async (id: string) => {
     if (!accounts) return;
     setAccounts(
@@ -363,6 +370,9 @@ function QuickContent({
                     <>
                       <div className="quick-provider-main">
                         {handle}
+                        {priority && (
+                          <span className="quick-priority">P{priority}</span>
+                        )}
                         <button
                           className="quick-select"
                           disabled={rowBusy}
@@ -371,14 +381,27 @@ function QuickContent({
                           }
                           aria-label={`选择 ${p.name}`}
                         >
-                          {priority && (
-                            <span className="quick-priority">P{priority}</span>
-                          )}
-                          <span className="quick-name">
-                            <strong title={p.name}>{p.name}</strong>
-                          </span>
                           {gateway.mode === "manual" &&
                             gateway.selected === p.id && <Check size={15} />}
+                          <span>{gateway.mode === "manual" && gateway.selected === p.id ? "已选择" : "选择"}</span>
+                        </button>
+                        <ProviderNameEditor
+                          provider={p}
+                          revision={gateway.revision}
+                          disabled={rowBusy}
+                          commit={(payload, revision) => edit(payload, revision)}
+                          report={setError}
+                          className="quick-name"
+                        />
+                        <button
+                          type="button"
+                          className="icon-button compact quick-provider-reset"
+                          aria-label={`${p.name} 重置熔断`}
+                          title="重置熔断"
+                          disabled={rowBusy}
+                          onClick={() => resetProvider(p)}
+                        >
+                          <RotateCcw size={14} />
                         </button>
                         <button
                           className="icon-button quick-provider-settings"

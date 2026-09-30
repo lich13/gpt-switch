@@ -385,13 +385,29 @@ impl Gateway {
     ) -> Result<View> {
         let _network_guard = self.0.registry.mutation.lock().unwrap();
         let mut s = self.0.inner.lock().unwrap();
-        s.home = Some(home.to_owned());
         if expected != self.view_revision(&s) {
             return Err(AppError::new(
                 "CONFLICT",
                 "网关设置已变化，请使用最新状态重试",
             ));
         }
+        if let Edit::Reset { id } = &edit {
+            if !s.store.providers.iter().any(|p| &p.id == id) {
+                return Err(AppError::new("PROVIDER", "供应商不存在"));
+            }
+            let prefix = format!("provider:{id}:");
+            let circuits: Vec<_> = s
+                .circuits
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, circuit)| circuit.clone())
+                .collect();
+            self.0.admission.reset_provider(id, &circuits);
+            drop(s);
+            self.changed();
+            return Ok(self.view());
+        }
+        s.home = Some(home.to_owned());
         if !s.running && self.0.data.join("gateway-recovery.json").exists() {
             return Err(AppError::new("RECOVERY", "请先处理未完成的配置事务"));
         }
@@ -401,14 +417,6 @@ impl Gateway {
         let direct_select = !s.running && matches!(&edit, Edit::Select { .. });
         let mut next = s.store.clone();
         match edit {
-            Edit::Reset { id } => {
-                let prefix = format!("provider:{id}:");
-                for (k, c) in &s.circuits {
-                    if k.starts_with(&prefix) {
-                        c.reset();
-                    }
-                }
-            }
             Edit::Import => {
                 let (base_url, token) = takeover::import_for(self.0.client, home)?;
                 next.edit(
@@ -849,31 +857,6 @@ impl Gateway {
             return Err(AppError::new("STALE", "供应商配置已变化，已丢弃旧模型列表"));
         }
         Ok(result)
-    }
-    pub async fn test_connection(&self, id: &str) -> Result<u64> {
-        let (p, cfg) = {
-            let s = self.0.inner.lock().unwrap();
-            let p = s
-                .store
-                .providers
-                .iter()
-                .find(|p| p.id == id)
-                .ok_or_else(|| AppError::new("PROVIDER", "供应商不存在"))?
-                .clone();
-            (p, s.store.settings.clone())
-        };
-        let connector = Connector::new(Duration::from_secs(cfg.connect_seconds), cfg.port)
-            .with_ports(self.0.registry.ports.clone());
-        let began = Instant::now();
-        let uri = p
-            .base_url
-            .parse()
-            .map_err(|_| AppError::new("URL", "base_url 无效"))?;
-        connector
-            .connect(uri)
-            .await
-            .map_err(|e| AppError::new("CONNECT", &e.to_string()))?;
-        Ok(began.elapsed().as_millis() as u64)
     }
     fn sync_single_protection(&self, state: &Inner) {
         let mut queue = state.store.providers.iter().filter(|p| p.queued);

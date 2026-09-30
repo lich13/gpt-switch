@@ -1,5 +1,5 @@
 use super::{
-    admission::{Admission, Budget, Rejected},
+    admission::{Admission, Budget, CapacitySource, Rejected},
     circuit::{self, Outcome, Permit},
     connector::{self, BoxError},
     model::Settings,
@@ -319,7 +319,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
     let mut wait_budget = Budget::new(settings.queue_seconds);
     let mut capacity_pending = false;
     let mut capacity_retry_after: Option<Duration> = None;
-    let mut capacity_provider = String::new();
+    let mut capacity_sources = Vec::new();
     let mut capacity_waited = Duration::ZERO;
     while attempted <= settings.max_retries {
         // An unknown previous_response_id has no safe owner to replay against;
@@ -337,7 +337,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 match gateway
                     .0
                     .admission
-                    .wait_capacity(&capacity_provider, delay, settings.max_waiting)
+                    .wait_capacity(&capacity_sources, delay, settings.max_waiting)
                     .await
                 {
                     Ok(()) => {}
@@ -354,6 +354,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     .collect();
                 capacity_pending = false;
                 capacity_retry_after = None;
+                capacity_sources.clear();
                 continue;
             }
             break;
@@ -366,6 +367,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             route,
             mut permits,
             slot,
+            reset_generation,
         } = match gateway
             .0
             .admission
@@ -588,7 +590,10 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             last_category = "HTTP";
             if capacity {
                 capacity_pending = true;
-                capacity_provider = route.provider.id.clone();
+                capacity_sources.push(CapacitySource {
+                    provider_id: route.provider.id.clone(),
+                    reset_generation,
+                });
                 capacity_retry_after = capacity_retry_after.max(cooldown);
             }
             continue;

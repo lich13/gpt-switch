@@ -192,6 +192,72 @@ async fn capacity_wait_is_bounded_cancelable_and_stopped_without_holding_slots()
 }
 
 #[tokio::test]
+async fn reset_provider_wakes_capacity_wait_and_retries_without_extra_attempt() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = hits.clone();
+    let upstream = server(move |_| {
+        let attempt = count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if attempt == 0 {
+                Response::builder()
+                    .status(429)
+                    .body(full("selected model is at capacity"))
+                    .unwrap()
+            } else {
+                Response::new(full("retried after reset"))
+            }
+        }
+    })
+    .await;
+    let (t, g) = fixture(vec![format!("http://127.0.0.1:{upstream}/v1")]).await;
+    configure(&g, &t, 1);
+    update(
+        &g,
+        &t,
+        Edit::Settings {
+            settings: Settings {
+                capacity_retry_seconds: 60,
+                ..g.view().settings
+            },
+        },
+    );
+    start(&g, &t).await;
+    let task = {
+        let g = g.clone();
+        tokio::spawn(async move {
+            request(
+                &g,
+                "/v1/responses",
+                br#"{"model":"test"}"#.to_vec(),
+                vec![("content-type", "application/json")],
+            )
+            .await
+        })
+    };
+    until(|| !g.view().capacity_retries.is_empty()).await;
+    update(
+        &g,
+        &t,
+        Edit::Reset {
+            id: g.view().providers[0].id.clone(),
+        },
+    );
+    let response = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "retried after reset"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(g.view().capacity_retries.is_empty());
+    assert_eq!(g.view().providers[0].active_requests, 0);
+    g.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn capacity_round_reads_new_queue_and_routes_without_touching_files() {
     let first = server(|_| async {
         Response::builder()

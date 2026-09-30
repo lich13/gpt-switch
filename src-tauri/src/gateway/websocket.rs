@@ -1,7 +1,7 @@
 //! Responses uses per-generation slots, following Sub2API's BeforeTurn/AfterTurn
 //! behavior (a3eb7ef3). Payloads are observed, never rewritten or replayed after upgrade.
 use super::{
-    admission::{Admission, Budget, Rejected},
+    admission::{Admission, Budget, CapacitySource, Rejected},
     circuit, forward,
     model::Settings,
     replay,
@@ -388,7 +388,7 @@ async fn session(
     let mut attempts = 0;
     let mut capacity_pending = false;
     let mut capacity_retry_after: Option<Duration> = None;
-    let mut capacity_provider = String::new();
+    let mut capacity_sources = Vec::new();
     let (mut upstream_peer, admission, initial_protocol) = loop {
         if attempts > cfg.max_retries || (unknown_affinity && attempts > 0) {
             return Err((1013, "all providers failed"));
@@ -401,7 +401,7 @@ async fn session(
                 return Ok(());
             }
             tokio::select! {
-                result = g.0.admission.wait_capacity(&capacity_provider, forward::capacity_delay(cfg, capacity_retry_after), cfg.max_waiting) => result.map_err(rejected)?,
+                result = g.0.admission.wait_capacity(&capacity_sources, forward::capacity_delay(cfg, capacity_retry_after), cfg.max_waiting) => result.map_err(rejected)?,
                 _ = client.closed.changed() => return Ok(()),
             }
             ids = g.routing_ids(pinned.as_deref());
@@ -411,6 +411,7 @@ async fn session(
                 .collect();
             capacity_pending = false;
             capacity_retry_after = None;
+            capacity_sources.clear();
             continue;
         }
         let candidates: Vec<_> = ids
@@ -467,7 +468,10 @@ async fn session(
                 }
                 if capacity {
                     capacity_pending = true;
-                    capacity_provider = admission.route.provider.id.clone();
+                    capacity_sources.push(CapacitySource {
+                        provider_id: admission.route.provider.id.clone(),
+                        reset_generation: admission.reset_generation,
+                    });
                     capacity_retry_after = capacity_retry_after.max(retry);
                 }
             }

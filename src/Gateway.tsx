@@ -6,6 +6,7 @@ import type { ClientId } from "./types";
 import { confirmAction } from "./confirmation";
 import ProviderSettings from "./ProviderSettings";
 import ProviderControls from "./ProviderControls";
+import ProviderNameEditor from "./ProviderNameEditor";
 import SortableProviders, { type ProviderCommit } from "./SortableProviders";
 import Modal from "./Modal";
 import { providerStatus } from "./provider-status";
@@ -36,7 +37,6 @@ import {
 type Edit = Record<string, unknown>;
 type Dialog =
   | { kind: "provider"; item?: Provider }
-  | { kind: "rename"; item: Provider }
   | { kind: "models"; item: Provider }
   | { kind: "settings"; item: Provider }
   | { kind: "quota"; item: Provider }
@@ -89,6 +89,7 @@ function GatewayContent({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [dialog, setDialog] = useState<Dialog>(null);
+  const [renameRequest, setRenameRequest] = useState<{ id: string; sequence: number } | null>(null);
   const quota = useProviderQuota(
     state?.providers ?? [],
     true,
@@ -193,6 +194,13 @@ function GatewayContent({
           : `文件已切换，请重新打开 ${clientName(clientId)}`,
       );
     });
+  const resetProvider = (p: Provider) =>
+    run(async () => {
+      await edit({ op: "reset", id: p.id });
+      notify("已重置熔断");
+    });
+  const renameProvider = (payload: { op: "renameProvider"; id: string; name: string }, revision: string) =>
+    edit(payload, revision);
   const menuClose = (e: React.MouseEvent) =>
     e.currentTarget.closest("details")?.removeAttribute("open");
   return (
@@ -312,9 +320,14 @@ function GatewayContent({
                   <div className="provider-main">
                     {handle}
                     {priority && <span className="priority">P{priority}</span>}
-                    <strong className="provider-title" title={p.name}>
-                      {p.name}
-                    </strong>
+                    <ProviderNameEditor
+                      provider={p}
+                      revision={state.revision}
+                      disabled={rowBusy}
+                      commit={renameProvider}
+                      report={setError}
+                      request={renameRequest?.id === p.id ? renameRequest.sequence : undefined}
+                    />
                     {status && (
                       <button
                         className="provider-alert"
@@ -342,6 +355,16 @@ function GatewayContent({
                       ) : (
                         "选择"
                       )}
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-button compact provider-reset"
+                      aria-label={`${p.name} 重置熔断`}
+                      title="重置熔断"
+                      disabled={rowBusy}
+                      onClick={() => resetProvider(p)}
+                    >
+                      <RotateCcw size={14} />
                     </button>
                     <details className="row-menu">
                       <summary
@@ -371,30 +394,14 @@ function GatewayContent({
                           编辑 API
                         </button>
                         <button
-                          onClick={() => setDialog({ kind: "rename", item: p })}
+                          onClick={() =>
+                            setRenameRequest({
+                              id: p.id,
+                              sequence: Date.now(),
+                            })
+                          }
                         >
                           重命名
-                        </button>
-                        <button
-                          disabled={busy}
-                          onClick={() =>
-                            run(async () =>
-                              notify(
-                                `TCP / TLS 连接正常 · ${await command<number>("test_provider", { clientId, id: p.id })} ms`,
-                              ),
-                            )
-                          }
-                        >
-                          测试连接
-                        </button>
-                        <button
-                          disabled={busy}
-                          onClick={() =>
-                            run(() => edit({ op: "reset", id: p.id }))
-                          }
-                        >
-                          <RotateCcw size={14} />
-                          重置熔断
                         </button>
                         <button
                           className="danger"
@@ -510,7 +517,7 @@ function GatewayContent({
           }}
         />
       )}
-      {dialog && (dialog.kind === "provider" || dialog.kind === "rename") && (
+      {dialog?.kind === "provider" && (
         <GatewayDialog
           clientId={clientId}
           dialog={dialog}
@@ -623,7 +630,7 @@ function GatewayDialog({
   onDirtyChange,
 }: {
   clientId: ClientId;
-  dialog: Extract<NonNullable<Dialog>, { kind: "provider" | "rename" }>;
+  dialog: Extract<NonNullable<Dialog>, { kind: "provider" }>;
   close: () => void;
   save: (p: Edit) => Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;
@@ -632,21 +639,17 @@ function GatewayDialog({
   const [busy, setBusy] = useState(false),
     [error, setError] = useState("");
   const [baseUrl, setBaseUrl] = useState(
-      dialog.kind === "provider" ? (dialog.item?.baseUrl ?? "") : "",
+      dialog.item?.baseUrl ?? "",
     ),
     [token, setToken] = useState("");
-  const [name, setName] = useState(dialog.item?.name ?? "");
-  const initialDraft = useRef(JSON.stringify([baseUrl, token, name]));
+  const initialDraft = useRef(JSON.stringify([baseUrl, token]));
   useEffect(() => {
     onDirtyChange?.(
-      JSON.stringify([baseUrl, token, name]) !== initialDraft.current,
+      JSON.stringify([baseUrl, token]) !== initialDraft.current,
     );
-  }, [baseUrl, token, name, onDirtyChange]);
+  }, [baseUrl, token, onDirtyChange]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
-  const title =
-    dialog.kind === "rename"
-      ? "重命名供应商"
-      : `${dialog.item ? "编辑" : "添加"}供应商`;
+  const title = `${dialog.item ? "编辑" : "添加"}供应商`;
   return (
     <Modal title={title} close={close} busy={busy}>
       <form
@@ -655,24 +658,20 @@ function GatewayDialog({
           e.preventDefault();
           setError("");
           setBusy(true);
-          const payload =
-            dialog.kind === "provider"
-              ? {
-                  op: "saveProvider",
-                  id: dialog.item?.id ?? null,
-                  baseUrl,
-                  token,
-                }
-              : { op: "renameProvider", id: dialog.item.id, name };
+          const payload = {
+            op: "saveProvider",
+            id: dialog.item?.id ?? null,
+            baseUrl,
+            token,
+          };
           void initialSave
             .current(payload)
             .catch((e) => setError(errorOf(e).message))
             .finally(() => setBusy(false));
         }}
       >
-        {dialog.kind === "provider" ? (
-          <>
-            <label>
+        <>
+          <label>
               {clientId === "claude" ? "ANTHROPIC_BASE_URL" : "base_url"}
               <input
                 required
@@ -686,8 +685,8 @@ function GatewayDialog({
                     : "https://api.example.com/v1"
                 }
               />
-            </label>
-            <label>
+          </label>
+          <label>
               {clientId === "claude"
                 ? "ANTHROPIC_AUTH_TOKEN"
                 : "experimental_bearer_token"}
@@ -699,20 +698,8 @@ function GatewayDialog({
                 onChange={(e) => setToken(e.target.value)}
                 placeholder={dialog.item ? "留空保留当前 Token" : "输入 Token"}
               />
-            </label>
-          </>
-        ) : (
-          <label>
-            名称
-            <input
-              required
-              autoFocus
-              maxLength={120}
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
           </label>
-        )}
+        </>
         {error && (
           <div className="banner error" role="alert">
             {error}

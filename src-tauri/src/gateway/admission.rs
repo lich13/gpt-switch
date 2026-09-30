@@ -1,6 +1,6 @@
 //! Request slots and bounded FIFO admission. Behavior informed by Sub2API
 //! a3eb7ef3 concurrency_service / account scheduler; independently implemented in Rust.
-use super::{forward::Permits, model::Provider, routing::Requirement, Route};
+use super::{circuit::Circuit, forward::Permits, model::Provider, routing::Requirement, Route};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
@@ -25,6 +25,12 @@ struct State {
     active: HashMap<String, usize>,
     waiting: VecDeque<(u64, Vec<String>)>,
     capacity_waits: HashMap<u64, (String, Instant)>,
+    resets: HashMap<String, u64>,
+}
+#[derive(Clone)]
+pub struct CapacitySource {
+    pub provider_id: String,
+    pub reset_generation: u64,
 }
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +54,7 @@ pub struct Admission {
     pub route: Route,
     pub permits: Permits,
     pub slot: Slot,
+    pub reset_generation: u64,
 }
 #[derive(Debug, PartialEq)]
 pub enum Rejected {
@@ -119,7 +126,7 @@ impl Scheduler {
     }
     pub async fn wait_capacity(
         &self,
-        provider: &str,
+        sources: &[CapacitySource],
         delay: Duration,
         max_waiting: usize,
     ) -> Result<(), Rejected> {
@@ -129,13 +136,24 @@ impl Scheduler {
             if !s.running {
                 return Err(Rejected::Stopped);
             }
+            if Self::was_reset(&s, sources) {
+                return Ok(());
+            }
             if s.waiting.len() + s.capacity_waits.len() >= max_waiting {
                 return Err(Rejected::Full);
             }
             s.next += 1;
             let ticket = s.next;
-            s.capacity_waits
-                .insert(ticket, (provider.to_owned(), until));
+            s.capacity_waits.insert(
+                ticket,
+                (
+                    sources
+                        .last()
+                        .map(|s| s.provider_id.clone())
+                        .unwrap_or_default(),
+                    until,
+                ),
+            );
             (ticket, s.epoch)
         };
         let _wait = CapacityWait {
@@ -152,12 +170,32 @@ impl Scheduler {
                 if !s.running || s.epoch != epoch {
                     return Err(Rejected::Stopped);
                 }
+                if Self::was_reset(&s, sources) {
+                    return Ok(());
+                }
             }
             tokio::select! {
                 _ = notified => {},
                 _ = tokio::time::sleep_until(until.into()) => return Ok(()),
             }
         }
+    }
+    fn was_reset(state: &State, sources: &[CapacitySource]) -> bool {
+        sources.iter().any(|source| {
+            state.resets.get(&source.provider_id).copied().unwrap_or(0) != source.reset_generation
+        })
+    }
+    pub fn reset_provider(&self, id: &str, circuits: &[Circuit]) {
+        // Same lock order as admission: slot state, then circuit. Capture the
+        // reset generation with each reservation so a reset during an upstream
+        // attempt cannot be lost before that attempt registers its wait.
+        let mut state = self.0.state.lock().unwrap();
+        for circuit in circuits {
+            circuit.reset();
+        }
+        *state.resets.entry(id.to_owned()).or_default() += 1;
+        drop(state);
+        self.signal();
     }
     pub fn signal(&self) {
         self.0.wake.notify_waiters();
@@ -282,6 +320,7 @@ impl Scheduler {
                             accepted = Some(Admission {
                                 route: (**route).clone(),
                                 permits,
+                                reset_generation: s.resets.get(id).copied().unwrap_or(0),
                                 slot: Slot {
                                     scheduler: self.clone(),
                                     id: id.clone(),

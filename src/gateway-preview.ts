@@ -94,7 +94,6 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
     s.configState = "provider";
     s.configProvider = s.selected;
   }
-  if (name === "test_provider") return 84;
   if (name === "query_provider_quota") {
     const provider = s.providers.find((p) => p.id === args.providerId)!;
     const result: ProviderQuota = {
@@ -144,6 +143,7 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
     if (e.op === "concurrencyProvider" && p)
       p.maxConcurrency = Number(e.maxConcurrency);
     if (e.op === "renameProvider" && p) p.name = String(e.name);
+    if (e.op === "reset" && p) p.health = { ...healthy };
     if (e.op === "deleteProvider")
       s.providers = s.providers.filter((p) => p.id !== id);
     if (e.op === "reorder")

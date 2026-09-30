@@ -86,6 +86,34 @@ it("uses current revisions for quick actions without initializing the main windo
     expectedRevision: "external-auth",
   });
 });
+
+it("keeps provider naming separate from selection and exposes reset in the quick panel", async () => {
+  const user = userEvent.setup();
+  render(<QuickPanel />);
+  const name = await screen.findByRole("button", {
+    name: `${gatewayDemo.providers[0].name} 名称`,
+  });
+  await user.dblClick(name);
+  const input = screen.getByRole("textbox", {
+    name: `${gatewayDemo.providers[0].name} 名称`,
+  });
+  await user.clear(input);
+  await user.type(input, "快捷名称");
+  await user.keyboard("{Enter}");
+  expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+    clientId: "codex",
+    edit: { op: "renameProvider", id: "primary", name: "快捷名称" },
+    expectedRevision: gatewayDemo.revision,
+  });
+  await user.click(
+    screen.getByRole("button", { name: `${gatewayDemo.providers[0].name} 重置熔断` }),
+  );
+  expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+    clientId: "codex",
+    edit: { op: "reset", id: "primary" },
+    expectedRevision: gatewayDemo.revision,
+  });
+});
 it("can restore a newer saved credential without auto-writing the auth file", async () => {
   const user = userEvent.setup();
   render(<QuickPanel />);

@@ -602,14 +602,6 @@ async fn stop_gateway(
     Ok(result)
 }
 #[tauri::command]
-async fn test_provider(
-    client_id: gateway::ClientId,
-    r: tauri::State<'_, Arc<Runtime>>,
-    id: String,
-) -> Result<u64> {
-    r.gateway(client_id).test_connection(&id).await
-}
-#[tauri::command]
 async fn query_provider_quota(
     client_id: gateway::ClientId,
     r: tauri::State<'_, Arc<Runtime>>,
@@ -1164,7 +1156,6 @@ pub fn run() {
             update_gateway,
             start_gateway,
             stop_gateway,
-            test_provider,
             query_provider_quota,
             list_provider_models,
             get_state,

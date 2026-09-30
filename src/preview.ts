@@ -193,7 +193,6 @@ export async function run(
       "start_gateway",
       "stop_gateway",
       "update_gateway",
-      "test_provider",
       "query_provider_quota",
     ].includes(name)
   ) {
@@ -203,7 +202,7 @@ export async function run(
         clientId: args.clientId ?? "codex",
         quota: result,
       });
-    else if (name !== "test_provider") emit("gateway-state", result);
+    else emit("gateway-state", result);
     return result;
   }
   switch (name) {

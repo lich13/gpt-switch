@@ -29,12 +29,42 @@ beforeEach(() => {
         return structuredClone(
           args?.clientId === "claude" ? claudeState : state,
         );
-      if (name === "test_provider") return 51;
     },
   );
 });
 afterEach(() => localStorage.clear());
 describe("gateway controls", () => {
+  it("resets a provider from the row and edits its name by double click", async () => {
+    const user = userEvent.setup();
+    render(<Gateway notify={() => {}} />);
+    const provider = await screen.findByRole("button", {
+      name: `${state.providers[0].name} 名称`,
+    });
+    await user.dblClick(provider);
+    const input = screen.getByRole("textbox", {
+      name: `${state.providers[0].name} 名称`,
+    });
+    await user.clear(input);
+    await user.type(input, "新的供应商");
+    await user.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+        clientId: "codex",
+        edit: { op: "renameProvider", id: state.providers[0].id, name: "新的供应商" },
+        expectedRevision: state.revision,
+      }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: `${state.providers[0].name} 重置熔断` }),
+    );
+    expect(mock.command).toHaveBeenCalledWith("update_gateway", {
+      clientId: "codex",
+      edit: { op: "reset", id: state.providers[0].id },
+      expectedRevision: state.revision,
+    });
+    expect(screen.queryByText("测试连接")).not.toBeInTheDocument();
+  });
+
   it("keeps the provider API form to two fields and sends no guessed model settings", async () => {
     const user = userEvent.setup();
     render(<Gateway notify={() => {}} />);
