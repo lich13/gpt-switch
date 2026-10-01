@@ -44,7 +44,11 @@ export const gatewayDemo: GatewayState = {
       quotaVersion: "preview-quota",
       quota: null,
       maxConcurrency: 4,
+      maxRpm: 60,
       activeRequests: 0,
+      rpmUsed: 0,
+      rpmRetryIn: 0,
+      rpmLimited: false,
       allowedModels: null,
       supportsWebsocket: true,
     },
@@ -57,7 +61,11 @@ export const gatewayDemo: GatewayState = {
       quotaVersion: "preview-quota",
       quota: null,
       maxConcurrency: 0,
+      maxRpm: 0,
       activeRequests: 0,
+      rpmUsed: 0,
+      rpmRetryIn: 0,
+      rpmLimited: false,
       allowedModels: null,
       supportsWebsocket: true,
     },
@@ -144,6 +152,7 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
     if (e.op === "queueProvider" && p) p.queued = Boolean(e.queued);
     if (e.op === "concurrencyProvider" && p)
       p.maxConcurrency = Number(e.maxConcurrency);
+    if (e.op === "rpmProvider" && p) p.maxRpm = Number(e.maxRpm);
     if (e.op === "renameProvider" && p) p.name = String(e.name);
     if (e.op === "reset" && p) p.health = { ...healthy };
     if (e.op === "deleteProvider")
@@ -165,7 +174,11 @@ export function gatewayPreview(name: string, args: Record<string, unknown>) {
           quotaVersion: crypto.randomUUID(),
           quota: null,
           maxConcurrency: 0,
+          maxRpm: 0,
           activeRequests: 0,
+          rpmUsed: 0,
+          rpmRetryIn: 0,
+          rpmLimited: false,
           allowedModels: null,
           supportsWebsocket: true,
         });

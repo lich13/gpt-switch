@@ -2000,6 +2000,7 @@ select:focus-visible {
   flex-shrink: 0;
 }
 .provider-concurrency,
+.provider-rpm,
 .provider-queue {
   display: inline-flex;
   align-items: center;
@@ -2016,6 +2017,7 @@ select:focus-visible {
   white-space: nowrap;
 }
 .provider-concurrency[aria-expanded="true"],
+.provider-rpm[aria-expanded="true"],
 .provider-queue[aria-pressed="true"] {
   color: var(--ink);
   background: var(--elevated);
@@ -2105,6 +2107,7 @@ select:focus-visible {
   gap: 5px;
 }
 .quick-provider-secondary .provider-concurrency,
+.quick-provider-secondary .provider-rpm,
 .quick-provider-secondary .provider-queue {
   padding: 0 5px;
   font-size: 12px;

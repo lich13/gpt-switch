@@ -14,6 +14,8 @@ pub struct Provider {
     #[serde(default)]
     pub max_concurrency: u32,
     #[serde(default)]
+    pub max_rpm: u32,
+    #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
     #[serde(default = "default_websocket_support")]
     pub supports_websocket: bool,
@@ -173,6 +175,10 @@ pub enum Edit {
         id: String,
         max_concurrency: u32,
     },
+    RpmProvider {
+        id: String,
+        max_rpm: u32,
+    },
     ModelsProvider {
         id: String,
         allowed_models: Option<Vec<String>>,
@@ -316,6 +322,7 @@ impl Store {
                         queued: true,
                         version: uuid::Uuid::new_v4().to_string(),
                         max_concurrency: 0,
+                        max_rpm: 0,
                         allowed_models: None,
                         supports_websocket: default_websocket_support(),
                     });
@@ -345,6 +352,12 @@ impl Store {
                     ));
                 }
                 self.provider_mut(&id)?.max_concurrency = max_concurrency;
+            }
+            Edit::RpmProvider { id, max_rpm } => {
+                if max_rpm > 100000 {
+                    return Err(AppError::new("RPM", "RPM 上限应为 0–100000，0 表示不限"));
+                }
+                self.provider_mut(&id)?.max_rpm = max_rpm;
             }
             Edit::ModelsProvider { id, allowed_models } => {
                 let allowed = allowed_models

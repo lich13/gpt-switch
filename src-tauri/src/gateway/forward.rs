@@ -319,6 +319,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
     let mut wait_budget = Budget::new(settings.queue_seconds);
     let mut capacity_pending = false;
     let mut capacity_retry_after: Option<Duration> = None;
+    let mut rpm_retry_after: Option<Duration> = None;
     let mut capacity_sources = Vec::new();
     let mut capacity_waited = Duration::ZERO;
     while attempted <= settings.max_retries {
@@ -363,12 +364,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             .iter()
             .filter_map(|id| routes.get(id).cloned())
             .collect();
-        let Admission {
-            route,
-            mut permits,
-            slot,
-            reset_generation,
-        } = match gateway
+        let mut admission = match gateway
             .0
             .admission
             .acquire_for_immediate(
@@ -418,6 +414,29 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     .insert(header::RETRY_AFTER, seconds.max(1).into());
                 return response;
             }
+            Err(Rejected::RateLimited(seconds)) => {
+                rpm_retry_after = Some(Duration::from_secs(seconds.max(1)));
+                if attempted > 0 {
+                    last_category = "RPM_LIMIT";
+                    break;
+                }
+                let mut response = error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "RPM_LIMIT",
+                    "供应商已达到 RPM 上限，等待后重试",
+                );
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, seconds.max(1).into());
+                return response;
+            }
+            Err(Rejected::RateLedger) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "RPM_LEDGER",
+                    "RPM 状态暂不可用，请稍后重试",
+                )
+            }
             Err(Rejected::Stopped) => {
                 return error(StatusCode::SERVICE_UNAVAILABLE, "STOPPED", "网关已停止")
             }
@@ -443,6 +462,8 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                 break;
             }
         };
+        let route = admission.route.clone();
+        let reset_generation = admission.reset_generation;
         ids.retain(|id| id != &route.provider.id);
         let uri = match target_for(route.client_id, &route.provider.base_url, &parts.uri) {
             Ok(uri) => uri,
@@ -469,6 +490,14 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         } else {
             upstream.headers_mut().remove(header::CONTENT_LENGTH);
         }
+        if admission.commit_rpm().is_err() {
+            admission.permits.neutral(&settings);
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RPM_LEDGER",
+                "RPM 状态暂不可用，请稍后重试",
+            );
+        }
         attempted += 1;
         let started = Instant::now();
         let mut protocol = super::protocol::Protocol::new(stream_hint);
@@ -487,14 +516,14 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     Some(connector::ConnectError::Tls) => "TLS",
                     _ => "NETWORK",
                 };
-                permits.failure(&settings, None);
+                admission.permits.failure(&settings, None);
 
                 protocol.finish(None, last_category);
                 continue;
             }
             Err(_) => {
                 last_category = "FIRST_BYTE_TIMEOUT";
-                permits.failure(&settings, None);
+                admission.permits.failure(&settings, None);
 
                 protocol.finish(None, last_category);
                 continue;
@@ -513,7 +542,8 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             .unwrap_or("");
         protocol.response(status.as_u16(), response_stream, encoding);
         if status == StatusCode::SWITCHING_PROTOCOLS && websocket {
-            permits.success(&settings);
+            admission.permits.success(&settings);
+            let Admission { permits, slot, .. } = admission;
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             let (mut response_parts, _) = response.into_parts();
             clean_headers(&mut response_parts.headers, true);
@@ -523,6 +553,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             tokio::spawn(async move {
                 let _active = active;
                 let _slot = slot;
+                let mut permits = permits;
                 let connected = tokio::try_join!(upstream_upgrade, downstream);
                 if let Ok((a, b)) = connected {
                     // Opaque tunnel preserves every data/control/close frame, including binary payloads.
@@ -574,11 +605,11 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
                     _ => capacity_message(status, &[]),
                 };
             if capacity {
-                permits.capacity_limited(&settings, cooldown);
+                admission.permits.capacity_limited(&settings, cooldown);
             } else if status == StatusCode::TOO_MANY_REQUESTS {
-                permits.rate_limited(&settings, cooldown);
+                admission.permits.rate_limited(&settings, cooldown);
             } else {
-                permits.failure(&settings, cooldown);
+                admission.permits.failure(&settings, cooldown);
             }
 
             if let Ok(Ok(body)) = captured {
@@ -616,7 +647,7 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
             Ok(Some(Ok(frame))) => Some(frame),
             Ok(None) => None,
             _ => {
-                permits.failure(&settings, None);
+                admission.permits.failure(&settings, None);
 
                 last_category = "FIRST_BYTE_TIMEOUT";
                 protocol.finish(Some(status.as_u16()), last_category);
@@ -626,6 +657,9 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         let total_deadline = tokio::time::Instant::now()
             + Duration::from_secs(settings.total_seconds)
                 .saturating_sub(began.elapsed().saturating_sub(capacity_waited));
+        let Admission {
+            mut permits, slot, ..
+        } = admission;
         let g = gateway.clone();
         let cfg = settings.clone();
         let neutral = status.as_u16() >= 400;
@@ -663,19 +697,36 @@ async fn forward(gateway: Gateway, mut request: Request<Incoming>) -> Response<W
         return Response::from_parts(response_parts, StreamBody::new(output).boxed_unsync());
     }
     last.unwrap_or_else(|| {
-        error(
-            if attempted == 0 {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_GATEWAY
-            },
-            last_category,
-            if attempted == 0 {
-                "没有可用供应商，请检查队列和熔断状态"
-            } else {
-                "所有可用供应商均请求失败"
-            },
-        )
+        if last_category == "RPM_LIMIT" {
+            let mut response = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "RPM_LIMIT",
+                "供应商已达到 RPM 上限，等待后重试",
+            );
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                rpm_retry_after
+                    .unwrap_or(Duration::from_secs(1))
+                    .as_secs()
+                    .max(1)
+                    .into(),
+            );
+            response
+        } else {
+            error(
+                if attempted == 0 {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                last_category,
+                if attempted == 0 {
+                    "没有可用供应商，请检查队列和熔断状态"
+                } else {
+                    "所有可用供应商均请求失败"
+                },
+            )
+        }
     })
 }
 fn remember(protocol: &super::protocol::Protocol, g: &Gateway, route: &Route, model: Option<&str>) {

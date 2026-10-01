@@ -225,6 +225,8 @@ fn rejected(reason: Rejected) -> Failure {
         Rejected::Unavailable => (1013, "no available provider"),
         Rejected::Cooling(_) => (1013, "providers cooling down; retry later"),
         Rejected::Full | Rejected::Timeout => (1013, "provider concurrency full; retry later"),
+        Rejected::RateLimited(_) => (1013, "provider RPM limit reached; retry later"),
+        Rejected::RateLedger => (1011, "RPM state unavailable"),
     }
 }
 pub(super) fn accept(
@@ -1063,6 +1065,9 @@ async fn session_once(
             }
             Err(error) => return Err(error),
         };
+        if let Err(reason) = admission.commit_rpm() {
+            return Err(rejected(reason));
+        }
         ids.retain(|id| id != &admission.route.provider.id);
         attempts += 1;
         let result = while_connecting(client, async {
@@ -1157,7 +1162,12 @@ async fn session_once(
                 )
                 .await;
                 match acquired {
-                    Ok(admission) => turn = Some(admission),
+                    Ok(mut admission) => {
+                        if let Err(reason) = admission.commit_rpm() {
+                            return Err(rejected(reason));
+                        }
+                        turn = Some(admission)
+                    }
                     Err(TURN_CANCELLED) => {
                         cancellation(client).await?;
                         continue;

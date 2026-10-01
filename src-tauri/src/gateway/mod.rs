@@ -50,7 +50,12 @@ pub struct ProviderView {
     quota_version: String,
     quota: Option<QuotaView>,
     pub max_concurrency: u32,
+    pub max_rpm: u32,
     pub active_requests: usize,
+    pub rpm_used: usize,
+    pub rpm_retry_in: u64,
+    pub rpm_limited: bool,
+    pub rpm_ledger_error: bool,
     pub allowed_models: Option<Vec<String>>,
     pub supports_websocket: bool,
 }
@@ -148,7 +153,7 @@ impl Gateway {
             .map_err(storage::io_error)?;
         storage::protect(spool.path(), true)?;
         let (events, _) = broadcast::channel(32);
-        let admission = admission::Scheduler::new(events.clone());
+        let admission = admission::Scheduler::new(events.clone(), data.join("rpm-window.json"));
         admission.configure(&store.providers, false);
         let gateway = Self(Arc::new(Shared {
             client,
@@ -303,21 +308,30 @@ impl Gateway {
                 .store
                 .providers
                 .iter()
-                .map(|p| ProviderView {
-                    id: p.id.clone(),
-                    name: p.name.clone(),
-                    base_url: p.base_url.clone(),
-                    queued: p.queued,
-                    health: health(pkey(p)),
-                    quota_version: Self::quota_version(&s.store, p),
-                    max_concurrency: p.max_concurrency,
-                    allowed_models: p.allowed_models.clone(),
-                    supports_websocket: p.supports_websocket,
-                    active_requests: occupied.get(&p.id).copied().unwrap_or(0),
-                    quota: self
-                        .0
-                        .quota
-                        .cached(&p.id, &Self::quota_version(&s.store, p)),
+                .map(|p| {
+                    let (rpm_used, rpm_retry_in, rpm_limited, rpm_ledger_error) =
+                        self.0.admission.rpm_status(&p.id, p.max_rpm);
+                    ProviderView {
+                        id: p.id.clone(),
+                        name: p.name.clone(),
+                        base_url: p.base_url.clone(),
+                        queued: p.queued,
+                        health: health(pkey(p)),
+                        quota_version: Self::quota_version(&s.store, p),
+                        max_concurrency: p.max_concurrency,
+                        max_rpm: p.max_rpm,
+                        allowed_models: p.allowed_models.clone(),
+                        supports_websocket: p.supports_websocket,
+                        active_requests: occupied.get(&p.id).copied().unwrap_or(0),
+                        rpm_used,
+                        rpm_retry_in,
+                        rpm_limited,
+                        rpm_ledger_error,
+                        quota: self
+                            .0
+                            .quota
+                            .cached(&p.id, &Self::quota_version(&s.store, p)),
+                    }
                 })
                 .collect(),
             active_connections: self.0.active.load(Ordering::Relaxed),

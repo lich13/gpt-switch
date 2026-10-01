@@ -83,7 +83,7 @@ Responses WebSocket 每个 `response.create` 检查模型，连接建立后固�
 
 ## 并发与启动
 
-主面板与快捷面板的并发按钮可调整独立上限，整数 `0–100000`，`0` 表示不限。队列开关直接加入／移出；拖动左侧手柄重新排序，列表顺序决定自动队列的 P1、P2，未入队项不占编号。键盘空格拾取、上下移动、空格确认、Escape 取消。排序与快捷调整不改变当前选择、路由模式或 Codex 文件；降低上限不终止已有请求。设置保存失败保留输入，其他窗口修改后需使用最新状态重试。
+主面板与快捷面板的并发和 RPM 按钮可分别调整上限，整数 `0–100000`，`0` 表示不限。RPM 使用客户端与供应商隔离的滚动 60 秒窗口；每次真实上游尝试计一次，重试和故障转移也分别计数，达到上限后固定当前供应商等待，不触发熔断或自动换商。RPM 时间戳保存在应用私有账本，重启不会绕过窗口；账本无法读取或写入时保守拒绝请求。队列开关直接加入／移出；拖动左侧手柄重新排序，列表顺序决定自动队列的 P1、P2，未入队项不占编号。键盘空格拾取、上下移动、空格确认、Escape 取消。排序与快捷调整不改变当前选择、路由模式或 Codex 文件；降低并发或 RPM 上限不终止已有请求。设置保存失败保留输入，其他窗口修改后需使用最新状态重试。
 
 HTTP/SSE 从上游转发开始占用到响应结束，取消或失败自动释放；额度和模型查询不占业务名额。自动模式跳过满载供应商，优先分配给下一家；高优先级供应商恢复空闲后重新优先使用。满载不计入失败或重试。所有匹配候选满载、冷却或恢复探测中时，共用默认累计等待 30 秒、最多 100 个请求的 FIFO 队列；唤醒后重新检查规则与优先级。参数可在高级设置修改。队列满或容量超时返回 429 与 Retry-After: 5；冷却超时返回 503 PROVIDERS_COOLING_DOWN 和重试时间。模型不匹配、队列为空等确定性问题立即返回；已有上游尝试全部失败时保留最后一次上游错误。手动模式及已有响应游标绑定的请求仅等待对应供应商。Codex 已收到容量错误后的重试等待采用独立的容量等待时长，不消耗响应读取超时；与并发队列共用等待人数上限，取消或停止网关立即退出，等待结束后重新读取队列、白名单和健康状态。
 
@@ -109,7 +109,7 @@ macOS 通过用户级 LaunchAgent 和系统的登录启动 Apple event 识别启
 
 ## 本地数据
 
-数据目录为 Tauri 的 `com.lich13.gpt-switch` 应用数据目录（macOS：`~/Library/Application Support/com.lich13.gpt-switch`；Windows：`%APPDATA%/com.lich13.gpt-switch`）。`accounts.json` 保存完整账号，`previous-auth.json`、`previous-config.toml`、`claude/previous-settings.json` 各保留一份最近写入前的文件。`startup.json` 保存启动偏好，`quick.json` 保存快捷面板标签与固定状态。`gateway.json` 保存 Codex 状态，`claude/gateway.json` 保存 Claude 状态（供应商、并发、模型白名单、访问令牌和恢复意图）；各客户端目录内的 `gateway-recovery.json` 保存版本化的两字段事务与停止目标，写入完成后清理。供应商 Token 仅用于其上游认证；凭据不写日志、不返回到列表或事件。文件采用当前用户权限，**未加密**，应像原 `auth.json` 一样保护。
+数据目录为 Tauri 的 `com.lich13.gpt-switch` 应用数据目录（macOS：`~/Library/Application Support/com.lich13.gpt-switch`；Windows：`%APPDATA%/com.lich13.gpt-switch`）。`accounts.json` 保存完整账号，`previous-auth.json`、`previous-config.toml`、`claude/previous-settings.json` 各保留一份最近写入前的文件。`startup.json` 保存启动偏好，`quick.json` 保存快捷面板标签与固定状态。`gateway.json` 保存 Codex 状态，`claude/gateway.json` 保存 Claude 状态（供应商、并发、RPM、模型白名单、访问令牌和恢复意图）；各客户端目录内的 `gateway-recovery.json` 保存版本化的两字段事务与停止目标，`rpm-window.json` 只保存最近 60 秒的供应商／客户端限速时间戳，写入完成后清理过期记录。供应商 Token 仅用于其上游认证；凭据不写日志、不返回到列表或事件。文件采用当前用户权限，**未加密**，应像原 `auth.json` 一样保护。
 
 v0.7.0 已移除使用统计、请求日志和模型定价。升级会精确删除应用私有目录内的 `usage.sqlite` 及 WAL／SHM／journal、`usage-settings.json`、`model-pricing.json`；失败可在设置中重试。账号、供应商、Key 额度、电源助手和 Codex 文件保留。
 

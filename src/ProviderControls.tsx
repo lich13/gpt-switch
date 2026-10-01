@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Check, LoaderCircle, Plus } from "lucide-react";
+import { Check, Gauge, LoaderCircle, Plus } from "lucide-react";
 import { errorOf, type Provider } from "./types";
 import type { ProviderCommit } from "./SortableProviders";
 
@@ -20,6 +20,7 @@ export default function ProviderControls({
   report: (message: string) => void;
 }) {
   const [draft, setDraft] = useState<{
+    kind: "concurrency" | "rpm";
     value: string;
     revision: string | null;
   } | null>(null);
@@ -112,11 +113,13 @@ export default function ProviderControls({
       await commit(
         queue
           ? { op: "queueProvider", id: provider.id, queued: !provider.queued }
-          : {
-              op: "concurrencyProvider",
-              id: provider.id,
-              maxConcurrency: Number(draft!.value),
-            },
+          : draft!.kind === "rpm"
+            ? { op: "rpmProvider", id: provider.id, maxRpm: Number(draft!.value) }
+            : {
+                op: "concurrencyProvider",
+                id: provider.id,
+                maxConcurrency: Number(draft!.value),
+              },
         queue ? revision : draft!.revision,
       );
       if (!queue) close();
@@ -139,16 +142,36 @@ export default function ProviderControls({
         className="provider-concurrency"
         disabled={disabled || saving}
         aria-label={`${provider.name} 并发上限`}
-        aria-expanded={Boolean(draft)}
+        aria-expanded={draft?.kind === "concurrency"}
         aria-haspopup="dialog"
         onClick={() => {
           setError("");
           setDraft(
-            draft ? null : { value: String(provider.maxConcurrency), revision },
+            draft
+              ? null
+              : { kind: "concurrency", value: String(provider.maxConcurrency), revision },
           );
         }}
       >
         并发 {provider.activeRequests}/{provider.maxConcurrency || "∞"}
+      </button>
+      <button
+        type="button"
+        className="provider-concurrency provider-rpm"
+        disabled={disabled || saving}
+        aria-label={`${provider.name} RPM 上限`}
+        aria-expanded={draft?.kind === "rpm"}
+        aria-haspopup="dialog"
+        onClick={() => {
+          setError("");
+          setDraft(
+            draft
+              ? null
+              : { kind: "rpm", value: String(provider.maxRpm), revision },
+          );
+        }}
+      >
+        <Gauge size={12} /> RPM {provider.rpmUsed}/{provider.maxRpm || "∞"}
       </button>
       <button
         type="button"
@@ -173,7 +196,7 @@ export default function ProviderControls({
             ref={popover}
             role="dialog"
             data-provider-draft
-            aria-label={`${provider.name} 并发上限`}
+            aria-label={`${provider.name} ${draft.kind === "rpm" ? "RPM 上限" : "并发上限"}`}
             className="concurrency-popover"
             style={position}
             onKeyDown={(event) => {

@@ -1,5 +1,6 @@
 use super::*;
 use crate::gateway::admission::{Budget, Rejected};
+use crate::gateway::routing::Requirement;
 
 async fn until(f: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -17,6 +18,16 @@ fn limit(g: &Gateway, t: &tempfile::TempDir, index: usize, max: u32) {
         Edit::ConcurrencyProvider {
             id: g.view().providers[index].id.clone(),
             max_concurrency: max,
+        },
+    );
+}
+fn rpm_limit(g: &Gateway, t: &tempfile::TempDir, index: usize, max: u32) {
+    update(
+        g,
+        t,
+        Edit::RpmProvider {
+            id: g.view().providers[index].id.clone(),
+            max_rpm: max,
         },
     );
 }
@@ -122,6 +133,169 @@ async fn capacity_spills_over_and_returns_to_priority_without_circuit_failures()
         b"unchanged-auth"
     );
     g.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn rpm_window_counts_upstream_attempts_without_touching_circuit_health() {
+    let p = server(|_| async { Response::new(full("ok")) }).await;
+    let (t, g) = fixture(vec![format!("http://127.0.0.1:{p}")]).await;
+    rpm_limit(&g, &t, 0, 1);
+    start(&g, &t).await;
+    let routes = routes(&g);
+    let mut first = slot(&g, &routes).await;
+    first.commit_rpm().unwrap();
+    drop(first);
+    let mut budget = Budget::new(0);
+    let result =
+        g.0.admission
+            .acquire_for(&routes, false, 100, &mut budget, &Requirement::Resource)
+            .await;
+    assert!(matches!(result, Err(Rejected::RateLimited(seconds)) if seconds > 0));
+    let provider = &g.view().providers[0];
+    assert_eq!(provider.max_rpm, 1);
+    assert_eq!(provider.rpm_used, 1);
+    assert!(provider.rpm_limited);
+    assert_eq!(provider.health.failures, 0);
+    assert_eq!(provider.health.state, circuit::CircuitState::Closed);
+    g.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn http_rpm_limit_waits_in_place_instead_of_spilling_to_the_next_provider() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let p1 = server(move |_| {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Response::new(full("primary"))
+        }
+    })
+    .await;
+    let p2 = server(|_| async { Response::new(full("backup")) }).await;
+    let (t, g) = fixture(vec![
+        format!("http://127.0.0.1:{p1}"),
+        format!("http://127.0.0.1:{p2}"),
+    ])
+    .await;
+    rpm_limit(&g, &t, 0, 1);
+    update(
+        &g,
+        &t,
+        Edit::Settings {
+            settings: Settings {
+                queue_seconds: 1,
+                ..g.view().settings
+            },
+        },
+    );
+    update(
+        &g,
+        &t,
+        Edit::Mode {
+            mode: "auto".into(),
+        },
+    );
+    start(&g, &t).await;
+    let first = request(&g, "/v1/responses", vec![], vec![]).await;
+    assert_eq!(first.status(), 200);
+    assert_eq!(
+        first.into_body().collect().await.unwrap().to_bytes(),
+        "primary"
+    );
+    let second = request(&g, "/v1/responses", vec![], vec![]).await;
+    assert_eq!(second.status(), 429);
+    assert!(String::from_utf8(
+        second
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    )
+    .unwrap()
+    .contains("RPM_LIMIT"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(g.view().providers[0].health.failures, 0);
+    assert_eq!(g.view().providers[1].active_requests, 0);
+    g.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn rpm_reservations_are_persisted_across_gateway_restart() {
+    let p = server(|_| async { Response::new(full("ok")) }).await;
+    let (t, g) = fixture(vec![format!("http://127.0.0.1:{p}")]).await;
+    rpm_limit(&g, &t, 0, 2);
+    start(&g, &t).await;
+    let routes = routes(&g);
+    let mut first = slot(&g, &routes).await;
+    first.commit_rpm().unwrap();
+    drop(first);
+    let raw = std::fs::read(t.path().join("rpm-window.json")).unwrap();
+    assert!(String::from_utf8_lossy(&raw).contains("providers"));
+    let second = Gateway::new(t.path().to_path_buf()).unwrap();
+    second.import_initial(t.path()).unwrap();
+    assert_eq!(second.view().providers[0].rpm_used, 1);
+    assert_eq!(second.view().providers[0].max_rpm, 2);
+    g.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn rpm_windows_are_isolated_between_codex_and_claude() {
+    let (t, codex, claude, home) =
+        super::claude_v080::claude_fixture("https://shared.example.test", "fixture-key").await;
+    codex
+        .edit(
+            Edit::SaveProvider {
+                id: None,
+                base_url: "https://shared.example.test".into(),
+                token: "fixture-key".into(),
+            },
+            &codex.view().revision,
+            &t.path().join("codex-home"),
+        )
+        .unwrap();
+    let codex_id = codex.view().providers[0].id.clone();
+    codex
+        .edit(
+            Edit::RpmProvider {
+                id: codex_id,
+                max_rpm: 1,
+            },
+            &codex.view().revision,
+            &t.path().join("codex-home"),
+        )
+        .unwrap();
+    let claude_id = claude.view().providers[0].id.clone();
+    claude
+        .edit(
+            Edit::RpmProvider {
+                id: claude_id,
+                max_rpm: 1,
+            },
+            &claude.view().revision,
+            &home,
+        )
+        .unwrap();
+
+    let codex_providers = codex.0.inner.lock().unwrap().store.providers.clone();
+    let claude_providers = claude.0.inner.lock().unwrap().store.providers.clone();
+    codex.0.admission.configure(&codex_providers, true);
+    claude.0.admission.configure(&claude_providers, true);
+
+    let mut codex_slot = slot(&codex, &routes(&codex)).await;
+    codex_slot.commit_rpm().unwrap();
+    drop(codex_slot);
+
+    let mut claude_slot = slot(&claude, &routes(&claude)).await;
+    claude_slot.commit_rpm().unwrap();
+    drop(claude_slot);
+
+    assert_eq!(codex.view().providers[0].rpm_used, 1);
+    assert_eq!(claude.view().providers[0].rpm_used, 1);
+    assert!(t.path().join("data/rpm-window.json").exists());
+    assert!(t.path().join("data/claude/rpm-window.json").exists());
 }
 #[tokio::test]
 async fn queue_is_fifo_bounded_cancelable_and_does_not_consume_retry_budget() {

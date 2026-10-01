@@ -91,6 +91,32 @@ it("keeps authoritative queue state on failure and prevents duplicate submission
   expect(toggle).toBeEnabled();
 });
 
+it("edits the provider RPM cap in the shared control", async () => {
+  const user = userEvent.setup();
+  const commit = vi.fn().mockResolvedValue(undefined);
+  render(
+    <ProviderControls
+      provider={{ ...provider, maxRpm: 60, rpmUsed: 12 }}
+      revision="rpm-revision"
+      disabled={false}
+      commit={commit}
+      report={vi.fn()}
+    />,
+  );
+  expect(screen.getByRole("button", { name: /RPM 上限/ })).toHaveTextContent(
+    "RPM 12/60",
+  );
+  await user.click(screen.getByRole("button", { name: /RPM 上限/ }));
+  const input = screen.getByRole("spinbutton");
+  await user.clear(input);
+  await user.type(input, "120");
+  await user.click(screen.getByRole("button", { name: "保存" }));
+  expect(commit).toHaveBeenCalledWith(
+    { op: "rpmProvider", id: provider.id, maxRpm: 120 },
+    "rpm-revision",
+  );
+});
+
 it("Escape closes only the editor, returns focus and hidden panels discard drafts", async () => {
   const commit = vi.fn(),
     report = vi.fn(),

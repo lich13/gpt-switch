@@ -101,7 +101,12 @@ export type Provider = {
   quotaVersion: string;
   quota: ProviderQuota | null;
   maxConcurrency: number;
+  maxRpm: number;
   activeRequests: number;
+  rpmUsed: number;
+  rpmRetryIn: number;
+  rpmLimited: boolean;
+  rpmLedgerError?: boolean;
   allowedModels: string[] | null;
   supportsWebsocket: boolean;
 };
