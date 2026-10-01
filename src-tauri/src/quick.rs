@@ -151,7 +151,7 @@ fn bounds(
     let (ax, ay, aw, ah) = anchor;
     let (x, y, w, h) = area;
     let width = (420. * scale).min(w);
-    let height = (height.clamp(128., 520.) * scale).min(h);
+    let height = (height.clamp(128., 720.) * scale).min(h);
     let left = (ax + aw / 2. - width / 2.).clamp(x, x + w - width);
     let top = if ay >= y + h / 2. {
         ay - height - 4. * scale
@@ -255,7 +255,7 @@ pub fn resize_quick(
     let panel = app.state::<Panel>();
     let anchor = {
         let mut life = panel.lifecycle.lock().unwrap();
-        life.height = height.clamp(128., 520.);
+        life.height = height.clamp(128., 720.);
         life.anchor
     };
     if let Some(anchor) = anchor {
@@ -278,10 +278,20 @@ mod tests {
             } else {
                 (1920., 48., 1920., 2072.)
             };
-            let (x, y, w, h) = bounds(anchor, area, 2., 520.);
+            let (x, y, w, h) = bounds(anchor, area, 2., 720.);
             assert!(
                 x >= area.0 && y >= area.1 && x + w <= area.0 + area.2 && y + h <= area.1 + area.3
             );
         }
+    }
+    #[test]
+    fn taller_panel_clamps_to_work_area_without_padding_short_content() {
+        let anchor = (500., 0., 22., 22.);
+        let large = (0., 24., 1440., 900.);
+        assert_eq!(bounds(anchor, large, 1., 1000.).3, 720.);
+        assert_eq!(bounds(anchor, large, 1., 250.).3, 250.);
+        let (x, y, w, h) = bounds(anchor, (0., 24., 760., 480.), 1., 720.);
+        assert_eq!(h, 480.);
+        assert!(x >= 0. && x + w <= 760. && y >= 24. && y + h <= 504.);
     }
 }

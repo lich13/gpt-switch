@@ -117,7 +117,7 @@ export default function ProviderControls({
               id: provider.id,
               maxConcurrency: Number(draft!.value),
             },
-        queue ? revision : (draft!.revision ?? revision),
+        queue ? revision : draft!.revision,
       );
       if (!queue) close();
     } catch (e) {

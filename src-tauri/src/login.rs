@@ -23,6 +23,33 @@ pub struct Session {
     pub state: LoginState,
     pub cancel: Option<oneshot::Sender<()>>,
 }
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CopyKind {
+    Url,
+    Code,
+}
+impl Session {
+    pub fn copy_value<E>(
+        &self,
+        kind: CopyKind,
+        write: impl FnOnce(&str) -> std::result::Result<(), E>,
+    ) -> Result<()> {
+        if self.cancel.is_none()
+            || self.state.mode != "device"
+            || !["starting", "waiting"].contains(&self.state.phase.as_str())
+        {
+            return Err(AppError::new("LOGIN_STATE", "设备码登录已结束或正在取消"));
+        }
+        let value = match kind {
+            CopyKind::Url => self.state.url.as_deref(),
+            CopyKind::Code => self.state.code.as_deref(),
+        }
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::new("LOGIN_PENDING", "登录链接或设备码尚未生成"))?;
+        write(value).map_err(|_| AppError::new("CLIPBOARD", "无法写入剪贴板，请重试"))
+    }
+}
 impl Default for Session {
     fn default() -> Self {
         Self {
@@ -274,6 +301,60 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn device_copy_uses_only_the_live_session_and_redacts_clipboard_failures() {
+        let (cancel, _rx) = oneshot::channel();
+        let mut s = Session {
+            state: LoginState {
+                phase: "waiting".into(),
+                mode: "device".into(),
+                ..Default::default()
+            },
+            cancel: Some(cancel),
+        };
+        assert!(s
+            .copy_value(CopyKind::Url, |_| -> std::result::Result<(), ()> {
+                panic!("no prompt yet")
+            })
+            .is_err());
+        update_prompt(
+            &mut s.state,
+            "https://auth.openai.com/codex/device ABCD-EFGH",
+        );
+        for (kind, expected) in [
+            (CopyKind::Url, "https://auth.openai.com/codex/device"),
+            (CopyKind::Code, "ABCD-EFGH"),
+        ] {
+            let mut copied = String::new();
+            s.copy_value(kind, |text| {
+                copied = text.into();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+            assert_eq!(copied, expected);
+        }
+        let err = s
+            .copy_value(CopyKind::Code, |_| Err("ABCD-EFGH must not leak"))
+            .unwrap_err();
+        assert_eq!(err.code, "CLIPBOARD");
+        assert!(!err.message.contains("ABCD"));
+        for phase in ["cancelling", "cancelled", "success", "error", "idle"] {
+            s.state.phase = phase.into();
+            assert!(s
+                .copy_value(CopyKind::Code, |_| -> std::result::Result<(), ()> {
+                    panic!("inactive session")
+                })
+                .is_err());
+        }
+        s.state.phase = "waiting".into();
+        s.cancel.take(); // Reject a delayed prompt even if its phase says waiting.
+        assert!(s
+            .copy_value(CopyKind::Url, |_| -> std::result::Result<(), ()> {
+                panic!("cancelled session")
+            })
+            .is_err());
+        assert!(serde_json::from_str::<CopyKind>(r#""text""#).is_err());
+    }
     #[test]
     fn output_is_filtered() {
         let mut s = LoginState {

@@ -78,15 +78,33 @@ async fn capacity_spills_over_and_returns_to_priority_without_circuit_failures()
     let original = std::fs::read(t.path().join("config.toml")).unwrap();
     let first = request(&g, "/v1/responses", vec![], vec![]).await;
     assert_eq!(g.view().providers[0].active_requests, 1);
+    let editor_revision = g.view().revision;
     let second = request(&g, "/v1/responses", vec![], vec![]).await;
     assert_eq!(
         second.into_body().collect().await.unwrap().to_bytes(),
         "backup"
     );
     assert_eq!(g.view().providers[0].health.failures, 0);
+    assert_eq!(g.view().revision, editor_revision);
+    let selected = g.view().selected;
+    g.edit(
+        Edit::SaveProvider {
+            id: None,
+            base_url: "https://new.invalid/v1".into(),
+            token: "fixture-new".into(),
+        },
+        &editor_revision,
+        t.path(),
+    )
+    .unwrap();
+    assert_eq!(g.view().selected, selected);
+    assert_eq!(g.view().mode, "auto");
+    assert_eq!(g.view().providers[0].active_requests, 1);
+    let after_add = g.view().revision;
     release.add_permits(1);
     first.into_body().collect().await.unwrap();
     until(|| g.view().providers[0].active_requests == 0).await;
+    assert_eq!(g.view().revision, after_add);
     let next = request(&g, "/v1/responses", vec![], vec![]).await;
     assert!(next
         .into_body()

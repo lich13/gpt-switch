@@ -19,6 +19,7 @@ import {
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical } from "lucide-react";
+import type { EditRevision } from "./gateway-edit";
 import { errorOf, type Provider } from "./types";
 
 export type ProviderEdit =
@@ -27,7 +28,7 @@ export type ProviderEdit =
   | { op: "concurrencyProvider"; id: string; maxConcurrency: number };
 export type ProviderCommit = (
   edit: ProviderEdit,
-  revision: string,
+  revision: EditRevision,
 ) => Promise<void>;
 type Content = (
   provider: Provider,

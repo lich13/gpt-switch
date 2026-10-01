@@ -1126,6 +1126,8 @@ async fn recognized_expired_sub2_stops_protocol_probing() {
 
 #[path = "concurrency_tests.rs"]
 mod concurrency;
+#[path = "revision_tests.rs"]
+mod revisions;
 
 #[path = "model_tests.rs"]
 mod models;

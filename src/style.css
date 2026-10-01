@@ -676,6 +676,14 @@ kbd {
 .login-actions .primary {
   width: 100%;
 }
+.login-copy-actions {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+.login-copy-actions > button {
+  flex: 1;
+}
 .privacy-note {
   font-size: 10px;
   text-align: center;
@@ -1414,6 +1422,7 @@ select:focus-visible {
 }
 .quick-panel {
   height: 100dvh;
+  max-height: 100dvh;
   display: flex;
   flex-direction: column;
   border: 1px solid var(--line);

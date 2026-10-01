@@ -3,6 +3,7 @@ import ClientSelection, {
   clientName,
 } from "./ClientSelection";
 import type { ClientId } from "./types";
+import { saveGatewayEdit, type EditRevision } from "./gateway-edit";
 import { confirmAction } from "./confirmation";
 import ProviderSettings from "./ProviderSettings";
 import ProviderControls from "./ProviderControls";
@@ -144,22 +145,9 @@ function GatewayContent({
       setBusy(false);
     }
   };
-  const edit = async (payload: Edit, expected?: string) => {
+  const edit = async (payload: Edit, expected?: EditRevision) => {
     if (!state) return;
-    const next = await command<GatewayState>("update_gateway", {
-      clientId,
-      edit: payload,
-      expectedRevision: expected ?? state.revision,
-      ...(payload.op === "select" && !state.running
-        ? { expectedConfigRevision: state.configRevision }
-        : {}),
-    }).catch(async (error) => {
-      await command<GatewayState>("get_gateway", { clientId })
-        .then(setState)
-        .catch(() => {});
-      throw error;
-    });
-    setState(next);
+    await saveGatewayEdit(clientId, state, payload, expected, setState);
   };
   const run = (fn: () => Promise<void>) => {
     void action(fn).catch(() => {});
@@ -204,7 +192,7 @@ function GatewayContent({
     });
   const renameProvider = (
     payload: { op: "renameProvider"; id: string; name: string },
-    revision: string,
+    revision: EditRevision,
   ) => edit(payload, revision);
   const menuClose = (e: React.MouseEvent) =>
     e.currentTarget.closest("details")?.removeAttribute("open");
@@ -526,18 +514,19 @@ function GatewayContent({
         <ModelPolicyDialog
           clientId={clientId}
           provider={dialog.item}
+          revision={state.revision}
           version={
             state.providers.find((p) => p.id === dialog.item.id)
               ?.quotaVersion ?? "deleted"
           }
           onDirtyChange={onDirtyChange}
           close={() => setDialog(null)}
-          save={async (allowedModels) => {
+          save={async (allowedModels, revision) => {
             await edit({
               op: "modelsProvider",
               id: dialog.item.id,
               allowedModels,
-            });
+            }, revision);
             setDialog(null);
           }}
         />
@@ -546,10 +535,11 @@ function GatewayContent({
         <GatewayDialog
           clientId={clientId}
           dialog={dialog}
+          revision={state.revision}
           onDirtyChange={onDirtyChange}
           close={() => setDialog(null)}
-          save={async (payload) => {
-            await edit(payload);
+          save={async (payload, revision) => {
+            await edit(payload, revision);
             setDialog(null);
           }}
         />
@@ -570,19 +560,19 @@ function Advanced({
   settings: GatewaySettings;
   revision: string;
   busy: boolean;
-  save: (s: GatewaySettings, revision: string) => Promise<void>;
+  save: (s: GatewaySettings, revision: EditRevision) => Promise<void>;
 }) {
   const [draft, setDraft] = useState(settings),
     [error, setError] = useState("");
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
-  const editing = useRef(false),
-    baseRevision = useRef(revision);
+  const [editing, setEditing] = useState(false);
+  const baseRevision = useRef<EditRevision>(revision);
   useEffect(() => {
-    if (!editing.current) {
+    if (!editing) {
       setDraft(settings);
       baseRevision.current = revision;
     }
-  }, [settings, revision]);
+  }, [settings, revision, editing]);
   const fields: [keyof GatewaySettings, string][] = [
     ["port", "本地端口"],
     ["maxRetries", "最大重试次数"],
@@ -614,10 +604,13 @@ function Advanced({
         setError("");
         void save(draft, baseRevision.current)
           .then(() => {
-            editing.current = false;
+            setEditing(false);
             onDirtyChange?.(false);
           })
-          .catch((e) => setError(errorOf(e).message));
+          .catch((e) => {
+            baseRevision.current = null;
+            setError(errorOf(e).message);
+          });
       }}
     >
       <div className="settings-grid">
@@ -632,8 +625,8 @@ function Advanced({
               step={key === "errorRate" ? 0.01 : 1}
               value={draft[key]}
               onChange={(e) => {
-                if (!editing.current) baseRevision.current = revision;
-                editing.current = true;
+                if (!editing) baseRevision.current = revision;
+                setEditing(true);
                 onDirtyChange?.(true);
                 setDraft({ ...draft, [key]: Number(e.target.value) });
               }}
@@ -647,7 +640,7 @@ function Advanced({
         </div>
       )}
       <button disabled={busy} className="secondary">
-        保存参数
+        {baseRevision.current === null ? "重试" : "保存参数"}
       </button>
     </form>
   );
@@ -655,6 +648,7 @@ function Advanced({
 function GatewayDialog({
   clientId,
   dialog,
+  revision,
   close,
   save,
   onDirtyChange,
@@ -662,10 +656,11 @@ function GatewayDialog({
   clientId: ClientId;
   dialog: Extract<NonNullable<Dialog>, { kind: "provider" }>;
   close: () => void;
-  save: (p: Edit) => Promise<void>;
+  revision: string;
+  save: (p: Edit, revision: EditRevision) => Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;
 }) {
-  const initialSave = useRef(save);
+  const baseline = useRef<EditRevision>(revision);
   const [busy, setBusy] = useState(false),
     [error, setError] = useState("");
   const [baseUrl, setBaseUrl] = useState(dialog.item?.baseUrl ?? ""),
@@ -690,9 +685,11 @@ function GatewayDialog({
             baseUrl,
             token,
           };
-          void initialSave
-            .current(payload)
-            .catch((e) => setError(errorOf(e).message))
+          void save(payload, baseline.current)
+            .catch((e) => {
+              baseline.current = null;
+              setError(errorOf(e).message);
+            })
             .finally(() => setBusy(false));
         }}
       >
@@ -741,7 +738,8 @@ function GatewayDialog({
             取消
           </button>
           <button className="primary" disabled={busy}>
-            {busy && <LoaderCircle size={15} className="spin" />}保存
+            {busy && <LoaderCircle size={15} className="spin" />}
+            {baseline.current === null ? "重试" : "保存"}
           </button>
         </div>
       </form>

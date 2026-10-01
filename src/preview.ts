@@ -220,16 +220,6 @@ export async function run(
     case "delete_account":
       demo.accounts = demo.accounts.filter((a) => a.id !== args.id);
       break;
-    case "add_api_key":
-      demo.accounts.push({
-        id: crypto.randomUUID(),
-        name: String(args.name),
-        kind: "apiKey",
-        email: null,
-        current: false,
-        updatedAt: 0,
-      });
-      break;
     case "read_config":
       return { ...(args.clientId === "claude" ? claudeDoc : doc) };
     case "read_previous_config":
@@ -284,8 +274,15 @@ export async function run(
       };
       emit("login-state", login);
       return login;
+    case "copy_login_value": {
+      const value = args.kind === "url" ? login.url : args.kind === "code" ? login.code : null;
+      if (login.mode !== "device" || !["starting", "waiting"].includes(login.phase) || !value)
+        throw new Error("登录链接或设备码不可用");
+      await navigator.clipboard.writeText(value);
+      return;
+    }
     case "cancel_login":
-      login = { ...login, phase: "cancelled", message: "登录已取消" };
+      login = { ...login, phase: "cancelled", url: null, code: null, message: "登录已取消" };
       emit("login-state", login);
       return;
     case "pick_path":

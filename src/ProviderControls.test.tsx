@@ -49,7 +49,7 @@ it("validates caps, preserves edits through runtime refresh and retries conflict
   await user.click(screen.getByRole("button", { name: "保存" }));
   expect(commit).toHaveBeenLastCalledWith(
     { op: "concurrencyProvider", id: provider.id, maxConcurrency: 0 },
-    "new",
+    null,
   );
   await waitFor(() =>
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),

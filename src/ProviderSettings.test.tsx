@@ -46,7 +46,7 @@ it("preserves a transport draft across events and retries a conflict with the re
   await user.click(screen.getByRole("button", { name: "重试" }));
   expect(save).toHaveBeenLastCalledWith(
     { op: "websocketProvider", id: provider.id, supportsWebsocket: false },
-    "refreshed",
+    null,
   );
   rerender(
     <ProviderSettings

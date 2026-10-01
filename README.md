@@ -5,7 +5,7 @@ Codex 与 Claude Code 独立供应商管理、本地 API 网关，兼具 Codex �
 <img src="assets/icon.svg" alt="Prism Relay icon" width="100" />
 
 - 菜单栏／托盘左键打开供应商／账号快捷面板，右键保留精简原生菜单。
-- 添加 ChatGPT 登录、导入现有凭据和添加 API Key；同一身份的 Token 刷新自动回存。
+- 添加 ChatGPT 登录或导入现有凭据；设备码登录支持复制链接和设备码，同一身份的 Token 刷新自动回存。
 - Codex TOML 原文与 Claude 可视化／JSON 配置，共用草稿，支持校验、冲突保护和恢复上次配置。
 - 跟随系统深浅主题，关闭窗口后驻留；不会自动重启 Codex。
 

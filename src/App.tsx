@@ -9,6 +9,7 @@ import {
 } from "react";
 import {
   ArrowLeftRight,
+  Copy,
   Network,
   Shield,
   Users,
@@ -614,12 +615,13 @@ function AddAccount({
   setLogin: (s: LoginState) => void;
   onDone: (s: ViewState) => void;
 }) {
-  const [tab, setTab] = useState<"login" | "import" | "api">("login"),
-    [name, setName] = useState(""),
-    [key, setKey] = useState(""),
+  const [tab, setTab] = useState<"login" | "import">("login"),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false);
   const running = ["starting", "waiting", "cancelling"].includes(login.phase);
+  const [copied, setCopied] = useState<"url" | "code" | null>(null);
+  useEffect(() => setCopied(null), [login.phase, login.url, login.code]);
+  const canCopy = login.mode === "device" && ["starting", "waiting"].includes(login.phase);
   const perform = async (fn: () => Promise<void>) => {
     setBusy(true);
     setError("");
@@ -634,17 +636,13 @@ function AddAccount({
   return (
     <div className="modal-content">
       <div className="segments">
-        {(["login", "import", "api"] as const).map((t) => (
+        {(["login", "import"] as const).map((t) => (
           <button
             key={t}
             className={tab === t ? "active" : ""}
             onClick={() => setTab(t)}
           >
-            {t === "login"
-              ? "ChatGPT 登录"
-              : t === "import"
-                ? "导入凭据"
-                : "API Key"}
+            {t === "login" ? "ChatGPT 登录" : "导入凭据"}
           </button>
         ))}
       </div>
@@ -658,9 +656,6 @@ function AddAccount({
             </div>
           </div>
           <h3 className="center">连接你的 ChatGPT 账号</h3>
-          <p className="dialog-help center">
-            通过官方 Codex 登录，成功后加入账号列表。
-          </p>
           {login.message && login.phase !== "idle" && (
             <div
               className={"banner " + (login.phase === "error" ? "error" : "")}
@@ -675,7 +670,7 @@ function AddAccount({
           )}
           {login.code && running && (
             <div className="device-code">
-              <span>在浏览器输入设备码</span>
+              <span>设备码</span>
               <strong>{login.code}</strong>
             </div>
           )}
@@ -684,7 +679,7 @@ function AddAccount({
               <>
                 <button
                   className="primary"
-                  disabled={!login.url}
+                  disabled={busy || !login.url || login.phase === "cancelling"}
                   onClick={() =>
                     void perform(async () => {
                       await command("open_login_url");
@@ -694,9 +689,30 @@ function AddAccount({
                   打开登录页面
                   <ExternalLink size={15} />
                 </button>
+                {login.mode === "device" && (
+                  <div className="login-copy-actions">
+                    {(["url", "code"] as const).map((kind) => (
+                      <button
+                        key={kind}
+                        type="button"
+                        className="secondary"
+                        aria-label={kind === "url" ? "复制链接" : "复制设备码"}
+                        disabled={busy || !canCopy || !login[kind]}
+                        onClick={() => void perform(async () => {
+                          setCopied(null);
+                          await command("copy_login_value", { kind });
+                          setCopied(kind);
+                        })}
+                      >
+                        {copied === kind ? <Check size={15} /> : <Copy size={15} />}
+                        {copied === kind ? "已复制" : kind === "url" ? "复制链接" : "复制设备码"}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <button
                   className="secondary"
-                  disabled={login.phase === "cancelling"}
+                  disabled={busy || login.phase === "cancelling"}
                   onClick={() =>
                     void perform(async () => {
                       await command("cancel_login");
@@ -745,7 +761,7 @@ function AddAccount({
             )}
           </div>
         </>
-      ) : tab === "import" ? (
+      ) : (
         <>
           <div className="import-area">
             <Upload size={26} />
@@ -775,48 +791,6 @@ function AddAccount({
             从当前 Codex 目录导入
           </button>
         </>
-      ) : (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void perform(async () => {
-              const s = await command<ViewState>("add_api_key", { name, key });
-              setKey("");
-              onDone(s);
-            });
-          }}
-        >
-          <label className="field">
-            账号名称
-            <input
-              required
-              autoComplete="off"
-              maxLength={100}
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="例如：开发 API"
-            />
-          </label>
-          <label className="field">
-            API Key
-            <input
-              required
-              type="password"
-              autoComplete="off"
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              placeholder="输入 API Key"
-            />
-          </label>
-
-          <button
-            className="primary full"
-            disabled={busy || !key.trim() || !name.trim()}
-          >
-            <Plus size={15} />
-            添加账号
-          </button>
-        </form>
       )}
       {error && (
         <p className="form-error" role="alert">

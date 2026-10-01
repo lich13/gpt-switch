@@ -1,5 +1,6 @@
 import { Check, Pencil, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import type { EditRevision } from "./gateway-edit";
 import { errorOf, type Provider } from "./types";
 
 export default function ProviderNameEditor({
@@ -14,7 +15,7 @@ export default function ProviderNameEditor({
   provider: Provider;
   revision: string;
   disabled: boolean;
-  commit: (edit: { op: "renameProvider"; id: string; name: string }, revision: string) => Promise<void>;
+  commit: (edit: { op: "renameProvider"; id: string; name: string }, revision: EditRevision) => Promise<void>;
   report: (message: string) => void;
   className?: string;
   request?: number;
@@ -22,12 +23,14 @@ export default function ProviderNameEditor({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(provider.name);
   const [saving, setSaving] = useState(false);
+  const baseline = useRef<EditRevision>(revision);
   const input = useRef<HTMLInputElement>(null);
   const lastRequest = useRef<number | undefined>(undefined);
 
   const begin = () => {
     if (disabled || saving) return;
     setDraft(provider.name);
+    baseline.current = revision;
     setEditing(true);
   };
   useEffect(() => {
@@ -56,9 +59,10 @@ export default function ProviderNameEditor({
     }
     setSaving(true);
     try {
-      await commit({ op: "renameProvider", id: provider.id, name }, revision);
+      await commit({ op: "renameProvider", id: provider.id, name }, baseline.current);
       setEditing(false);
     } catch (error) {
+      baseline.current = null;
       report(errorOf(error).message);
       input.current?.focus();
     } finally {

@@ -34,6 +34,72 @@ beforeEach(() => {
 });
 afterEach(() => localStorage.clear());
 describe("gateway controls", () => {
+  it.each(["codex", "claude"] as const)("%s preserves a conflicting provider draft and retries only with a fresh version", async (client) => {
+    localStorage.setItem("lich13-switch.main.client", client);
+    const user = userEvent.setup();
+    let current = client === "claude" ? claudeState : state;
+    current.running = true;
+    current.mode = "auto";
+    mock.command.mockImplementation(async (name, args) => {
+      if (name === "get_gateway") return structuredClone(current);
+      if (name === "update_gateway") {
+        if (args.expectedRevision !== current.revision) throw { code: "CONFLICT", message: "网关设置已变化，请使用最新状态重试" };
+        return structuredClone(current);
+      }
+    });
+    render(<Gateway notify={() => {}} />);
+    // Explicit UI selection also covers independent client preferences.
+    await screen.findByRole("button", { name: "添加" });
+    await user.click(screen.getByRole("button", { name: "添加" }));
+    const address = screen.getByLabelText(client === "codex" ? "base_url" : "ANTHROPIC_BASE_URL");
+    const key = screen.getByLabelText(client === "codex" ? "experimental_bearer_token" : "ANTHROPIC_AUTH_TOKEN");
+    await user.type(address, "https://new.invalid/v1");
+    await user.type(key, "fixture-key");
+    const original = current.revision;
+    // Runtime events keep the same semantic version and cannot erase input.
+    act(() => mock.listeners.get("gateway-state")!({ ...current, lastSuccessful: "backup", waitingRequests: 2 }));
+    expect(key).toHaveValue("fixture-key");
+    current = { ...current, revision: "external-edit" };
+    act(() => mock.listeners.get("gateway-state")!(current));
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("网关设置已变化");
+    expect(mock.command).toHaveBeenCalledWith("update_gateway", expect.objectContaining({ expectedRevision: original }));
+    expect(key).toHaveValue("fixture-key");
+    const writes = () => mock.command.mock.calls.filter(([name]) => name === "update_gateway");
+    expect(writes()).toHaveLength(1);
+    // The authoritative version can change again without delivering a frontend event.
+    current = { ...current, revision: "latest-on-retry" };
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "添加供应商" })).not.toBeInTheDocument());
+    expect(writes()).toHaveLength(2);
+    expect(writes()[1][1]).toMatchObject({ clientId: client, expectedRevision: "latest-on-retry", edit: { op: "saveProvider", token: "fixture-key", baseUrl: "https://new.invalid/v1" } });
+  });
+
+  it("retries advanced settings without losing typed parameters", async () => {
+    const user = userEvent.setup();
+    let current = structuredClone(state);
+    mock.command.mockImplementation(async (name, args) => {
+      if (name === "get_gateway") return structuredClone(current);
+      if (name === "update_gateway") {
+        if (args.expectedRevision !== current.revision) throw { code: "CONFLICT", message: "设置已变化" };
+        current = { ...current, settings: args.edit.settings, revision: "saved" };
+        return structuredClone(current);
+      }
+    });
+    render(<Gateway notify={() => {}} />);
+    await screen.findByRole("button", { name: "添加" });
+    await user.click(screen.getByText("高级设置"));
+    const input = screen.getByLabelText("容量错误等待 / 秒");
+    await user.clear(input);
+    await user.type(input, "120");
+    current = { ...current, revision: "external" };
+    act(() => mock.listeners.get("gateway-state")!(current));
+    await user.click(screen.getByRole("button", { name: "保存参数" }));
+    expect((await screen.findAllByRole("alert")).some(e => e.textContent?.includes("设置已变化"))).toBe(true);
+    expect(input).toHaveValue(120);
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(mock.command).toHaveBeenCalledWith("update_gateway", expect.objectContaining({ expectedRevision: "external", edit: { op: "settings", settings: expect.objectContaining({ capacityRetrySeconds: 120 }) } })));
+  });
   it("resets a provider from the row and edits its name by double click", async () => {
     const user = userEvent.setup();
     render(<Gateway notify={() => {}} />);

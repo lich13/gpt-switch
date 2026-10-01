@@ -2,6 +2,7 @@ import ClientSelection, {
   useClientSelection,
   clientName,
 } from "./ClientSelection";
+import { saveGatewayEdit, type EditRevision } from "./gateway-edit";
 import type { ClientId } from "./types";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
@@ -144,7 +145,7 @@ function QuickContent({
         .filter((e) => !e.classList.contains("quick-scroll"))
         .reduce((h, e) => h + e.getBoundingClientRect().height, 0);
       const height = Math.min(
-        520,
+        720,
         Math.max(
           128,
           Math.ceil(chrome + inner.getBoundingClientRect().height + 2),
@@ -176,23 +177,9 @@ function QuickContent({
     }
   };
   const run = (fn: () => Promise<void>) => void action(fn).catch(() => {});
-  const edit = async (edit: Record<string, unknown>, expected?: string) => {
+  const edit = async (edit: Record<string, unknown>, expected?: EditRevision) => {
     if (!gateway) return;
-    setGateway(
-      await command<GatewayState>("update_gateway", {
-        clientId,
-        edit,
-        expectedRevision: expected ?? gateway.revision,
-        ...(edit.op === "select" && !gateway.running
-          ? { expectedConfigRevision: gateway.configRevision }
-          : {}),
-      }).catch(async (error) => {
-        await command<GatewayState>("get_gateway", { clientId })
-          .then(setGateway)
-          .catch(() => {});
-        throw error;
-      }),
-    );
+    await saveGatewayEdit(clientId, gateway, edit, expected, setGateway);
     if (edit.op === "select")
       setNotice(
         gateway.running

@@ -139,6 +139,35 @@ beforeEach(() => {
   );
 });
 describe("user workflows", () => {
+  it("copies active device login values and keeps API-key accounts without a manual add option", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "切换到 工作账号" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "添加账号" }));
+    expect(screen.queryByRole("button", { name: "API Key" })).not.toBeInTheDocument();
+    const session = { phase: "waiting", mode: "device", url: null as string | null, code: null as string | null, message: "等待授权" };
+    act(() => mocks.listeners.get("login-state")?.(session));
+    expect(screen.getByRole("button", { name: "复制链接" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "复制设备码" })).toBeDisabled();
+    session.url = "https://auth.openai.com/codex/device";
+    session.code = "ABCD-EFGH";
+    act(() => mocks.listeners.get("login-state")?.({ ...session }));
+    await user.click(screen.getByRole("button", { name: "复制链接" }));
+    expect(mocks.command).toHaveBeenCalledWith("copy_login_value", { kind: "url" });
+    expect(screen.getByRole("button", { name: "复制链接" })).toHaveTextContent("已复制");
+    await user.click(screen.getByRole("button", { name: "复制设备码" }));
+    expect(mocks.command).toHaveBeenCalledWith("copy_login_value", { kind: "code" });
+    mocks.command.mockRejectedValueOnce({ code: "CLIPBOARD", message: "无法写入剪贴板，请重试" });
+    await user.click(screen.getByRole("button", { name: "复制链接" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法写入剪贴板");
+    act(() => mocks.listeners.get("login-state")?.({ ...session, phase: "cancelling" }));
+    expect(screen.getByRole("button", { name: "复制链接" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "复制设备码" })).toBeDisabled();
+    act(() => mocks.listeners.get("login-state")?.({ ...session, phase: "cancelled", url: null, code: null }));
+    expect(screen.queryByRole("button", { name: "复制链接" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "导入凭据" }));
+    expect(screen.getByRole("button", { name: "选择凭据文件" })).toBeInTheDocument();
+  });
   it("keeps provider secrets in the open draft across activation and protects explicit navigation", async () => {
     const u = userEvent.setup();
     render(<App />);

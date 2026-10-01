@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { EditRevision } from "./gateway-edit";
 import { confirmAction } from "./confirmation";
 import Modal from "./Modal";
 import { errorOf } from "./types";
@@ -22,7 +23,7 @@ export default function ProviderSettings({
   disabled?: boolean;
   save: (
     edit: { op: "websocketProvider"; id: string; supportsWebsocket: boolean },
-    revision: string,
+    revision: EditRevision,
   ) => Promise<void>;
   close: () => void;
   models: () => void;
@@ -62,7 +63,7 @@ export default function ProviderSettings({
           id: provider.id,
           supportsWebsocket,
         },
-        retry ? revision : baseline.current,
+        retry ? null : baseline.current,
       );
       setSaved(supportsWebsocket);
       setRetry(false);

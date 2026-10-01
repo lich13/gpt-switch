@@ -1,3 +1,4 @@
+import type { EditRevision } from "./gateway-edit";
 import type { ClientId } from "./types";
 import { confirmAction } from "./confirmation";
 import { useEffect, useRef, useState } from "react";
@@ -9,6 +10,7 @@ export default function ModelPolicyDialog({
   clientId = "codex",
   provider,
   version,
+  revision,
   close,
   save,
   onDirtyChange,
@@ -16,8 +18,9 @@ export default function ModelPolicyDialog({
   clientId?: ClientId;
   provider: Provider;
   version: string;
+  revision: string;
   close: () => void;
-  save: (models: string[] | null) => Promise<void>;
+  save: (models: string[] | null, revision: EditRevision) => Promise<void>;
   onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [limited, setLimited] = useState(provider.allowedModels != null);
@@ -30,7 +33,7 @@ export default function ModelPolicyDialog({
   const [saving, setSaving] = useState(false);
   const generation = useRef(0);
   const dialog = useRef<HTMLDialogElement>(null);
-  const initialSave = useRef(save);
+  const baseline = useRef<EditRevision>(revision);
   useEffect(() => {
     dialog.current?.showModal();
   }, []);
@@ -113,9 +116,11 @@ export default function ModelPolicyDialog({
           }
           setSaving(true);
           setError("");
-          void initialSave
-            .current(limited ? selected : null)
-            .catch((e) => setError(errorOf(e).message))
+          void save(limited ? selected : null, baseline.current)
+            .catch((e) => {
+              baseline.current = null;
+              setError(errorOf(e).message);
+            })
             .finally(() => setSaving(false));
         }}
       >
@@ -236,7 +241,7 @@ export default function ModelPolicyDialog({
             取消
           </button>
           <button className="primary" disabled={saving}>
-            {saving ? "保存中…" : "保存"}
+            {saving ? "保存中…" : baseline.current === null ? "重试" : "保存"}
           </button>
         </div>
       </form>

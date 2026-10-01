@@ -226,7 +226,21 @@ impl Gateway {
         self.0.client
     }
     fn view_revision(&self, s: &Inner) -> String {
-        s.revision.clone()
+        // File revisions also include resume checkpoints, which change after successful
+        // auto-routing. Only configuration/lifecycle changes invalidate an editor.
+        // Keep s.revision separate for the on-disk transaction checks below.
+        let editable = (
+            self.0.client,
+            &s.store.providers,
+            &s.store.settings,
+            &s.store.mode,
+            &s.store.selected,
+            &s.store.local_token,
+            s.running,
+            &s.home,
+            s.upgrade_pending,
+        );
+        storage::digest(&serde_json::to_vec(&editable).expect("serializable gateway configuration"))
     }
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
         self.0.events.subscribe()
@@ -409,7 +423,6 @@ impl Gateway {
             self.changed();
             return Ok(self.view());
         }
-        s.home = Some(home.to_owned());
         if !s.running && self.0.data.join("gateway-recovery.json").exists() {
             return Err(AppError::new("RECOVERY", "请先处理未完成的配置事务"));
         }
@@ -499,6 +512,7 @@ impl Gateway {
         }
         s.store = next;
         s.revision = revision;
+        s.home = Some(home.to_owned());
         self.sync_single_protection(&s);
         self.0.admission.configure(&s.store.providers, s.running);
         self.0.quota.retain(

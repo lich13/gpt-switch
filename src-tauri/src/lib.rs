@@ -257,16 +257,6 @@ async fn import_auth_file(
     }
 }
 #[tauri::command]
-fn add_api_key(
-    app: tauri::AppHandle,
-    r: tauri::State<'_, Arc<Runtime>>,
-    name: String,
-    key: String,
-) -> Result<ViewState> {
-    lock(&r.core)?.add_api_key(&name, &key)?;
-    refresh(&app, &r)
-}
-#[tauri::command]
 fn rename_account(
     app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
@@ -427,7 +417,18 @@ fn start_login(
         let task = login::run(&cli, &mode, rx, sender);
         tokio::pin!(task);
         let result = loop {
-            tokio::select! {Some(state)=events.recv()=>{if let Ok(mut s)=runtime.login.lock(){s.state=state.clone();}let _=app.emit("login-state",state);},r=&mut task=>break r}
+            tokio::select! {
+                Some(state) = events.recv() => {
+                    if let Ok(mut s) = runtime.login.lock() {
+                        // Buffered CLI prompts must not revive a cancelled session.
+                        if s.cancel.is_some() {
+                            s.state = state.clone();
+                            let _ = app.emit("login-state", state);
+                        }
+                    }
+                },
+                result = &mut task => break result,
+            }
         };
         let final_state = match result {
             Ok(Some(raw)) => match lock(&runtime.core).and_then(|mut c| c.import_raw(&raw, None)) {
@@ -487,6 +488,15 @@ fn open_login_url(r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
         .as_ref()
         .ok_or_else(|| AppError::new("LOGIN_URL", "登录链接尚未生成"))?;
     open::that(url).map_err(|_| AppError::new("OPEN", "无法打开浏览器"))
+}
+#[tauri::command]
+fn copy_login_value(
+    app: tauri::AppHandle,
+    r: tauri::State<'_, Arc<Runtime>>,
+    kind: login::CopyKind,
+) -> Result<()> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    lock(&r.login)?.copy_value(kind, |value| app.clipboard().write_text(value))
 }
 fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
     if r.quit_pending.swap(true, Ordering::Relaxed) {
@@ -855,6 +865,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
             let fixture = if smoke.is_some() {
                 Some(
@@ -1162,7 +1173,6 @@ pub fn run() {
             switch_account,
             import_current,
             import_auth_file,
-            add_api_key,
             rename_account,
             delete_account,
             read_config,
@@ -1177,6 +1187,7 @@ pub fn run() {
             start_login,
             cancel_login,
             open_login_url,
+            copy_login_value,
             frontend_ready
         ])
         .build(tauri::generate_context!())
