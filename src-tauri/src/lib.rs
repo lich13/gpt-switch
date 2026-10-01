@@ -5,6 +5,7 @@ mod core;
 mod gateway;
 mod links;
 mod login;
+mod official;
 mod power;
 #[cfg(target_os = "macos")]
 mod power_macos;
@@ -189,9 +190,20 @@ fn publish(app: &tauri::AppHandle, state: ViewState) {
     let _ = app.emit("switch-state", &state);
 }
 fn refresh(app: &tauri::AppHandle, r: &Runtime) -> Result<ViewState> {
-    let state = lock(&r.core)?.state()?;
-    r.gateway.observe_home(&lock(&r.core)?.home());
+    let state = state_for(r)?;
+    let home = lock(&r.core)?.home();
+    r.gateway.observe_home(&home);
     publish(app, state.clone());
+    Ok(state)
+}
+fn state_for(r: &Runtime) -> Result<ViewState> {
+    let (mut state, home) = {
+        let mut core = lock(&r.core)?;
+        let state = core.state()?;
+        let home = core.home();
+        (state, home)
+    };
+    state.official_mode = official::view(&r.data, &home);
     Ok(state)
 }
 #[tauri::command]
@@ -205,7 +217,7 @@ async fn list_provider_models(
 }
 #[tauri::command]
 fn get_state(r: tauri::State<'_, Arc<Runtime>>) -> Result<ViewState> {
-    lock(&r.core)?.state()
+    state_for(r.inner())
 }
 #[tauri::command]
 fn switch_account(
@@ -214,14 +226,98 @@ fn switch_account(
     id: String,
     expected_revision: String,
 ) -> Result<ViewState> {
-    let result = lock(&r.core)?.switch_account(&id, &expected_revision);
-    match &result {
-        Ok(s) => publish(&app, s.clone()),
-        Err(_) => {
-            let _ = refresh(&app, &r);
+    if official::is_enabled(&r.data, &r.home(gateway::ClientId::Codex)?) {
+        let state = state_for(r.inner())?;
+        if state.official_mode.account_id.as_deref() != Some(id.as_str()) {
+            return Err(AppError::new(
+                "OFFICIAL_MODE",
+                "请先关闭官方账号连接，再切换其他账号",
+            ));
         }
     }
-    result
+    let result = lock(&r.core)?.switch_account(&id, &expected_revision);
+    match result {
+        Ok(s) => {
+            let mut next = s.clone();
+            next.official_mode = official::view(&r.data, &r.home(gateway::ClientId::Codex)?);
+            publish(&app, next.clone());
+            Ok(next)
+        }
+        Err(e) => {
+            let _ = refresh(&app, &r);
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+async fn use_official_account(
+    app: tauri::AppHandle,
+    r: tauri::State<'_, Arc<Runtime>>,
+    account_id: String,
+    expected_auth_revision: String,
+    expected_config_revision: String,
+) -> Result<ViewState> {
+    let state = get_state(r.clone())?;
+    let account = state
+        .accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .ok_or_else(|| AppError::new("ACCOUNT", "账号不存在"))?;
+    if account.kind != "chatgpt" {
+        return Err(AppError::new(
+            "OFFICIAL_MODE",
+            "只有 ChatGPT 账号可以使用官方连接",
+        ));
+    }
+    if state.official_mode.enabled {
+        if state.official_mode.account_id.as_deref() == Some(account_id.as_str()) {
+            return Ok(state);
+        }
+        return Err(AppError::new("OFFICIAL_MODE", "已有官方账号连接，请先关闭"));
+    }
+    if r.gateway.view().recovery_pending {
+        return Err(AppError::new("RECOVERY", "请先处理 Codex 网关的恢复事务"));
+    }
+    let gateway_was_running = r.gateway.view().running;
+    if gateway_was_running {
+        r.gateway.stop_checked(None).await?;
+    }
+    let home = r.home(gateway::ClientId::Codex)?;
+    let config_revision = r.gateway.read_config(&home)?.revision;
+    if !gateway_was_running
+        && config_revision != expected_config_revision
+        && !expected_config_revision.is_empty()
+    {
+        return Err(AppError::new("CONFLICT", "Codex 配置已变化，请刷新后重试"));
+    }
+    official::enable(&r.data, &home, &account_id, &config_revision)?;
+    let switched = lock(&r.core)?.switch_account(&account_id, &expected_auth_revision);
+    if let Err(e) = switched {
+        let current = r.gateway.read_config(&home)?.revision;
+        let _ = official::disable(&r.data, &home, &current);
+        return Err(e);
+    }
+    let mut next = refresh(&app, &r)?;
+    next.official_mode = official::view(&r.data, &home);
+    publish(&app, next.clone());
+    let _ = app.emit("switch-notice", "官方账号已启用，请重新打开 Codex");
+    Ok(next)
+}
+
+#[tauri::command]
+fn disable_official_account(
+    app: tauri::AppHandle,
+    r: tauri::State<'_, Arc<Runtime>>,
+    expected_config_revision: String,
+) -> Result<ViewState> {
+    let home = r.home(gateway::ClientId::Codex)?;
+    official::disable(&r.data, &home, &expected_config_revision)?;
+    let mut next = refresh(&app, &r)?;
+    next.official_mode = official::view(&r.data, &home);
+    publish(&app, next.clone());
+    let _ = app.emit("switch-notice", "官方连接已关闭，配置已恢复");
+    Ok(next)
 }
 #[tauri::command]
 fn import_current(app: tauri::AppHandle, r: tauri::State<'_, Arc<Runtime>>) -> Result<ViewState> {
@@ -272,6 +368,16 @@ fn delete_account(
     r: tauri::State<'_, Arc<Runtime>>,
     id: String,
 ) -> Result<ViewState> {
+    if official::view(&r.data, &r.home(gateway::ClientId::Codex)?)
+        .account_id
+        .as_deref()
+        == Some(id.as_str())
+    {
+        return Err(AppError::new(
+            "OFFICIAL_MODE",
+            "请先关闭官方账号连接，再删除该账号",
+        ));
+    }
     lock(&r.core)?.delete(&id)?;
     refresh(&app, &r)
 }
@@ -303,9 +409,13 @@ fn save_config(
     client_id: Option<gateway::ClientId>,
 ) -> Result<configuration::Document> {
     let client = client_id.unwrap_or_default();
+    let home = r.home(client)?;
+    if client == gateway::ClientId::Codex {
+        official::guard_save(&r.data, &home, &text)?;
+    }
     let doc = r
         .gateway(client)
-        .save_config(&r.home(client)?, &text, &expected_revision)?;
+        .save_config(&home, &text, &expected_revision)?;
     let _ = app.emit(
         "config-state",
         serde_json::json!({"clientId":client,"revision":doc.revision,"guarded":doc.guarded}),
@@ -407,6 +517,8 @@ fn start_login(
         phase: "starting".into(),
         mode: mode.clone(),
         message: "正在启动官方登录…".into(),
+        callback_ready: mode == "browser",
+        callback_port: (mode == "browser").then_some(1455),
         ..Default::default()
     };
     let initial = session.state.clone();
@@ -498,6 +610,34 @@ fn copy_login_value(
     use tauri_plugin_clipboard_manager::ClipboardExt;
     lock(&r.login)?.copy_value(kind, |value| app.clipboard().write_text(value))
 }
+#[tauri::command]
+async fn complete_login_callback(
+    app: tauri::AppHandle,
+    r: tauri::State<'_, Arc<Runtime>>,
+    callback_url: String,
+) -> Result<login::LoginState> {
+    let port = {
+        let session = lock(&r.login)?;
+        if session.cancel.is_none()
+            || session.state.mode != "browser"
+            || !["starting", "waiting"].contains(&session.state.phase.as_str())
+            || !session.state.callback_ready
+        {
+            return Err(AppError::new("LOGIN_STATE", "当前浏览器登录会话不可用"));
+        }
+        session.state.callback_port
+    };
+    login::forward_callback(&callback_url, port).await?;
+    let mut session = lock(&r.login)?;
+    if session.cancel.is_none() || !login_active(&session.state) {
+        return Err(AppError::new("LOGIN_STATE", "登录会话已结束，请重新开始"));
+    }
+    session.state.message = "已提交，等待登录完成".into();
+    let state = session.state.clone();
+    drop(session);
+    let _ = app.emit("login-state", state.clone());
+    Ok(state)
+}
 fn quit(app: &tauri::AppHandle, r: &Arc<Runtime>) {
     if r.quit_pending.swap(true, Ordering::Relaxed) {
         return;
@@ -577,6 +717,14 @@ async fn start_gateway(
     expected_revision: String,
     expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
+    if client_id == gateway::ClientId::Codex
+        && official::blocks_gateway(&r.data, &r.home(client_id)?)
+    {
+        return Err(AppError::new(
+            "OFFICIAL_MODE",
+            "请先关闭官方账号连接，再启动 Codex 网关",
+        ));
+    }
     let home = r.home(client_id)?;
     let result = r
         .gateway(client_id)
@@ -666,6 +814,11 @@ async fn frontend_ready(
     } else {
         if r.startup.preferences()?.restore_gateway {
             for client in [gateway::ClientId::Codex, gateway::ClientId::Claude] {
+                if client == gateway::ClientId::Codex
+                    && official::blocks_gateway(&r.data, &r.home(client)?)
+                {
+                    continue;
+                }
                 if let Err(e) = r.gateway(client).resume(&r.home(client)?).await {
                     let e = AppError::new(&e.code, &format!("{}：{}", client.name(), e.message));
                     *r.startup_error.lock().unwrap() = Some(e.clone());
@@ -937,7 +1090,7 @@ pub fn run() {
             runtime
                 .claude
                 .observe_home(&runtime.home(gateway::ClientId::Claude)?);
-            let state = lock(&runtime.core)?.state()?;
+            let state = state_for(&runtime)?;
             app.manage(runtime.clone());
             links::receive(app.handle(), args.iter().cloned());
             quick::Panel::create(app.handle())?;
@@ -1173,6 +1326,8 @@ pub fn run() {
             list_provider_models,
             get_state,
             switch_account,
+            use_official_account,
+            disable_official_account,
             import_current,
             import_auth_file,
             rename_account,
@@ -1190,6 +1345,7 @@ pub fn run() {
             cancel_login,
             open_login_url,
             copy_login_value,
+            complete_login_callback,
             frontend_ready
         ])
         .build(tauri::generate_context!())

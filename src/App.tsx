@@ -64,6 +64,7 @@ const emptyLogin: LoginState = {
   url: null,
   code: null,
   message: "",
+  callbackReady: false,
 };
 export default function App() {
   const [state, setState] = useState<ViewState | null>(null),
@@ -249,6 +250,26 @@ export default function App() {
       setState(s);
       notify("文件已切换，请重新打开 Codex");
     });
+  const useOfficial = (a: Account) =>
+    void action(async () => {
+      if (!state) return;
+      const s = await command<ViewState>("use_official_account", {
+        accountId: a.id,
+        expectedAuthRevision: state.authRevision,
+        expectedConfigRevision: state.configRevision,
+      });
+      setState(s);
+      notify("官方账号已启用，请重新打开 Codex");
+    });
+  const disableOfficial = () =>
+    void action(async () => {
+      if (!state) return;
+      const s = await command<ViewState>("disable_official_account", {
+        expectedConfigRevision: state.configRevision,
+      });
+      setState(s);
+      notify("官方连接已关闭，配置已恢复");
+    });
   const current = state?.accounts.find((a) => a.current),
     accounts =
       state?.accounts.filter((a) =>
@@ -381,6 +402,21 @@ export default function App() {
                 }}
               />
             )}
+            {state?.officialMode?.state === "conflict" ||
+            state?.officialMode?.state === "unavailable" ? (
+              <div className="banner error" role="alert">
+                <AlertTriangle size={16} />
+                {state.officialMode.error}
+              </div>
+            ) : state?.officialMode?.enabled ? (
+              <div className="banner">
+                <Shield size={16} />
+                <span>官方账号已启用</span>
+                <button className="text-button" onClick={disableOfficial} disabled={busy}>
+                  关闭官方连接
+                </button>
+              </div>
+            ) : null}
             <div className="list-tools">
               <h2>
                 已保存账号 <span>{state?.accounts.length ?? 0}</span>
@@ -461,6 +497,26 @@ export default function App() {
                           切换
                           <ArrowLeftRight size={13} />
                         </button>
+                      )}
+                      {a.kind === "chatgpt" && (
+                        state?.officialMode?.enabled &&
+                        state.officialMode.accountId === a.id ? (
+                          <button
+                            className="text-button"
+                            disabled={busy}
+                            onClick={disableOfficial}
+                          >
+                            官方连接
+                          </button>
+                        ) : (
+                          <button
+                            className="text-button"
+                            disabled={busy || Boolean(state?.officialMode?.enabled)}
+                            onClick={() => useOfficial(a)}
+                          >
+                            使用官方账号
+                          </button>
+                        )
                       )}
                       <details className="account-menu">
                         <summary aria-label={"管理 " + a.name}>
@@ -684,6 +740,29 @@ function AddAccount({
               )}
               <span>{login.message}</span>
             </div>
+          )}
+          {login.mode === "browser" && running && login.callbackReady && (
+            <form
+              className="login-callback"
+              onSubmit={(event) => {
+                event.preventDefault();
+                const input = event.currentTarget.elements.namedItem("callbackUrl");
+                if (!(input instanceof HTMLInputElement) || !input.value.trim()) return;
+                void perform(async () => {
+                  const next = await command<LoginState>("complete_login_callback", {
+                    callbackUrl: input.value.trim(),
+                  });
+                  setLogin(next);
+                  input.value = "";
+                });
+              }}
+            >
+              <label className="field">
+                回调地址
+                <input name="callbackUrl" type="url" autoComplete="off" placeholder="http://127.0.0.1:1455/success?..." disabled={busy} />
+              </label>
+              <button className="secondary" disabled={busy}>完成登录</button>
+            </form>
           )}
           {login.code && running && (
             <div className="device-code">

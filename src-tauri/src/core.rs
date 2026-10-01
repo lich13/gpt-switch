@@ -72,6 +72,8 @@ pub struct ViewState {
     pub preferences: Preferences,
     pub error: Option<String>,
     pub auth_sync: Option<AuthSync>,
+    #[serde(default)]
+    pub official_mode: crate::official::OfficialModeView,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -613,6 +615,7 @@ impl Core {
             preferences: self.preferences(),
             error: None,
             auth_sync: self.auth_sync.clone(),
+            official_mode: crate::official::OfficialModeView::default(),
         })
     }
     fn set_sync(&mut self, state: &str, account_id: Option<String>, message: &str) {

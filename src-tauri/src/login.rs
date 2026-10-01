@@ -18,6 +18,9 @@ pub struct LoginState {
     pub url: Option<String>,
     pub code: Option<String>,
     pub message: String,
+    pub callback_ready: bool,
+    #[serde(skip)]
+    pub callback_port: Option<u16>,
 }
 pub struct Session {
     pub state: LoginState,
@@ -147,6 +150,20 @@ fn extract_url(line: &str) -> Option<String> {
         })
         .map(str::to_owned)
 }
+fn extract_callback_port(line: &str) -> Option<u16> {
+    let clean = strip_ansi(line);
+    for marker in ["http://localhost:", "http://127.0.0.1:", "http://[::1]:"] {
+        if let Some(rest) = clean.split_once(marker).map(|(_, rest)| rest) {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(port) = digits.parse::<u16>() {
+                if port != 0 {
+                    return Some(port);
+                }
+            }
+        }
+    }
+    None
+}
 pub fn update_prompt(state: &mut LoginState, line: &str) {
     let line = strip_ansi(line);
     if let Some(url) = extract_url(&line) {
@@ -168,6 +185,12 @@ pub fn update_prompt(state: &mut LoginState, line: &str) {
             {
                 state.code = Some(word.to_string());
             }
+        }
+    }
+    if state.mode == "browser" {
+        if let Some(port) = extract_callback_port(&line) {
+            state.callback_port = Some(port);
+            state.callback_ready = true;
         }
     }
 }
@@ -276,6 +299,8 @@ pub async fn run(
         phase: "waiting".into(),
         mode: mode.into(),
         message: "请在浏览器中完成 ChatGPT 登录".into(),
+        callback_ready: mode == "browser",
+        callback_port: (mode == "browser").then_some(1455),
         ..Default::default()
     };
     let _ = events.send(state.clone()).await;
@@ -301,6 +326,103 @@ pub async fn run(
     temp.close()
         .map_err(|_| AppError::new("LOGIN_CLEANUP", "登录临时目录无法清理，请检查临时目录权限"))?;
     result
+}
+
+fn callback_error(message: &str) -> AppError {
+    AppError::new("LOGIN_CALLBACK", message)
+}
+
+fn validate_callback(raw: &str, expected_port: Option<u16>) -> Result<(String, u16)> {
+    if raw.len() > 64 * 1024 || raw.trim().is_empty() {
+        return Err(callback_error("回调地址无效或过长"));
+    }
+    let url = url::Url::parse(raw.trim()).map_err(|_| callback_error("回调地址格式无效"))?;
+    if url.scheme() != "http"
+        || url.path() != "/success"
+        || url.fragment().is_some()
+        || url.username() != ""
+        || url.password().is_some()
+    {
+        return Err(callback_error("只接受本机 /success 回调地址"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| callback_error("回调地址缺少本机主机"))?;
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return Err(callback_error("回调地址必须指向本机"));
+    }
+    let port = url.port().unwrap_or(1455);
+    if expected_port.is_some_and(|p| p != port) {
+        return Err(callback_error("回调端口与当前登录会话不匹配"));
+    }
+    if url.query_pairs().count() > 32 {
+        return Err(callback_error("回调参数过多"));
+    }
+    let mut id_token = 0;
+    let mut has_token = false;
+    for (key, value) in url.query_pairs() {
+        if key == "id_token" {
+            id_token += 1;
+            has_token |= !value.trim().is_empty() && value.len() <= 32 * 1024;
+        }
+        if key == "error" || key == "error_description" {
+            return Err(callback_error("官方登录返回了失败状态，请重新登录"));
+        }
+    }
+    if id_token != 1 || !has_token {
+        return Err(callback_error("回调地址缺少有效登录结果"));
+    }
+    Ok((host.into(), port))
+}
+
+pub async fn forward_callback(raw: &str, expected_port: Option<u16>) -> Result<()> {
+    let (host, port) = validate_callback(raw, expected_port)?;
+    let url = url::Url::parse(raw.trim()).map_err(|_| callback_error("回调地址格式无效"))?;
+    let target = if let Some(query) = url.query() {
+        format!("{}?{}", url.path(), query)
+    } else {
+        url.path().to_owned()
+    };
+    let stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    .map_err(|_| callback_error("本机登录回调连接超时"))?
+    .map_err(|_| callback_error("无法连接官方 CLI 的本机回调服务"))?;
+    let mut stream = stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host_header = if host == "::1" {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let request =
+        format!("GET {target} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.write_all(request.as_bytes()),
+    )
+    .await
+    .map_err(|_| callback_error("提交登录回调超时"))?
+    .map_err(|_| callback_error("提交登录回调失败"))?;
+    let mut response = [0_u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut response))
+        .await
+        .map_err(|_| callback_error("等待官方 CLI 接收回调超时"))?
+        .map_err(|_| callback_error("官方 CLI 未接收登录回调"))?;
+    if n < 12 || !response.starts_with(b"HTTP/") {
+        return Err(callback_error("官方 CLI 返回了无效回调响应"));
+    }
+    let status = std::str::from_utf8(&response)
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..400).contains(&status) {
+        return Err(callback_error("官方 CLI 未接受登录回调"));
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -387,6 +509,64 @@ mod tests {
             "2. Enter this one-time code 91CX-VA5M3 (expires in 15 minutes)",
         );
         assert_eq!(s.code.as_deref(), Some("91CX-VA5M3"));
+    }
+
+    #[test]
+    fn callback_validation_accepts_loopback_and_rejects_remote_or_duplicate_tokens() {
+        let valid = "http://127.0.0.1:1455/success?id_token=opaque&needs_setup=false";
+        assert_eq!(validate_callback(valid, Some(1455)).unwrap().1, 1455);
+        for bad in [
+            "https://127.0.0.1:1455/success?id_token=opaque",
+            "http://example.invalid:1455/success?id_token=opaque",
+            "http://127.0.0.1:1455/callback?id_token=opaque",
+            "http://127.0.0.1:1456/success?id_token=opaque",
+            "http://127.0.0.1:1455/success?id_token=a&id_token=b",
+        ] {
+            assert!(validate_callback(bad, Some(1455)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn browser_prompt_exposes_only_callback_ready_state() {
+        let mut s = LoginState {
+            mode: "browser".into(),
+            ..Default::default()
+        };
+        update_prompt(
+            &mut s,
+            "Starting local login server on http://localhost:1777",
+        );
+        assert!(s.callback_ready);
+        assert_eq!(s.callback_port, Some(1777));
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("callbackReady"));
+        assert!(!json.contains("1777"));
+    }
+    #[tokio::test]
+    async fn callback_forwarding_sends_only_local_http_request_and_discards_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..n]);
+            assert!(request.starts_with("GET /success?id_token=opaque"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nprivate-body")
+                .await
+                .unwrap();
+        });
+        forward_callback(
+            &format!("http://127.0.0.1:{port}/success?id_token=opaque"),
+            Some(port),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
     }
     #[test]
     fn missing_cli_is_clear() {

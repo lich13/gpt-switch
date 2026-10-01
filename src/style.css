@@ -684,6 +684,14 @@ kbd {
 .login-copy-actions > button {
   flex: 1;
 }
+.login-callback {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+.login-callback .field {
+  margin-bottom: 0;
+}
 .privacy-note {
   font-size: 10px;
   text-align: center;

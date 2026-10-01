@@ -35,6 +35,13 @@ export type ViewState = {
     warning: string | null;
   };
   error: string | null;
+  officialMode?: OfficialMode;
+};
+export type OfficialMode = {
+  enabled: boolean;
+  state: "disabled" | "enabled" | "conflict" | "unavailable" | string;
+  accountId: string | null;
+  error: string | null;
 };
 export type ConfigDocument = {
   clientId: ClientId;
@@ -50,6 +57,7 @@ export type LoginState = {
   url: string | null;
   code: string | null;
   message: string;
+  callbackReady: boolean;
 };
 export type AppError = {
   code: string;
