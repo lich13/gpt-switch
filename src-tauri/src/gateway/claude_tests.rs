@@ -99,6 +99,7 @@ async fn claude_missing_settings_are_created_without_other_fields() {
                 id: None,
                 base_url: "https://fixture.invalid/root".into(),
                 token: "fixture-only".into(),
+                name: None,
             },
             &claude.view().revision,
             &home,

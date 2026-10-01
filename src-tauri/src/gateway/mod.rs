@@ -217,6 +217,7 @@ impl Gateway {
                     id: None,
                     base_url,
                     token,
+                    name: None,
                 },
                 false,
             )?;
@@ -455,6 +456,7 @@ impl Gateway {
                         id: None,
                         base_url,
                         token,
+                        name: None,
                     },
                     s.running,
                 )?;

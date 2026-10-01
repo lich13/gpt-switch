@@ -159,6 +159,8 @@ pub enum Edit {
         id: Option<String>,
         base_url: String,
         token: String,
+        #[serde(default)]
+        name: Option<String>,
     },
     RenameProvider {
         id: String,
@@ -280,33 +282,44 @@ impl Store {
                 }) {
                     return Err(AppError::new("DUPLICATE", "该供应商已存在"));
                 }
-                let label = name(&display_name)?;
                 let selected = self.selected.clone();
                 self.edit(
                     Edit::SaveProvider {
                         id: None,
                         base_url: raw,
                         token,
+                        name: Some(display_name),
                     },
                     running,
                 )?;
                 self.selected = selected;
-                self.providers.last_mut().expect("provider added").name = label;
             }
             Edit::SaveProvider {
                 id,
                 base_url: raw,
                 token,
+                name: display_name,
             } => {
                 let u = base_url(&raw, self.settings.port)?;
                 if token.contains(['\r', '\n']) {
                     return Err(AppError::new("TOKEN", "Token 不得包含换行"));
                 }
+                let label = if let Some(value) = display_name
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    name(value)?
+                } else {
+                    u.host_str().unwrap_or("Provider").to_owned()
+                };
                 if let Some(id) = id {
                     let p = self.provider_mut(&id)?;
                     p.base_url = raw.trim().to_owned();
                     if !token.is_empty() {
                         p.token = token;
+                    }
+                    if display_name.is_some() {
+                        p.name = label;
                     }
                     p.version = uuid::Uuid::new_v4().to_string();
                 } else {
@@ -316,7 +329,7 @@ impl Store {
                     let id = uuid::Uuid::new_v4().to_string();
                     self.providers.push(Provider {
                         id: id.clone(),
-                        name: u.host_str().unwrap_or("Provider").into(),
+                        name: label,
                         base_url: raw.trim().into(),
                         token,
                         queued: true,

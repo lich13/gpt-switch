@@ -97,6 +97,7 @@ async fn dual_fixture(codex_urls: Vec<String>, claude_urls: Vec<String>) -> Dual
                     id: None,
                     base_url,
                     token: token.into(),
+                    name: None,
                 },
             );
         }
@@ -558,6 +559,7 @@ async fn peer_gateway_urls_and_port_changes_that_create_cross_client_loops_are_r
                         id: None,
                         base_url: format!("http://{host}:{}/loop", peer.view().settings.port),
                         token: "loop-fixture".into(),
+                        name: None,
                     },
                     &revision,
                     home,
@@ -579,6 +581,7 @@ async fn peer_gateway_urls_and_port_changes_that_create_cross_client_loops_are_r
             id: None,
             base_url: format!("http://127.0.0.1:{upstream_port}/deployment"),
             token: "future-loop-fixture".into(),
+            name: None,
         },
     );
     let before = f.claude.view();

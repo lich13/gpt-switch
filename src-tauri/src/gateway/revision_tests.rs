@@ -21,6 +21,7 @@ async fn resume_checkpoints_do_not_invalidate_editors_for_either_client() {
                 id: None,
                 base_url: url.into(),
                 token: token.into(),
+                name: None,
             });
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -60,6 +61,7 @@ async fn resume_checkpoints_do_not_invalidate_editors_for_either_client() {
                 id: None,
                 base_url: "https://c.invalid/sub".into(),
                 token: "c".into(),
+                name: None,
             },
             &revision,
             &home,

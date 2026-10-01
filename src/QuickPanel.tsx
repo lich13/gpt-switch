@@ -4,7 +4,7 @@ import ClientSelection, {
 } from "./ClientSelection";
 import { saveGatewayEdit, type EditRevision } from "./gateway-edit";
 import type { ClientId } from "./types";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowUpRight,
   Check,
@@ -56,8 +56,6 @@ function QuickContent({
   const [systemDark, setSystemDark] = useState(
     matchMedia("(prefers-color-scheme: dark)").matches,
   );
-  const root = useRef<HTMLDivElement>(null),
-    content = useRef<HTMLDivElement>(null);
   const quota = useProviderQuota(
     gateway?.providers ?? [],
     visible && prefs.tab === "providers",
@@ -135,35 +133,6 @@ function QuickContent({
     document.addEventListener("keydown", escape);
     return () => document.removeEventListener("keydown", escape);
   }, []);
-  useLayoutEffect(() => {
-    if (!root.current || !content.current) return;
-    const element = root.current,
-      inner = content.current;
-    let last = 0;
-    const resize = () => {
-      const chrome = [...element.children]
-        .filter((e) => !e.classList.contains("quick-scroll"))
-        .reduce((h, e) => h + e.getBoundingClientRect().height, 0);
-      const height = Math.min(
-        720,
-        Math.max(
-          128,
-          Math.ceil(chrome + inner.getBoundingClientRect().height + 2),
-        ),
-      );
-      if (height === last) return;
-      last = height;
-      if (preview) element.style.height = `${height}px`;
-      void command("resize_quick", { height }).catch(() => {});
-    };
-    const observer = new ResizeObserver(resize);
-    observer.observe(inner);
-    [...element.children]
-      .filter((e) => !e.classList.contains("quick-scroll"))
-      .forEach((e) => observer.observe(e));
-    resize();
-    return () => observer.disconnect();
-  }, []);
   const action = async (fn: () => Promise<void>, surfaceError = true) => {
     setBusy(true);
     setError("");
@@ -209,7 +178,7 @@ function QuickContent({
       await command("open_main", { page: page ?? null });
     });
   return (
-    <div ref={root} className="quick-panel">
+    <div className="quick-panel">
       <header className="quick-toolbar">
         <nav className="segmented" aria-label="快捷面板">
           {(["providers", "accounts"] as const).map((tab) => (
@@ -249,7 +218,7 @@ function QuickContent({
         </button>
       </header>
       <div className="quick-scroll">
-        <div ref={content}>
+        <div>
           {prefs.tab === "providers" && (
             <ClientSelection
               client={clientId}

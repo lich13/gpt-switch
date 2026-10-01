@@ -302,6 +302,7 @@ async fn capacity_round_reads_new_queue_and_routes_without_touching_files() {
             id: None,
             base_url: format!("http://127.0.0.1:{third}/v1"),
             token: "new-fixture-key".into(),
+            name: None,
         },
     );
     let mut ids: Vec<_> = g.view().providers.iter().map(|p| p.id.clone()).collect();

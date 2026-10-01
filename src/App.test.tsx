@@ -116,6 +116,13 @@ beforeEach(() => {
             };
           doc = { ...doc, text: String(args.text), revision: "cfg-2" };
           return { ...doc };
+        case "set_preferences": {
+          state = {
+            ...state,
+            preferences: args.preferences as ViewState["preferences"],
+          };
+          return structuredClone(state);
+        }
         case "switch_account":
           return {
             ...state,
@@ -137,6 +144,43 @@ beforeEach(() => {
       }
     },
   );
+});
+
+describe("settings presentation", () => {
+  it("removes path controls and previews the selected theme immediately", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "账号", level: 1 });
+    await user.click(screen.getByRole("button", { name: /^设置/ }));
+    expect(screen.queryByText("Codex 配置目录")).not.toBeInTheDocument();
+    expect(screen.queryByText("Claude Code 配置目录")).not.toBeInTheDocument();
+    expect(screen.queryByText("Codex CLI 路径")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "浅色" }));
+    expect(document.documentElement.dataset.theme).toBe("light");
+    await user.click(screen.getByRole("button", { name: "关闭对话框" }));
+    expect(document.documentElement.dataset.theme).toBe("dark");
+  });
+
+  it("persists the selected theme while retaining hidden path preferences", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "账号", level: 1 });
+    await user.click(screen.getByRole("button", { name: /^设置/ }));
+    await user.click(screen.getByRole("button", { name: "浅色" }));
+    await user.click(screen.getByRole("button", { name: "保存设置" }));
+    await waitFor(() =>
+      expect(mocks.command).toHaveBeenCalledWith("set_preferences", {
+        preferences: expect.objectContaining({
+          theme: "light",
+          codexHome: "/test/.codex",
+          cliPath: "",
+        }),
+      }),
+    );
+    expect(document.documentElement.dataset.theme).toBe("light");
+    await user.click(screen.getByRole("button", { name: /^设置/ }));
+    expect(screen.getByRole("button", { name: "浅色" })).toHaveClass("active");
+  });
 });
 describe("user workflows", () => {
   it("copies active device login values and keeps API-key accounts without a manual add option", async () => {

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Mutex, time::Duration};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
+pub const QUICK_DEFAULT_HEIGHT: f64 = 720.;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
@@ -45,7 +47,7 @@ impl Panel {
             path,
             preferences: Mutex::new(preferences),
             lifecycle: Mutex::new(Lifecycle {
-                height: 300.,
+                height: QUICK_DEFAULT_HEIGHT,
                 ..Default::default()
             }),
         })
@@ -57,7 +59,7 @@ impl Panel {
             WebviewUrl::App("index.html?panel=quick".into()),
         )
         .title("lich13-switch 快捷面板")
-        .inner_size(420., 300.)
+        .inner_size(420., QUICK_DEFAULT_HEIGHT)
         .decorations(false)
         .resizable(false)
         .always_on_top(true)
@@ -255,7 +257,7 @@ pub fn resize_quick(
     let panel = app.state::<Panel>();
     let anchor = {
         let mut life = panel.lifecycle.lock().unwrap();
-        life.height = height.clamp(128., 720.);
+        life.height = height.clamp(128., QUICK_DEFAULT_HEIGHT);
         life.anchor
     };
     if let Some(anchor) = anchor {

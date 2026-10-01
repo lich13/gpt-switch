@@ -74,6 +74,9 @@ export default function App() {
     [message, setMessage] = useState(""),
     [busy, setBusy] = useState(false),
     [dirty, setDirty] = useState(false),
+    [themePreview, setThemePreview] = useState<Preferences["theme"] | null>(
+      null,
+    ),
     [systemDark, setSystemDark] = useState(
       window.matchMedia("(prefers-color-scheme: dark)").matches,
     ),
@@ -169,6 +172,7 @@ export default function App() {
                   return;
                 setPage("accounts");
                 setDirty(false);
+                setThemePreview(null);
                 setDialog("settings");
               })()
             : navigate(p === "config" || p === "gateway" ? p : "accounts"),
@@ -212,12 +216,15 @@ export default function App() {
     const t = setTimeout(() => setMessage(""), 6500);
     return () => clearTimeout(t);
   }, [message]);
-  const theme =
-    state?.preferences.theme === "system" || !state
-      ? systemDark
-        ? "dark"
-        : "light"
-      : state.preferences.theme;
+  const selectedTheme = themePreview ?? state?.preferences.theme ?? "system";
+  const theme: "dark" | "light" =
+    selectedTheme === "dark"
+      ? "dark"
+      : selectedTheme === "light"
+        ? "light"
+        : systemDark
+          ? "dark"
+          : "light";
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
@@ -282,7 +289,13 @@ export default function App() {
           </button>
         </nav>
         <div className="sidebar-bottom">
-          <button className="nav-item" onClick={() => setDialog("settings")}>
+          <button
+            className="nav-item"
+            onClick={() => {
+              setThemePreview(null);
+              setDialog("settings");
+            }}
+          >
             <Settings size={17} />
             设置<span className="version">v{version}</span>
           </button>
@@ -533,7 +546,10 @@ export default function App() {
                   ? "重命名账号"
                   : "删除账号"
           }
-          onClose={() => setDialog(null)}
+          onClose={() => {
+            if (dialog === "settings") setThemePreview(null);
+            setDialog(null);
+          }}
         >
           {dialog === "add" ? (
             <AddAccount
@@ -547,9 +563,10 @@ export default function App() {
           ) : dialog === "settings" ? (
             <SettingsForm
               preferences={state.preferences}
-              dirty={dirty}
+              onThemePreview={setThemePreview}
               onDone={(s) => {
                 setState(s);
+                setThemePreview(null);
                 setDialog(null);
               }}
             />
@@ -802,47 +819,22 @@ function AddAccount({
 }
 function SettingsForm({
   preferences,
-  dirty,
+  onThemePreview,
   onDone,
 }: {
   preferences: Preferences;
-  dirty: boolean;
+  onThemePreview: (theme: Preferences["theme"] | null) => void;
   onDone: (s: ViewState) => void;
 }) {
   const [prefs, setPrefs] = useState(preferences),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false);
-  const pick = async (kind: string) => {
-    try {
-      const path = await command<string | null>("pick_path", {
-        kind: kind === "claude" ? "directory" : kind,
-      });
-      if (path)
-        setPrefs((p) => ({
-          ...p,
-          [kind === "directory"
-            ? "codexHome"
-            : kind === "claude"
-              ? "claudeHome"
-              : "cliPath"]: path,
-        }));
-    } catch (e) {
-      setError(errorOf(e).message);
-    }
-  };
+  useEffect(() => () => onThemePreview(null), [onThemePreview]);
   return (
     <form
       className="modal-content"
       onSubmit={(e) => {
         e.preventDefault();
-        if (
-          dirty &&
-          (prefs.codexHome !== preferences.codexHome ||
-            prefs.claudeHome !== preferences.claudeHome)
-        ) {
-          setError("请先保存或撤销配置草稿，再切换目录");
-          return;
-        }
         setBusy(true);
         void command<ViewState>("set_preferences", { preferences: prefs })
           .then(onDone)
@@ -850,61 +842,6 @@ function SettingsForm({
           .finally(() => setBusy(false));
       }}
     >
-      <label className="field">
-        Codex 配置目录
-        <div className="path-input">
-          <input
-            required
-            value={prefs.codexHome}
-            onChange={(e) => setPrefs({ ...prefs, codexHome: e.target.value })}
-          />
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="选择 Codex 目录"
-            onClick={() => void pick("directory")}
-          >
-            <FolderOpen size={17} />
-          </button>
-        </div>
-      </label>
-      <label className="field">
-        Claude Code 配置目录
-        <div className="path-input">
-          <input
-            required
-            value={prefs.claudeHome ?? ""}
-            onChange={(e) => setPrefs({ ...prefs, claudeHome: e.target.value })}
-          />
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="选择 Claude Code 目录"
-            onClick={() => void pick("claude")}
-          >
-            <FolderOpen size={17} />
-          </button>
-        </div>
-      </label>
-      <label className="field">
-        Codex CLI 路径
-        <div className="path-input">
-          <input
-            value={prefs.cliPath}
-            placeholder="自动查找"
-            onChange={(e) => setPrefs({ ...prefs, cliPath: e.target.value })}
-          />
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="选择 Codex CLI"
-            onClick={() => void pick("file")}
-          >
-            <FolderOpen size={17} />
-          </button>
-        </div>
-      </label>
-
       <label className="field">外观</label>
       <div className="segments theme-options">
         {(["system", "dark", "light"] as const).map((t) => (
@@ -912,7 +849,10 @@ function SettingsForm({
             key={t}
             type="button"
             className={prefs.theme === t ? "active" : ""}
-            onClick={() => setPrefs({ ...prefs, theme: t })}
+            onClick={() => {
+              setPrefs({ ...prefs, theme: t });
+              onThemePreview(t);
+            }}
           >
             {t === "system" ? (
               <Monitor size={16} />

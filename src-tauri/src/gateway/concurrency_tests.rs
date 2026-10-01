@@ -103,6 +103,7 @@ async fn capacity_spills_over_and_returns_to_priority_without_circuit_failures()
             id: None,
             base_url: "https://new.invalid/v1".into(),
             token: "fixture-new".into(),
+            name: None,
         },
         &editor_revision,
         t.path(),
@@ -251,6 +252,7 @@ async fn rpm_windows_are_isolated_between_codex_and_claude() {
                 id: None,
                 base_url: "https://shared.example.test".into(),
                 token: "fixture-key".into(),
+                name: None,
             },
             &codex.view().revision,
             &t.path().join("codex-home"),
@@ -363,6 +365,7 @@ async fn dynamic_limits_keep_slots_across_route_edits_and_do_not_oversubscribe()
             id: Some(r[0].provider.id.clone()),
             base_url: "https://changed.invalid".into(),
             token: "new-fixture".into(),
+            name: None,
         },
     );
     assert_eq!(g.view().providers[0].active_requests, 2);
@@ -449,6 +452,7 @@ async fn panel_edits_preserve_live_slots_files_and_persist_queue_priority() {
             id: Some(ids[0].clone()),
             base_url: g.view().providers[1].base_url.clone(),
             token: String::new(),
+            name: None,
         },
     );
     assert_eq!(g.view().providers[1].active_requests, 2);

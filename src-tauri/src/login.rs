@@ -156,11 +156,15 @@ pub fn update_prompt(state: &mut LoginState, line: &str) {
         for word in line.split_whitespace() {
             let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
             let stripped = word.replace('-', "");
-            if word.contains('-')
-                && stripped.len() == 8
-                && stripped
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            let parts: Vec<_> = word.split('-').collect();
+            if parts.len() == 2
+                && parts.iter().all(|part| {
+                    (3..=8).contains(&part.len())
+                        && part
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                })
+                && (8..=16).contains(&stripped.len())
             {
                 state.code = Some(word.to_string());
             }
@@ -371,6 +375,18 @@ mod tests {
         update_prompt(&mut s, "access_token=private https://evil.invalid/");
         assert!(s.url.is_none());
         assert!(s.message.is_empty());
+    }
+    #[test]
+    fn accepts_current_cli_device_code_format() {
+        let mut s = LoginState {
+            mode: "device".into(),
+            ..Default::default()
+        };
+        update_prompt(
+            &mut s,
+            "2. Enter this one-time code 91CX-VA5M3 (expires in 15 minutes)",
+        );
+        assert_eq!(s.code.as_deref(), Some("91CX-VA5M3"));
     }
     #[test]
     fn missing_cli_is_clear() {

@@ -195,10 +195,11 @@ describe("gateway controls", () => {
     ).toBe(false);
   });
 
-  it("keeps the provider API form to two fields and sends no guessed model settings", async () => {
+  it("accepts an optional display name without adding model settings", async () => {
     const user = userEvent.setup();
     render(<Gateway notify={() => {}} />);
     await user.click(await screen.findByRole("button", { name: "添加" }));
+    await user.type(screen.getByLabelText("名称"), "主力供应商");
     await user.type(
       screen.getByLabelText("base_url"),
       "https://new.example.com/sub/v1",
@@ -219,6 +220,7 @@ describe("gateway controls", () => {
         edit: {
           op: "saveProvider",
           id: null,
+          name: "主力供应商",
           baseUrl: "https://new.example.com/sub/v1",
           token: "fixture-token",
         },
@@ -552,7 +554,7 @@ describe("client isolation", () => {
     });
     await user.click(screen.getByRole("button", { name: "添加" }));
     const dialog = screen.getByRole("dialog", { name: "添加供应商" });
-    expect(dialog.querySelectorAll("input")).toHaveLength(2);
+    expect(dialog.querySelectorAll("input")).toHaveLength(3);
     const base = within(dialog).getByLabelText("ANTHROPIC_BASE_URL");
     const token = within(dialog).getByLabelText("ANTHROPIC_AUTH_TOKEN");
     expect(token).toHaveAttribute("type", "password");
@@ -578,6 +580,7 @@ describe("client isolation", () => {
       edit: {
         op: "saveProvider",
         id: null,
+        name: "",
         baseUrl: "https://claude.fixture.invalid/deployment",
         token: "claude-form-fixture",
       },

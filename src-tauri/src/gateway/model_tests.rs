@@ -14,6 +14,47 @@ async fn body(response: Response<Incoming>) -> Bytes {
     response.into_body().collect().await.unwrap().to_bytes()
 }
 
+#[test]
+fn provider_display_name_is_trimmed_and_host_is_the_blank_fallback() {
+    let mut store = Store::default();
+    store
+        .edit(
+            Edit::SaveProvider {
+                id: None,
+                base_url: "https://api.example.invalid/deployment".into(),
+                token: "fixture-token".into(),
+                name: Some("  主力供应商  ".into()),
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(store.providers[0].name, "主力供应商");
+
+    store
+        .edit(
+            Edit::SaveProvider {
+                id: None,
+                base_url: "https://fallback.example.invalid/v1".into(),
+                token: "fixture-token-2".into(),
+                name: Some("  ".into()),
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(store.providers[1].name, "fallback.example.invalid");
+
+    let invalid = store.edit(
+        Edit::SaveProvider {
+            id: None,
+            base_url: "https://invalid.example.invalid".into(),
+            token: "fixture-token-3".into(),
+            name: Some("x".repeat(121)),
+        },
+        false,
+    );
+    assert_eq!(invalid.unwrap_err().code, "NAME");
+}
+
 #[tokio::test]
 async fn exact_rules_filter_before_attempts_and_preserve_original_json_and_resources() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -312,6 +353,7 @@ async fn catalog_errors_and_changed_credentials_do_not_expose_raw_responses() {
             id: Some(id),
             base_url: format!("http://127.0.0.1:{port}"),
             token: "changed-fixture".into(),
+            name: None,
         },
     );
     gate.add_permits(1);

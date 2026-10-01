@@ -1421,7 +1421,7 @@ select:focus-visible {
   color: var(--warning);
 }
 .quick-panel {
-  height: 100dvh;
+  height: min(720px, 100dvh);
   max-height: 100dvh;
   display: flex;
   flex-direction: column;

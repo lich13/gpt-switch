@@ -87,6 +87,14 @@ it("uses current revisions for quick actions without initializing the main windo
   });
 });
 
+it("keeps the fixed tall panel without dynamic resize commands", async () => {
+  render(<QuickPanel />);
+  await screen.findByText("api.example.com");
+  expect(mock.command.mock.calls.some(([name]) => name === "resize_quick")).toBe(
+    false,
+  );
+});
+
 it("keeps provider naming separate from selection and exposes reset in the quick panel", async () => {
   const user = userEvent.setup();
   render(<QuickPanel />);

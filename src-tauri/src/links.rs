@@ -118,7 +118,7 @@ fn parse(raw: &str) -> Result<Pending> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .unwrap_or(endpoint.host_str().unwrap());
-    if name.len() > 200 || name.chars().any(char::is_control) {
+    if name.chars().count() > 120 || name.chars().any(char::is_control) {
         return Err(invalid("无效的供应商名称"));
     }
     let fingerprint = crate::storage::digest(
@@ -296,11 +296,27 @@ mod tests {
     #[test]
     fn decode_redact_and_preserve_path() {
         let p = parse(URL).unwrap();
+        assert_eq!(p.preview.name, "Fixture");
         assert_eq!(p.preview.base_url, "https://example.invalid/site/v1");
         assert_eq!(p.key, "fixture-only");
         assert!(!serde_json::to_string(&p.preview)
             .unwrap()
             .contains("fixture-only"));
+    }
+
+    #[test]
+    fn missing_name_falls_back_to_endpoint_host() {
+        let p = parse("ccswitch://v1/import?resource=provider&app=codex&endpoint=https%3A%2F%2Fapi.example.invalid%2Fv1&apiKey=fixture-only").unwrap();
+        assert_eq!(p.preview.name, "api.example.invalid");
+    }
+
+    #[test]
+    fn rejects_control_and_overlong_names() {
+        let control = "ccswitch://v1/import?resource=provider&app=codex&name=bad%0Aname&endpoint=https%3A%2F%2Fapi.example.invalid&apiKey=fixture-only";
+        assert!(parse(control).is_err());
+        let long = "x".repeat(121);
+        let url = format!("ccswitch://v1/import?resource=provider&app=codex&name={long}&endpoint=https%3A%2F%2Fapi.example.invalid&apiKey=fixture-only");
+        assert!(parse(&url).is_err());
     }
     #[test]
     fn duplicate_delivery_cancel_and_bounded_queue() {

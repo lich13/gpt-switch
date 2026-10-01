@@ -6,6 +6,7 @@ Codex 与 Claude Code 独立供应商管理、本地 API 网关，兼具 Codex �
 
 - 菜单栏／托盘左键打开供应商／账号快捷面板，右键保留精简原生菜单。
 - 添加 ChatGPT 登录或导入现有凭据；设备码登录支持复制链接和设备码，同一身份的 Token 刷新自动回存。
+- 添加供应商时可填写显示名称，留空使用 endpoint 主机名；CC Switch 导入会保留链接中的名称。
 - Codex TOML 原文与 Claude 可视化／JSON 配置，共用草稿，支持校验、冲突保护和恢复上次配置。
 - 跟随系统深浅主题，关闭窗口后驻留；不会自动重启 Codex。
 
@@ -21,7 +22,7 @@ v0.8.0 从 gpt-Switch 改名，仍使用 `com.lich13.gpt-switch` 内部身份及
 
 点击“添加账号”通过官方 Codex CLI 登录，或导入完整 `auth.json`。选择账号后仅替换认证文件，配置保持不变。现有 Codex 进程可能缓存凭据，需要自行重新打开。
 
-ChatGPT 登录需要本机已安装 [官方 Codex CLI](https://developers.openai.com/codex/cli)。应用自动查找 PATH、常见安装目录和 macOS nvm；也可在设置中指定 CLI 路径。Windows npm 安装使用同目录 Codex JavaScript 入口和 Node.js。登录使用独立临时目录，不修改当前 Codex 登录；10 分钟未完成会取消。浏览器授权需本人完成，也支持设备码登录。
+ChatGPT 登录需要本机已安装 [官方 Codex CLI](https://developers.openai.com/codex/cli)。应用自动查找 PATH、常见安装目录和 macOS nvm；旧安装中的 CLI 路径偏好继续兼容。Windows npm 安装使用同目录 Codex JavaScript 入口和 Node.js。登录使用独立临时目录，不修改当前 Codex 登录；10 分钟未完成会取消。浏览器授权需本人完成，也支持设备码登录。
 
 默认目录为 `CODEX_HOME` 或 `~/.codex`（Windows 为用户主目录中的 `.codex`），可在设置中修改。账号切换仅影响文件；`keyring` / `auto` / `ephemeral`、provider bearer token、环境变量或命令认证可能使用其他来源。
 
@@ -47,7 +48,7 @@ ChatGPT 登录需要本机已安装 [官方 Codex CLI](https://developers.openai
 
 ### Claude Code
 
-默认读取 `CLAUDE_CONFIG_DIR` 或 `~/.claude`，可在设置指定目录。首次从现有 `settings.json` 导入供应商，网关保持关闭。添加表单仅填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`。
+默认读取 `CLAUDE_CONFIG_DIR` 或 `~/.claude`；旧安装中的目录偏好继续兼容。首次从现有 `settings.json` 导入供应商，网关保持关闭。添加表单仅填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`。
 
 网关操作仅替换 `settings.json` 中 `env` 下的这两个字段。缺少文件、env 或字段时补齐必要结构；其他字段、顺序、缩进和换行保留。无效 JSON、重复受管键或非字符串值停止操作。不会修改 shell 启动文件、环境变量、模型、权限和插件。检测到的其他认证来源仅提示，项目或组织的更高优先级配置仍由 Claude Code 决定。
 

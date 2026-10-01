@@ -29,6 +29,7 @@ fn provider_secrets_never_appear_in_view() {
         id: None,
         base_url: "https://example.test/custom/v1".into(),
         token: "private-fixture-token".into(),
+        name: None,
     });
     let json = serde_json::to_string(&g.view()).unwrap();
     assert!(!json.contains("private-fixture"));
@@ -127,6 +128,7 @@ async fn fixture(urls: Vec<String>) -> (tempfile::TempDir, Gateway) {
                 id: None,
                 base_url: url,
                 token: "upstream-fixture-token".into(),
+                name: None,
             },
         );
     }
@@ -452,6 +454,7 @@ async fn streaming_first_byte_retry_no_splicing_and_cancel_releases_activity() {
             id: Some(first),
             base_url: format!("http://127.0.0.1:{never}"),
             token: String::new(),
+            name: None,
         },
     );
     let mut response = request(&g, "/v1/responses", vec![], vec![]).await;
@@ -656,6 +659,7 @@ async fn real_codex_cli_with_isolated_home() {
             id: None,
             base_url: private["baseUrl"].as_str().unwrap().into(),
             token: private["token"].as_str().unwrap().into(),
+            name: None,
         },
     );
     // A valid disposable auth file proves the CLI used the managed provider, never the real account.
@@ -1019,6 +1023,7 @@ async fn quota_late_response_is_discarded_after_provider_edit() {
             id: Some(id),
             base_url: format!("http://127.0.0.1:{port}"),
             token: "changed-key".into(),
+            name: None,
         },
     );
     gate.notify_one();

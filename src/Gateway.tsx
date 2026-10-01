@@ -663,12 +663,13 @@ function GatewayDialog({
   const baseline = useRef<EditRevision>(revision);
   const [busy, setBusy] = useState(false),
     [error, setError] = useState("");
-  const [baseUrl, setBaseUrl] = useState(dialog.item?.baseUrl ?? ""),
+  const [name, setName] = useState(dialog.item ? dialog.item.name : ""),
+    [baseUrl, setBaseUrl] = useState(dialog.item?.baseUrl ?? ""),
     [token, setToken] = useState("");
-  const initialDraft = useRef(JSON.stringify([baseUrl, token]));
+  const initialDraft = useRef(JSON.stringify([name, baseUrl, token]));
   useEffect(() => {
-    onDirtyChange?.(JSON.stringify([baseUrl, token]) !== initialDraft.current);
-  }, [baseUrl, token, onDirtyChange]);
+    onDirtyChange?.(JSON.stringify([name, baseUrl, token]) !== initialDraft.current);
+  }, [name, baseUrl, token, onDirtyChange]);
   useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
   const title = `${dialog.item ? "编辑" : "添加"}供应商`;
   return (
@@ -679,12 +680,13 @@ function GatewayDialog({
           e.preventDefault();
           setError("");
           setBusy(true);
-          const payload = {
+          const payload: Edit = {
             op: "saveProvider",
             id: dialog.item?.id ?? null,
             baseUrl,
             token,
           };
+          if (!dialog.item) payload.name = name;
           void save(payload, baseline.current)
             .catch((e) => {
               baseline.current = null;
@@ -694,6 +696,18 @@ function GatewayDialog({
         }}
       >
         <>
+          {!dialog.item && (
+            <label>
+              名称
+              <input
+                type="text"
+                maxLength={120}
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="可选"
+              />
+            </label>
+          )}
           <label>
             {clientId === "claude" ? "ANTHROPIC_BASE_URL" : "base_url"}
             <input
