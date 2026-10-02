@@ -123,6 +123,17 @@ beforeEach(() => {
           };
           return structuredClone(state);
         }
+        case "check_for_updates":
+          return {
+            hasUpdate: false,
+            currentVersion: "0.12.1",
+            latestVersion: "0.12.1",
+            releaseUrl: "https://github.com/lich13/lich13-switch/releases",
+            asset: null,
+          };
+        case "open_github":
+        case "open_update_release":
+          return;
         case "switch_account":
           return {
             ...state,
@@ -180,6 +191,17 @@ describe("settings presentation", () => {
     expect(document.documentElement.dataset.theme).toBe("light");
     await user.click(screen.getByRole("button", { name: /^设置/ }));
     expect(screen.getByRole("button", { name: "浅色" })).toHaveClass("active");
+  });
+
+  it("checks updates and opens the fixed GitHub project", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole("heading", { name: "账号", level: 1 });
+    await user.click(screen.getByRole("button", { name: /^设置/ }));
+    await user.click(screen.getByRole("button", { name: "检查更新" }));
+    expect(await screen.findByText("已是最新版本")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "GitHub" }));
+    expect(mocks.command).toHaveBeenCalledWith("open_github");
   });
 });
 describe("user workflows", () => {

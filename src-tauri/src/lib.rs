@@ -17,6 +17,7 @@ mod startup_macos;
 mod storage;
 #[cfg(target_os = "macos")]
 mod tray_macos;
+mod update;
 use core::{Core, Preferences, ViewState};
 use std::{
     path::PathBuf,
@@ -143,6 +144,8 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         ("config", "编辑配置"),
         ("gateway", "打开网关"),
         ("settings", "设置"),
+        ("check_update", "检查更新"),
+        ("github", "GitHub"),
         ("quit", "退出 lich13-switch"),
     ] {
         if id == "quit" {
@@ -151,6 +154,18 @@ fn tray_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         menu.append(&MenuItem::with_id(app, id, label, true, None::<&str>)?)?;
     }
     Ok(menu)
+}
+#[tauri::command]
+async fn check_for_updates() -> Result<update::Info> {
+    update::latest().await
+}
+#[tauri::command]
+fn open_github() -> Result<()> {
+    update::open_repository()
+}
+#[tauri::command]
+fn open_update_release() -> Result<()> {
+    update::open_releases()
 }
 #[tauri::command]
 fn open_main(
@@ -1229,6 +1244,27 @@ pub fn run() {
                     "config" | "gateway" | "settings" => {
                         let _ = open_main(app.clone(), Some(e.id().as_ref().into()), None, None);
                     }
+                    "github" => {
+                        let _ = update::open_repository();
+                    }
+                    "check_update" => {
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            match update::latest().await {
+                                Ok(info) if info.has_update => {
+                                    let version = info.latest_version.as_deref().unwrap_or("latest");
+                                    let _ = handle.emit("switch-notice", format!("发现新版本 v{version}"));
+                                    let _ = update::open_releases();
+                                }
+                                Ok(_) => {
+                                    let _ = handle.emit("switch-notice", "已是最新版本".to_string());
+                                }
+                                Err(error) => {
+                                    let _ = handle.emit("switch-error", error);
+                                }
+                            }
+                        });
+                    }
                     _ => (),
                 })
                 .build(app)?;
@@ -1373,6 +1409,9 @@ pub fn run() {
             open_login_url,
             copy_login_value,
             complete_login_callback,
+            check_for_updates,
+            open_github,
+            open_update_release,
             frontend_ready
         ])
         .build(tauri::generate_context!())

@@ -32,6 +32,8 @@ import {
   Sun,
   Moon,
   Monitor,
+  Github,
+  RefreshCw,
   LogIn,
   Trash2,
   Pencil,
@@ -50,6 +52,7 @@ import {
   type ViewState,
   type Preferences,
   type LoginState,
+  type UpdateInfo,
 } from "./types";
 const Gateway = lazy(() => import("./Gateway"));
 const ConfigEditor = lazy(() => import("./ConfigEditor"));
@@ -931,8 +934,28 @@ function SettingsForm({
 }) {
   const [prefs, setPrefs] = useState(preferences),
     [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
+    [busy, setBusy] = useState(false),
+    [checking, setChecking] = useState(false),
+    [update, setUpdate] = useState<UpdateInfo | null>(null);
   useEffect(() => () => onThemePreview(null), [onThemePreview]);
+  const checkForUpdates = () => {
+    setChecking(true);
+    setError("");
+    void command<UpdateInfo>("check_for_updates")
+      .then(setUpdate)
+      .catch((e) => setError(errorOf(e).message))
+      .finally(() => setChecking(false));
+  };
+  const openGitHub = () => {
+    setError("");
+    void command("open_github").catch((e) => setError(errorOf(e).message));
+  };
+  const openUpdate = () => {
+    setError("");
+    void command("open_update_release").catch((e) =>
+      setError(errorOf(e).message),
+    );
+  };
   return (
     <form
       className="modal-content"
@@ -971,6 +994,31 @@ function SettingsForm({
       <StartupSettings />
       <PowerSettings />
       <LinkSettings />
+      <div className="settings-update-row">
+        <button
+          type="button"
+          className="secondary"
+          disabled={checking}
+          onClick={checkForUpdates}
+        >
+          <RefreshCw size={15} className={checking ? "quota-spin" : undefined} />
+          检查更新
+        </button>
+        <button type="button" className="secondary" onClick={openGitHub}>
+          <Github size={15} />
+          GitHub
+        </button>
+        {update?.hasUpdate && (
+          <button type="button" className="text-button" onClick={openUpdate}>
+            更新 v{update.latestVersion}
+          </button>
+        )}
+        {update && !update.hasUpdate && (
+          <span className="settings-update-status" role="status">
+            已是最新版本
+          </span>
+        )}
+      </div>
       {error && (
         <p className="form-error" role="alert">
           {error}

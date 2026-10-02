@@ -9,6 +9,7 @@ Codex 与 Claude Code 独立供应商管理、本地 API 网关，兼具 Codex �
 - 添加供应商时可填写显示名称，留空使用 endpoint 主机名；CC Switch 导入会保留链接中的名称。
 - Codex TOML 原文与 Claude 可视化／JSON 配置，共用草稿，支持校验、冲突保护和恢复上次配置。
 - 跟随系统深浅主题，关闭窗口后驻留；不会自动重启 Codex。
+- 设置页和托盘菜单提供检查更新与 GitHub 入口。
 
 ## 安装
 

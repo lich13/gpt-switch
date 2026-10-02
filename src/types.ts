@@ -65,6 +65,13 @@ export type AppError = {
   line?: number;
   column?: number;
 };
+export type UpdateInfo = {
+  hasUpdate: boolean;
+  currentVersion: string;
+  latestVersion: string | null;
+  releaseUrl: string;
+  asset: { name: string; url: string } | null;
+};
 export const errorOf = (e: unknown): AppError =>
   typeof e === "object" && e !== null && "message" in e
     ? (e as AppError)

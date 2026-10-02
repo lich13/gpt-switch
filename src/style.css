@@ -611,6 +611,22 @@ kbd {
 .modal-content {
   padding: 22px;
 }
+.settings-update-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 18px 0 4px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.settings-update-row button {
+  min-height: 32px;
+}
+.settings-update-status {
+  color: var(--muted);
+  font-size: 12px;
+}
 .segments {
   display: flex;
   background: var(--canvas);

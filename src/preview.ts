@@ -160,6 +160,15 @@ export async function run(
     return;
   }
   if (name === "cleanup_retired_data") return;
+  if (name === "check_for_updates")
+    return {
+      hasUpdate: false,
+      currentVersion: "0.12.1",
+      latestVersion: "0.12.1",
+      releaseUrl: "https://github.com/lich13/lich13-switch/releases",
+      asset: null,
+    };
+  if (name === "open_github" || name === "open_update_release") return;
   if (powerCommands.includes(name)) return powerPreview(name, args, emit);
   if (name === "get_quick") return { ...quick };
   if (name === "set_quick") {
