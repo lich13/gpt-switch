@@ -487,8 +487,39 @@ fn auth_matches_callback(path: &Path, id_token: &str) -> Result<()> {
 
 async fn process_callback(raw: &str, expected_port: Option<u16>, temp: &Path) -> Result<()> {
     let id_token = callback_id_token(raw)?;
-    auth_matches_callback(&temp.join("auth.json"), &id_token)?;
-    forward_callback(raw, expected_port).await
+    let auth_path = temp.join("auth.json");
+    // If a complete credential already exists for another identity, do not
+    // send a callback from a different session to the local CLI. An absent or
+    // partial file is expected while the CLI is still exchanging the code.
+    if let Some(raw_auth) = storage::read_optional(&auth_path)? {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw_auth) {
+            if let Some(current) = value
+                .get("tokens")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|tokens| tokens.get("id_token"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|token| !token.is_empty())
+            {
+                if current != id_token {
+                    return Err(AppError::new(
+                        "LOGIN_PENDING",
+                        "回调地址与当前登录会话不匹配",
+                    ));
+                }
+            }
+        }
+    }
+    forward_callback(raw, expected_port).await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match auth_matches_callback(&auth_path, &id_token) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code == "LOGIN_PENDING" && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub async fn forward_callback(raw: &str, expected_port: Option<u16>) -> Result<()> {
@@ -766,6 +797,45 @@ mod tests {
                 .code,
             "LOGIN_PENDING"
         );
+    }
+    #[tokio::test]
+    async fn callback_is_forwarded_before_the_cli_writes_the_complete_auth_file() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = tempfile::tempdir().unwrap();
+        let token = "eyJzdWIiOiJmaXh0dXJlIn0.signature";
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let auth_path = fixture.path().join("auth.json");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).contains("GET /success?id_token="));
+            std::fs::write(
+                auth_path,
+                serde_json::json!({
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "id_token": token,
+                        "access_token": "access",
+                        "refresh_token": "refresh"
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let callback = format!("http://127.0.0.1:{port}/success?id_token={token}");
+        process_callback(&callback, Some(port), fixture.path())
+            .await
+            .unwrap();
+        server.await.unwrap();
     }
     #[test]
     fn missing_cli_is_clear() {
