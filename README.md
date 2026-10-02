@@ -15,6 +15,8 @@ Codex 与 Claude Code 独立供应商管理、本地 API 网关，兼具 Codex �
 
 从 [GitHub Releases](https://github.com/lich13/lich13-switch/releases) 下载 macOS Apple Silicon DMG 或 Windows x64 安装程序。macOS 包使用 ad-hoc 签名，Windows 包未配置商业代码签名；系统可能要求确认来自非商店开发者的应用。校验下载文件时使用 Release 中的 `SHA256SUMS`。
 
+版本变化见 [发布说明](RELEASE.md)，数据范围和网络访问见 [隐私与安全](PRIVACY.md)。
+
 v0.8.0 从 gpt-Switch 改名，仍使用 `com.lich13.gpt-switch` 内部身份及原私有目录。macOS 安装到 `/Applications/lich13-switch.app`；保留账号、供应商、启动偏好、电源记录和协议默认应用。已启用的启动项迁移路径，旧登录参数继续兼容。Windows 保留原升级／卸载标识，显示名和可执行文件更新为 lich13-switch。
 
 ## 使用
@@ -118,6 +120,10 @@ macOS 通过用户级 LaunchAgent 和系统的登录启动 Apple event 识别启
 v0.7.0 已移除使用统计、请求日志和模型定价。升级会精确删除应用私有目录内的 `usage.sqlite` 及 WAL／SHM／journal、`usage-settings.json`、`model-pricing.json`；失败可在设置中重试。账号、供应商、Key 额度、电源助手和 Codex 文件保留。
 
 v0.9.0 已移除应用内供应商代理。升级先完成恢复事务，再清除两客户端旧代理对象、绑定和 `proxy-profiles.json`，不保留代理密码副本；失败时停止自动恢复，并在网关恢复入口重试。账号、供应商身份、Key、顺序、并发、白名单及启动意图保留。不会修改系统网络代理。
+
+## 隐私与安全
+
+应用不会把账号、配置或供应商凭据上传到本项目的服务，也不包含广告和遥测。启用网关后，业务请求只发送到用户配置的供应商；检查更新只访问官方 GitHub Release API。仓库和发布包使用脱敏夹具，不包含真实账号、令牌、回调地址或个人路径。完整说明见 [PRIVACY.md](PRIVACY.md)。
 
 ## 开发与验证
 

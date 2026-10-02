@@ -802,7 +802,7 @@ mod tests {
     async fn callback_is_forwarded_before_the_cli_writes_the_complete_auth_file() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let fixture = tempfile::tempdir().unwrap();
-        let token = "eyJzdWIiOiJmaXh0dXJlIn0.signature";
+        let token = "fixture-id-token";
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();

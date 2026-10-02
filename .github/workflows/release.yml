@@ -136,7 +136,9 @@ jobs:
           zip -r release-assets/lich13-switch-icons.zip assets src-tauri/icons
           cd release-assets
           sha256sum *.dmg *.exe *.zip > SHA256SUMS
+      - name: Prepare Chinese release notes
+        run: python3 scripts/extract-release-notes.py RELEASE.md "${GITHUB_REF_NAME#v}" release-notes.md
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --title "lich13-switch $GITHUB_REF_NAME" --notes-file RELEASE.md
+        run: gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --title "lich13-switch $GITHUB_REF_NAME" --notes-file release-notes.md
