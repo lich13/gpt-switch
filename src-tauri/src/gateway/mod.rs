@@ -445,6 +445,15 @@ impl Gateway {
             return Err(AppError::new("CLEANUP", "请先处理未完成的升级清理"));
         }
         let direct_select = !s.running && matches!(&edit, Edit::Select { .. });
+        if direct_select
+            && self.0.client == ClientId::Codex
+            && crate::official::blocks_gateway(&self.0.data, home)
+        {
+            return Err(AppError::new(
+                "OFFICIAL_MODE",
+                "官方账号连接期间不能切换网关供应商",
+            ));
+        }
         let mut next = s.store.clone();
         match edit {
             Edit::Import => {
@@ -553,6 +562,12 @@ impl Gateway {
         home: &Path,
         config_revision: Option<&str>,
     ) -> Result<View> {
+        if self.0.client == ClientId::Codex && crate::official::blocks_gateway(&self.0.data, home) {
+            return Err(AppError::new(
+                "OFFICIAL_MODE",
+                "请先关闭官方账号连接，再启动 Codex 网关",
+            ));
+        }
         let _guard = self.0.lifecycle.lock().await;
         let (port, token) = {
             let s = self.0.inner.lock().unwrap();

@@ -21,10 +21,19 @@ pub struct LoginState {
     pub callback_ready: bool,
     #[serde(skip)]
     pub callback_port: Option<u16>,
+    /// The complete authorization URL stays in the Rust session so it is not
+    /// exposed through login-state events.
+    #[serde(skip)]
+    pub auth_url: Option<String>,
 }
 pub struct Session {
     pub state: LoginState,
     pub cancel: Option<oneshot::Sender<()>>,
+    pub callback: Option<mpsc::Sender<CallbackRequest>>,
+}
+pub struct CallbackRequest {
+    pub url: String,
+    pub reply: oneshot::Sender<Result<()>>,
 }
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +70,7 @@ impl Default for Session {
                 ..Default::default()
             },
             cancel: None,
+            callback: None,
         }
     }
 }
@@ -162,12 +172,50 @@ fn extract_callback_port(line: &str) -> Option<u16> {
             }
         }
     }
+    // The CLI commonly prints an encoded redirect_uri inside the authorization
+    // URL rather than printing the loopback listener separately.
+    if let Some((_, rest)) = clean.split_once("redirect_uri=") {
+        let encoded = rest.split(['&', ' ', '"', '\'']).next().unwrap_or(rest);
+        if let Some(decoded) = url::form_urlencoded::parse(format!("value={encoded}").as_bytes())
+            .next()
+            .map(|(_, value)| value.into_owned())
+        {
+            if let Ok(url) = url::Url::parse(&decoded) {
+                if matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")) {
+                    if let Some(port) = url.port() {
+                        return Some(port);
+                    }
+                }
+            }
+        }
+    }
     None
 }
+
+fn public_login_url(url: &str, browser: bool) -> String {
+    if !browser {
+        return url.to_owned();
+    }
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_owned();
+    };
+    // Keep the complete authorization URL in the Rust session only. The
+    // webview needs to know that a URL exists, but must not receive the
+    // loopback callback address or its ephemeral port through an event.
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.into()
+}
+
 pub fn update_prompt(state: &mut LoginState, line: &str) {
     let line = strip_ansi(line);
     if let Some(url) = extract_url(&line) {
-        state.url = Some(url);
+        state.auth_url = Some(url.clone());
+        state.url = Some(public_login_url(&url, state.mode == "browser"));
+        if state.mode == "browser" && state.callback_port.is_none() {
+            state.callback_port = Some(1455);
+            state.callback_ready = true;
+        }
     }
     if state.mode == "device" {
         for word in line.split_whitespace() {
@@ -231,11 +279,23 @@ async fn terminate(child: &mut tokio::process::Child) {
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
+#[allow(dead_code)]
 pub async fn run(
+    cli: &Path,
+    mode: &str,
+    cancel: oneshot::Receiver<()>,
+    events: mpsc::Sender<LoginState>,
+) -> Result<Option<String>> {
+    let (_sender, callbacks) = mpsc::channel(1);
+    run_with_callbacks(cli, mode, cancel, events, callbacks).await
+}
+
+pub async fn run_with_callbacks(
     cli: &Path,
     mode: &str,
     mut cancel: oneshot::Receiver<()>,
     events: mpsc::Sender<LoginState>,
+    mut callbacks: mpsc::Receiver<CallbackRequest>,
 ) -> Result<Option<String>> {
     let temp = tempfile::Builder::new()
         .prefix("lich13-switch-login-")
@@ -299,8 +359,8 @@ pub async fn run(
         phase: "waiting".into(),
         mode: mode.into(),
         message: "请在浏览器中完成 ChatGPT 登录".into(),
-        callback_ready: mode == "browser",
-        callback_port: (mode == "browser").then_some(1455),
+        callback_ready: false,
+        callback_port: None,
         ..Default::default()
     };
     let _ = events.send(state.clone()).await;
@@ -309,6 +369,14 @@ pub async fn run(
         tokio::select! {
             _=&mut cancel=>{terminate(&mut child).await;break Ok(None);},
             _=tokio::time::sleep_until(deadline)=>{terminate(&mut child).await;break Err(AppError::new("LOGIN_TIMEOUT","登录已超时，请重试"));},
+            Some(request)=callbacks.recv(), if mode == "browser" => {
+                let result = process_callback(&request.url, state.callback_port, temp.path()).await;
+                if result.is_ok() {
+                    state.message = "已提交，等待登录完成".into();
+                    let _ = events.send(state.clone()).await;
+                }
+                let _ = request.reply.send(result);
+            },
             Some(line)=rx.recv()=>{let before=state.clone();update_prompt(&mut state,&line);if state!=before{let _=events.send(state.clone()).await;}},
             status=child.wait()=>{
                 break (|| {
@@ -348,6 +416,7 @@ fn validate_callback(raw: &str, expected_port: Option<u16>) -> Result<(String, u
     let host = url
         .host_str()
         .ok_or_else(|| callback_error("回调地址缺少本机主机"))?;
+    let host = host.trim_matches(['[', ']']);
     if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
         return Err(callback_error("回调地址必须指向本机"));
     }
@@ -375,6 +444,53 @@ fn validate_callback(raw: &str, expected_port: Option<u16>) -> Result<(String, u
     Ok((host.into(), port))
 }
 
+fn callback_id_token(raw: &str) -> Result<String> {
+    let url = url::Url::parse(raw.trim()).map_err(|_| callback_error("回调地址格式无效"))?;
+    let token = url
+        .query_pairs()
+        .find(|(key, value)| key == "id_token" && !value.trim().is_empty())
+        .map(|(_, value)| value.into_owned())
+        .ok_or_else(|| callback_error("回调地址缺少有效登录结果"))?;
+    Ok(token)
+}
+
+fn auth_matches_callback(path: &Path, id_token: &str) -> Result<()> {
+    let raw = storage::read_optional(path)?.ok_or_else(|| {
+        AppError::new(
+            "LOGIN_PENDING",
+            "尚未完成当前会话授权，请先在浏览器完成登录",
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&raw)
+        .map_err(|_| AppError::new("LOGIN_PENDING", "当前登录会话尚未生成完整凭据"))?;
+    let tokens = value
+        .get("tokens")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| AppError::new("LOGIN_PENDING", "尚未生成完整 ChatGPT 凭据"))?;
+    for key in ["id_token", "access_token", "refresh_token"] {
+        if tokens
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(AppError::new("LOGIN_PENDING", "尚未生成完整 ChatGPT 凭据"));
+        }
+    }
+    if tokens.get("id_token").and_then(serde_json::Value::as_str) != Some(id_token) {
+        return Err(AppError::new(
+            "LOGIN_PENDING",
+            "回调地址与当前登录会话不匹配",
+        ));
+    }
+    Ok(())
+}
+
+async fn process_callback(raw: &str, expected_port: Option<u16>, temp: &Path) -> Result<()> {
+    let id_token = callback_id_token(raw)?;
+    auth_matches_callback(&temp.join("auth.json"), &id_token)?;
+    forward_callback(raw, expected_port).await
+}
+
 pub async fn forward_callback(raw: &str, expected_port: Option<u16>) -> Result<()> {
     let (host, port) = validate_callback(raw, expected_port)?;
     let url = url::Url::parse(raw.trim()).map_err(|_| callback_error("回调地址格式无效"))?;
@@ -383,9 +499,14 @@ pub async fn forward_callback(raw: &str, expected_port: Option<u16>) -> Result<(
     } else {
         url.path().to_owned()
     };
+    let connect_host = if host == "localhost" {
+        "127.0.0.1"
+    } else {
+        host.as_str()
+    };
     let stream = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio::net::TcpStream::connect((host.as_str(), port)),
+        tokio::net::TcpStream::connect((connect_host, port)),
     )
     .await
     .map_err(|_| callback_error("本机登录回调连接超时"))?
@@ -406,12 +527,25 @@ pub async fn forward_callback(raw: &str, expected_port: Option<u16>) -> Result<(
     .await
     .map_err(|_| callback_error("提交登录回调超时"))?
     .map_err(|_| callback_error("提交登录回调失败"))?;
-    let mut response = [0_u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut response))
-        .await
-        .map_err(|_| callback_error("等待官方 CLI 接收回调超时"))?
-        .map_err(|_| callback_error("官方 CLI 未接收登录回调"))?;
-    if n < 12 || !response.starts_with(b"HTTP/") {
+    let mut response = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
+            .await
+            .map_err(|_| callback_error("等待官方 CLI 接收回调超时"))?
+            .map_err(|_| callback_error("官方 CLI 未接收登录回调"))?;
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..n]);
+        if response.len() > 16 * 1024 {
+            return Err(callback_error("官方 CLI 返回头过大"));
+        }
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    if response.len() < 12 || !response.starts_with(b"HTTP/") {
         return Err(callback_error("官方 CLI 返回了无效回调响应"));
     }
     let status = std::str::from_utf8(&response)
@@ -419,7 +553,7 @@ pub async fn forward_callback(raw: &str, expected_port: Option<u16>) -> Result<(
         .and_then(|s| s.split_whitespace().nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    if !(200..400).contains(&status) {
+    if !(200..300).contains(&status) {
         return Err(callback_error("官方 CLI 未接受登录回调"));
     }
     Ok(())
@@ -437,6 +571,7 @@ mod tests {
                 ..Default::default()
             },
             cancel: Some(cancel),
+            callback: None,
         };
         assert!(s
             .copy_value(CopyKind::Url, |_| -> std::result::Result<(), ()> {
@@ -542,6 +677,22 @@ mod tests {
         assert!(json.contains("callbackReady"));
         assert!(!json.contains("1777"));
     }
+
+    #[test]
+    fn browser_prompt_captures_encoded_redirect_port_without_exposing_it() {
+        let mut s = LoginState {
+            mode: "browser".into(),
+            ..Default::default()
+        };
+        update_prompt(
+            &mut s,
+            "https://auth.openai.com/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A1888%2Fauth%2Fcallback",
+        );
+        assert_eq!(s.callback_port, Some(1888));
+        assert!(s.callback_ready);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("1888"));
+    }
     #[tokio::test]
     async fn callback_forwarding_sends_only_local_http_request_and_discards_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -567,6 +718,54 @@ mod tests {
         .await
         .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn callback_requires_current_complete_auth_before_forwarding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = tempfile::tempdir().unwrap();
+        let token = "fixture-id-token";
+        std::fs::write(
+            fixture.path().join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": token,
+                    "access_token": "access",
+                    "refresh_token": "refresh"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let n = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).contains("GET /success?id_token="));
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let callback =
+            format!("http://127.0.0.1:{port}/success?id_token={token}&needs_setup=false");
+        process_callback(&callback, Some(port), fixture.path())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let mismatch = callback.replace(token, "other");
+        assert_eq!(
+            process_callback(&mismatch, Some(port), fixture.path())
+                .await
+                .unwrap_err()
+                .code,
+            "LOGIN_PENDING"
+        );
     }
     #[test]
     fn missing_cli_is_clear() {

@@ -1,6 +1,6 @@
 # lich13-switch v0.12.0
 
-- 浏览器登录支持粘贴官方 Codex CLI 成功回调地址。应用只接受当前会话的本机 `/success` 回调，并转发给隔离 CLI，由 CLI 生成完整 `auth.json`；不从裸 `id_token` 拼接凭据，也不在状态、日志或账号库保存回调内容。
+- 浏览器登录支持粘贴官方 Codex CLI 成功回调地址。应用只接受当前会话的本机 `/success` 回调，并转发给隔离 CLI；只有该 CLI 已生成与回调匹配的完整 `auth.json` 才会导入，不从裸 `id_token` 拼接凭据，也不在状态、日志或账号库保存回调内容。
 - 增加 Codex 官方账号模式：启用前自动停止 Codex 网关，精确注释现有 `custom` 的 `base_url`、`experimental_bearer_token` 和 `supports_websockets` 行，并切换选定 ChatGPT 账号；关闭后按事务记录恢复原始行文本。
 - 官方模式保护配置编辑和网关启动，外部修改受管行时报告冲突；Claude Code、供应商库、额度、RPM、并发、队列、故障转移、账号及电源助手保持独立。
 

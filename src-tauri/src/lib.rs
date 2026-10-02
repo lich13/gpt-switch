@@ -52,6 +52,7 @@ struct Runtime {
     power: power::Service,
     startup_error: Mutex<Option<AppError>>,
     cleanup_error: Mutex<Option<AppError>>,
+    official_tx: tokio::sync::Mutex<()>,
 }
 impl Runtime {
     fn gateway(&self, client: gateway::ClientId) -> &gateway::Gateway {
@@ -68,6 +69,7 @@ impl Runtime {
         })
     }
     async fn stop_gateways(&self) -> Result<()> {
+        let _official_guard = self.official_tx.lock().await;
         let a = self.gateway.stop_for_exit().await;
         let b = self.claude.stop_for_exit().await;
         a.and(b).map(|_| ())
@@ -226,14 +228,14 @@ fn switch_account(
     id: String,
     expected_revision: String,
 ) -> Result<ViewState> {
-    if official::is_enabled(&r.data, &r.home(gateway::ClientId::Codex)?) {
-        let state = state_for(r.inner())?;
-        if state.official_mode.account_id.as_deref() != Some(id.as_str()) {
-            return Err(AppError::new(
-                "OFFICIAL_MODE",
-                "请先关闭官方账号连接，再切换其他账号",
-            ));
-        }
+    let official_view = official::view(&r.data, &r.home(gateway::ClientId::Codex)?);
+    if official::blocks_gateway(&r.data, &r.home(gateway::ClientId::Codex)?)
+        && official_view.account_id.as_deref() != Some(id.as_str())
+    {
+        return Err(AppError::new(
+            "OFFICIAL_MODE",
+            "请先关闭官方账号连接，再切换其他账号",
+        ));
     }
     let result = lock(&r.core)?.switch_account(&id, &expected_revision);
     match result {
@@ -258,6 +260,7 @@ async fn use_official_account(
     expected_auth_revision: String,
     expected_config_revision: String,
 ) -> Result<ViewState> {
+    let _official_guard = r.official_tx.lock().await;
     let state = get_state(r.clone())?;
     let account = state
         .accounts
@@ -276,7 +279,7 @@ async fn use_official_account(
         }
         return Err(AppError::new("OFFICIAL_MODE", "已有官方账号连接，请先关闭"));
     }
-    if r.gateway.view().recovery_pending {
+    if r.gateway.view().recovery_pending && !r.gateway.view().running {
         return Err(AppError::new("RECOVERY", "请先处理 Codex 网关的恢复事务"));
     }
     let gateway_was_running = r.gateway.view().running;
@@ -291,13 +294,12 @@ async fn use_official_account(
     {
         return Err(AppError::new("CONFLICT", "Codex 配置已变化，请刷新后重试"));
     }
-    official::enable(&r.data, &home, &account_id, &config_revision)?;
-    let switched = lock(&r.core)?.switch_account(&account_id, &expected_auth_revision);
-    if let Err(e) = switched {
-        let current = r.gateway.read_config(&home)?.revision;
-        let _ = official::disable(&r.data, &home, &current);
-        return Err(e);
-    }
+    let auth_revision = expected_auth_revision.clone();
+    official::enable_with_switch(&r.data, &home, &account_id, &config_revision, || {
+        lock(&r.core)?
+            .switch_account(&account_id, &auth_revision)
+            .map(|_| ())
+    })?;
     let mut next = refresh(&app, &r)?;
     next.official_mode = official::view(&r.data, &home);
     publish(&app, next.clone());
@@ -306,11 +308,12 @@ async fn use_official_account(
 }
 
 #[tauri::command]
-fn disable_official_account(
+async fn disable_official_account(
     app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
     expected_config_revision: String,
 ) -> Result<ViewState> {
+    let _official_guard = r.official_tx.lock().await;
     let home = r.home(gateway::ClientId::Codex)?;
     official::disable(&r.data, &home, &expected_config_revision)?;
     let mut next = refresh(&app, &r)?;
@@ -401,13 +404,14 @@ fn validate_config(client_id: Option<gateway::ClientId>, text: String) -> Result
     configuration::validate(client_id.unwrap_or_default(), &text)
 }
 #[tauri::command]
-fn save_config(
+async fn save_config(
     app: tauri::AppHandle,
     r: tauri::State<'_, Arc<Runtime>>,
     text: String,
     expected_revision: String,
     client_id: Option<gateway::ClientId>,
 ) -> Result<configuration::Document> {
+    let _official_guard = r.official_tx.lock().await;
     let client = client_id.unwrap_or_default();
     let home = r.home(client)?;
     if client == gateway::ClientId::Codex {
@@ -432,7 +436,9 @@ fn set_preferences(
     if login_active(&lock(&r.login)?.state) {
         return Err(AppError::new("LOGIN_BUSY", "请先完成或取消登录"));
     }
-    if r.gateway.guarded_home() && lock(&r.core)?.preferences().codex_home != preferences.codex_home
+    if (r.gateway.guarded_home()
+        || official::blocks_gateway(&r.data, &r.home(gateway::ClientId::Codex)?))
+        && lock(&r.core)?.preferences().codex_home != preferences.codex_home
     {
         return Err(AppError::new(
             "GATEWAY_ACTIVE",
@@ -512,13 +518,15 @@ fn start_login(
         return Err(AppError::new("LOGIN_BUSY", "已有登录正在进行"));
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let (callback_tx, callback_rx) = tokio::sync::mpsc::channel(2);
     session.cancel = Some(tx);
+    session.callback = Some(callback_tx);
     session.state = login::LoginState {
         phase: "starting".into(),
         mode: mode.clone(),
         message: "正在启动官方登录…".into(),
-        callback_ready: mode == "browser",
-        callback_port: (mode == "browser").then_some(1455),
+        callback_ready: false,
+        callback_port: None,
         ..Default::default()
     };
     let initial = session.state.clone();
@@ -526,7 +534,7 @@ fn start_login(
     let runtime = r.inner().clone();
     tauri::async_runtime::spawn(async move {
         let (sender, mut events) = tokio::sync::mpsc::channel(8);
-        let task = login::run(&cli, &mode, rx, sender);
+        let task = login::run_with_callbacks(&cli, &mode, rx, sender, callback_rx);
         tokio::pin!(task);
         let result = loop {
             tokio::select! {
@@ -573,6 +581,7 @@ fn start_login(
         if let Ok(mut s) = runtime.login.lock() {
             s.state = final_state.clone();
             s.cancel = None;
+            s.callback = None;
         }
         let _ = app.emit("login-state", final_state);
         let _ = refresh(&app, &runtime);
@@ -588,6 +597,7 @@ fn cancel_login(r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
     if let Some(tx) = s.cancel.take() {
         let _ = tx.send(());
         s.state.phase = "cancelling".into();
+        s.callback = None;
     }
     Ok(())
 }
@@ -596,8 +606,9 @@ fn open_login_url(r: tauri::State<'_, Arc<Runtime>>) -> Result<()> {
     let s = lock(&r.login)?;
     let url = s
         .state
-        .url
+        .auth_url
         .as_ref()
+        .or(s.state.url.as_ref())
         .ok_or_else(|| AppError::new("LOGIN_URL", "登录链接尚未生成"))?;
     open::that(url).map_err(|_| AppError::new("OPEN", "无法打开浏览器"))
 }
@@ -616,7 +627,7 @@ async fn complete_login_callback(
     r: tauri::State<'_, Arc<Runtime>>,
     callback_url: String,
 ) -> Result<login::LoginState> {
-    let port = {
+    let callback = {
         let session = lock(&r.login)?;
         if session.cancel.is_none()
             || session.state.mode != "browser"
@@ -625,9 +636,22 @@ async fn complete_login_callback(
         {
             return Err(AppError::new("LOGIN_STATE", "当前浏览器登录会话不可用"));
         }
-        session.state.callback_port
+        session
+            .callback
+            .clone()
+            .ok_or_else(|| AppError::new("LOGIN_STATE", "当前登录会话尚未准备回调"))?
     };
-    login::forward_callback(&callback_url, port).await?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    callback
+        .send(login::CallbackRequest {
+            url: callback_url,
+            reply,
+        })
+        .await
+        .map_err(|_| AppError::new("LOGIN_STATE", "登录会话已结束，请重新开始"))?;
+    result
+        .await
+        .map_err(|_| AppError::new("LOGIN_STATE", "登录会话已结束，请重新开始"))??;
     let mut session = lock(&r.login)?;
     if session.cancel.is_none() || !login_active(&session.state) {
         return Err(AppError::new("LOGIN_STATE", "登录会话已结束，请重新开始"));
@@ -717,6 +741,7 @@ async fn start_gateway(
     expected_revision: String,
     expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
+    let _official_guard = r.official_tx.lock().await;
     if client_id == gateway::ClientId::Codex
         && official::blocks_gateway(&r.data, &r.home(client_id)?)
     {
@@ -748,6 +773,7 @@ async fn stop_gateway(
     r: tauri::State<'_, Arc<Runtime>>,
     expected_config_revision: Option<String>,
 ) -> Result<gateway::View> {
+    let _official_guard = r.official_tx.lock().await;
     let result = r
         .gateway(client_id)
         .stop_checked(expected_config_revision.as_deref())
@@ -1085,6 +1111,7 @@ pub fn run() {
                 force_quitting: AtomicBool::new(false),
                 startup_error: Mutex::new(claude_import_error),
                 cleanup_error: Mutex::new(cleanup_error),
+                official_tx: tokio::sync::Mutex::new(()),
             });
             runtime.gateway.observe_home(&lock(&runtime.core)?.home());
             runtime
@@ -1218,7 +1245,7 @@ pub fn run() {
                     if runtime.quitting.load(Ordering::Relaxed) {
                         break;
                     }
-                    let result = lock(&runtime.core).and_then(|mut c| c.state());
+                    let result = state_for(&runtime);
                     match result {
                         Ok(s) => {
                             if last.as_ref() != Some(&s) {

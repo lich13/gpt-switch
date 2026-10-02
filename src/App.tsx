@@ -406,7 +406,12 @@ export default function App() {
             state?.officialMode?.state === "unavailable" ? (
               <div className="banner error" role="alert">
                 <AlertTriangle size={16} />
-                {state.officialMode.error}
+                <span>{state.officialMode.error}</span>
+                {(state.officialMode.enabled || state.officialMode.accountId) && (
+                  <button className="text-button" onClick={disableOfficial} disabled={busy}>
+                    关闭官方连接
+                  </button>
+                )}
               </div>
             ) : state?.officialMode?.enabled ? (
               <div className="banner">
@@ -693,7 +698,16 @@ function AddAccount({
     [busy, setBusy] = useState(false);
   const running = ["starting", "waiting", "cancelling"].includes(login.phase);
   const [copied, setCopied] = useState<"url" | "code" | null>(null);
+  const [callbackDraft, setCallbackDraft] = useState("");
   useEffect(() => setCopied(null), [login.phase, login.url, login.code]);
+  useEffect(() => {
+    if (
+      login.mode !== "browser" ||
+      !["starting", "waiting"].includes(login.phase) ||
+      !login.callbackReady
+    )
+      setCallbackDraft("");
+  }, [login.mode, login.phase, login.callbackReady]);
   const canCopy = login.mode === "device" && ["starting", "waiting"].includes(login.phase);
   const perform = async (fn: () => Promise<void>) => {
     setBusy(true);
@@ -746,22 +760,32 @@ function AddAccount({
               className="login-callback"
               onSubmit={(event) => {
                 event.preventDefault();
-                const input = event.currentTarget.elements.namedItem("callbackUrl");
-                if (!(input instanceof HTMLInputElement) || !input.value.trim()) return;
+                if (!callbackDraft.trim()) return;
                 void perform(async () => {
                   const next = await command<LoginState>("complete_login_callback", {
-                    callbackUrl: input.value.trim(),
+                    callbackUrl: callbackDraft.trim(),
                   });
                   setLogin(next);
-                  input.value = "";
+                  setCallbackDraft("");
                 });
               }}
             >
               <label className="field">
                 回调地址
-                <input name="callbackUrl" type="url" autoComplete="off" placeholder="http://127.0.0.1:1455/success?..." disabled={busy} />
+                <input
+                  name="callbackUrl"
+                  type="password"
+                  autoComplete="off"
+                  aria-label="回调地址"
+                  placeholder="粘贴浏览器回调地址"
+                  value={callbackDraft}
+                  onChange={(event) => setCallbackDraft(event.target.value)}
+                  disabled={busy}
+                />
               </label>
-              <button className="secondary" disabled={busy}>完成登录</button>
+              <button className="secondary" disabled={busy || !callbackDraft.trim()}>
+                完成登录
+              </button>
             </form>
           )}
           {login.code && running && (
